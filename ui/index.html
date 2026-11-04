@@ -1,0 +1,129 @@
+﻿<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FastFiles</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><path d="M13.5 2 5 13.2h6L9.8 22 19 10h-6.2z"/></svg>
+      </div>
+      <span>FastFiles</span>
+    </div>
+    <div class="me" id="me" title="Bu bilgisayar">
+      <span class="pulse" aria-hidden="true"></span>
+      <span class="me-name" id="me-name">…</span>
+      <span class="me-ip" id="me-ip"></span>
+    </div>
+    <div class="top-actions">
+      <button class="icon-btn" id="btn-downloads" title="İndirilenler klasörünü aç">
+        <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+      </button>
+      <button class="icon-btn" id="btn-settings" title="Ayarlar">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="update-bar" id="update-bar" hidden>
+    <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0-4-4m4 4 4-4M5 21h14"/></svg>
+    <span id="update-text"></span>
+    <span class="spacer"></span>
+    <button class="btn small" id="update-now">Şimdi güncelle</button>
+    <button class="btn ghost small" id="update-later">Sonra</button>
+  </div>
+
+  <main class="layout">
+    <section class="panel peers-panel">
+      <div class="panel-head">
+        <h2>Ağdaki cihazlar <span class="count" id="peer-count">0</span></h2>
+        <div class="head-actions">
+          <button class="btn soft small" id="btn-batch" hidden title="Aynı dosyaları birden fazla kişiye gönder">
+            <svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3 19c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5"/><path d="M16 4.8a3.2 3.2 0 0 1 0 6.4M18 13.8c2 .7 3 2.5 3 5.2"/></svg>Toplu gönder
+          </button>
+          <button class="btn ghost small" id="btn-add-peer">
+            <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>IP ile ekle
+          </button>
+        </div>
+      </div>
+      <div class="peers" id="peers"></div>
+      <div class="empty" id="peers-empty" hidden>
+        <div class="radar" aria-hidden="true"><span></span><span></span><span></span><i></i></div>
+        <h3>Ağdaki bilgisayarlar aranıyor…</h3>
+        <p>Diğer bilgisayarlarda da FastFiles açık olmalı. Birkaç saniye içinde burada görünürler.</p>
+        <p class="muted small">Görünmüyorsa <a href="#" id="link-add-peer">IP adresiyle ekleyin</a>. Bu bilgisayarın adresi: <b id="empty-ip">—</b></p>
+      </div>
+      <p class="hint" id="drop-hint">
+        <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0-4-4m4 4 4-4M5 21h14"/></svg>
+        Dosya veya klasörleri bir cihazın üzerine sürükleyip bırakın
+      </p>
+    </section>
+
+    <aside class="panel side-panel">
+      <!-- Sekmeler -->
+      <div class="panel-head tabs-head" id="tabs-head">
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-tab="transfers" role="tab">Aktarımlar</button>
+          <button class="tab" data-tab="chats" role="tab">Mesajlar <span class="tab-badge" id="chat-badge" hidden>0</span></button>
+        </div>
+        <button class="btn ghost small" id="btn-clear" hidden>Temizle</button>
+      </div>
+
+      <div class="tab-body" id="tab-transfers">
+        <div class="transfers" id="transfers"></div>
+        <div class="empty small-empty" id="transfers-empty">
+          <svg viewBox="0 0 24 24" class="empty-icon"><path d="M7 7h11l-3-3M17 17H6l3 3"/></svg>
+          <h3>Henüz aktarım yok</h3>
+          <p>Gönderdiğiniz ve aldığınız dosyalar burada görünecek.</p>
+        </div>
+      </div>
+
+      <div class="tab-body" id="tab-chats" hidden>
+        <div class="convs" id="convs"></div>
+        <div class="empty small-empty" id="convs-empty">
+          <svg viewBox="0 0 24 24" class="empty-icon"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg>
+          <h3>Henüz mesaj yok</h3>
+          <p>Bir cihazın kartındaki mesaj butonuyla sohbet başlatın. Mesajlar şifreli olarak doğrudan karşı bilgisayara gider.</p>
+        </div>
+      </div>
+
+      <!-- Açık sohbet -->
+      <div class="chat-view" id="chat-view" hidden>
+        <div class="chat-head">
+          <button class="icon-btn sm" id="chat-back" title="Geri"><svg viewBox="0 0 24 24"><path d="M15 18 9 12l6-6"/></svg></button>
+          <div class="avatar sm" id="chat-avatar"></div>
+          <div class="chat-who">
+            <div class="chat-name" id="chat-name"></div>
+            <div class="chat-status" id="chat-status"></div>
+          </div>
+          <button class="icon-btn sm" id="chat-block" title="Engelle"></button>
+          <button class="icon-btn sm" id="chat-clear" title="Sohbet geçmişini sil">
+            <svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>
+          </button>
+        </div>
+        <div class="messages" id="messages"></div>
+        <div class="composer" id="composer-wrap">
+          <textarea id="composer" rows="1" maxlength="4000" placeholder="Mesaj yazın…" spellcheck="true"></textarea>
+          <button class="send-btn" id="chat-send" title="Gönder (Enter)">
+            <svg viewBox="0 0 24 24"><path d="M5 12h13M13 6l6 6-6 6"/></svg>
+          </button>
+        </div>
+        <div class="composer-note" id="composer-note"></div>
+      </div>
+    </aside>
+  </main>
+
+  <div class="drop-overlay" id="drop-overlay" aria-hidden="true">
+    <div class="drop-msg" id="drop-msg">Bir cihazın üzerine bırakın</div>
+  </div>
+
+  <div class="modal-root" id="modal-root"></div>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>
