@@ -3,6 +3,9 @@
 //! Tauri'den bağımsızdır; arayüze olaylar `Emitter` geri çağrısı ile iletilir.
 //! Bu sayede aynı kod testlerde iki "sanal cihaz" ile uçtan uca denenebilir.
 
+#[path = "group.rs"]
+mod group;
+
 use crate::chat::{ChatMessage, ChatStore, ConversationSummary, MsgStatus};
 use crate::config::{fingerprint, Identity, Settings, TrustedDevice};
 use crate::protocol::*;
@@ -179,6 +182,8 @@ pub struct Node {
     update_pkg: Mutex<Option<PackageHeader>>,
     update_fetching: AtomicBool,
     update_failures: Mutex<HashMap<String, Instant>>,
+    outbox_in_flight: Mutex<HashSet<String>>,
+    outbox_backoff: Mutex<HashMap<String, Instant>>,
     pub shutdown: CancellationToken,
 }
 
@@ -216,6 +221,8 @@ impl Node {
             update_pkg: Mutex::new(None),
             update_fetching: AtomicBool::new(false),
             update_failures: Mutex::new(HashMap::new()),
+            outbox_in_flight: Mutex::new(HashSet::new()),
+            outbox_backoff: Mutex::new(HashMap::new()),
             shutdown: CancellationToken::new(),
         });
         node.load_cached_package();
@@ -839,6 +846,30 @@ impl Node {
                 self.receive(rd, wr, addr.ip(), device, files, total).await
             }
             Message::UpdateRequest => self.serve_update(&mut wr).await,
+            Message::GroupUpdate { device, group } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                let reply = self.accept_group_update(&client_fp, group);
+                write_msg(&mut wr, &reply).await.map_err(|e| e.to_string())
+            }
+            Message::GroupChat { device, group_id, id, text, sent_at } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                let reply = match self.accept_group_chat(device, addr.ip(), &group_id, &id, &text, sent_at) {
+                    Ok(()) => Message::ChatAck { id },
+                    Err(reason) => Message::ChatReject { reason: reason.into() },
+                };
+                write_msg(&mut wr, &reply).await.map_err(|e| e.to_string())
+            }
+            Message::GroupLeave { device, group_id } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                self.accept_group_leave(&client_fp, &group_id);
+                write_msg(&mut wr, &Message::GroupAck).await.map_err(|e| e.to_string())
+            }
             Message::Chat { device, id, text } => {
                 if device.fingerprint != client_fp {
                     return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
@@ -1091,7 +1122,7 @@ impl Node {
         if self.chats.lock().unwrap().contains(&fp, id) {
             return Ok(());
         }
-        let msg = ChatMessage { id: id.to_string(), outgoing: false, text, at: now_ms(), status: MsgStatus::Received, error: None };
+        let msg = ChatMessage { id: id.to_string(), outgoing: false, text, at: now_ms(), status: MsgStatus::Received, error: None, ..Default::default() };
         self.store_chat(&fp, &name, msg);
         Ok(())
     }
@@ -1126,8 +1157,19 @@ impl Node {
         self.chats.lock().unwrap().mark_read(fp);
     }
 
-    pub fn chat_clear(&self, fp: &str) {
-        self.chats.lock().unwrap().clear(fp);
+    /// Geçmişi siler. Gruplarda grup bilgisi korunur (yalnızca mesajlar silinir);
+    /// ayrılınmış gruplar tamamen kaldırılır.
+    pub fn chat_clear(&self, key: &str) {
+        let mut chats = self.chats.lock().unwrap();
+        let active_group = chats.conv(key).map_or(false, |c| c.group.is_some() && !c.left);
+        if active_group {
+            chats.with(key, |c| {
+                c.messages.retain(|m| m.outgoing && !m.pending.is_empty());
+                c.unread = 0;
+            });
+        } else {
+            chats.clear(key);
+        }
     }
 
     /// Mesajı kaydeder ve arka planda iletir. Durum değişiklikleri "chat" olayıyla bildirilir.
@@ -1150,6 +1192,7 @@ impl Node {
             at: now_ms(),
             status: MsgStatus::Sending,
             error: None,
+            ..Default::default()
         };
         self.store_chat(&peer.fingerprint, &peer.name, msg.clone());
         self.spawn_chat_delivery(peer, msg.clone());
@@ -1983,6 +2026,178 @@ mod tests {
         alice.chat_retry(&bfp, &failed_id).unwrap();
         wait_until(|| last_status(&alice, &bfp) == Some(MsgStatus::Sent)).await;
         assert_eq!(bob.chat_history(&afp).len(), 2);
+    }
+
+    // ───────────── Grup testleri ─────────────
+
+    fn introduce_all(nodes: &[&Arc<Node>]) {
+        for a in nodes {
+            for b in nodes {
+                if !Arc::ptr_eq(a, b) {
+                    introduce(a, b);
+                }
+            }
+        }
+    }
+
+    /// Keşif döngüsünü taklit eder: koşul sağlanana kadar her düğümün giden kutusunu boşaltır.
+    async fn wait_flushing(nodes: &[&Arc<Node>], mut f: impl FnMut() -> bool) {
+        for _ in 0..100 {
+            if f() {
+                return;
+            }
+            for n in nodes {
+                n.flush_outbox();
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        panic!("koşul zamanında gerçekleşmedi");
+    }
+
+    fn group_texts(node: &Node, key: &str) -> Vec<String> {
+        node.chat_history(key).into_iter().filter(|m| !m.system).map(|m| m.text).collect()
+    }
+
+    #[tokio::test]
+    async fn group_create_send_and_receive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        let carol = make_node(tmp.path(), "carol").await;
+        introduce_all(&[&alice, &bob, &carol]);
+
+        let g = alice
+            .group_create("Proje Ekibi", &[bob.identity.fingerprint.clone(), carol.identity.fingerprint.clone()])
+            .unwrap();
+        let key = g.fingerprint.clone();
+        assert_eq!(g.group.as_ref().unwrap().members.len(), 3);
+
+        // Üyeler grubu öğrenir.
+        wait_until(|| bob.chat_summaries().iter().any(|c| c.fingerprint == key)).await;
+        wait_until(|| carol.chat_summaries().iter().any(|c| c.fingerprint == key)).await;
+        assert_eq!(bob.chat_summaries()[0].name, "Proje Ekibi");
+
+        // Herkes yazar, herkes alır.
+        alice.group_send(&key, "Merhaba ekip").unwrap();
+        bob.group_send(&key, "Selam!").unwrap();
+        let all = [&alice, &bob, &carol];
+        wait_flushing(&all, || group_texts(&carol, &key).len() == 2).await;
+        wait_flushing(&all, || group_texts(&alice, &key).len() == 2).await;
+        let carol_msgs: Vec<_> = carol.chat_history(&key).into_iter().filter(|m| !m.system).collect();
+        assert!(carol_msgs.iter().any(|m| m.text == "Selam!" && m.sender_name.as_deref() == Some("bob")));
+        assert_eq!(carol.chat_summaries().iter().find(|c| c.fingerprint == key).unwrap().unread, 2);
+        // Gönderen tarafta "herkese iletildi".
+        wait_flushing(&all, || alice.chat_history(&key).iter().any(|m| m.outgoing && m.status == MsgStatus::Sent && m.pending.is_empty())).await;
+    }
+
+    #[tokio::test]
+    async fn group_outbox_delivers_when_member_comes_online() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        let carol = make_node(tmp.path(), "carol").await;
+        introduce_all(&[&alice, &bob, &carol]);
+        let carol_fp = carol.identity.fingerprint.clone();
+        let carol_id = carol.identity.id.clone();
+
+        let key = alice.group_create("Ekip", &[bob.identity.fingerprint.clone(), carol_fp.clone()]).unwrap().fingerprint;
+        wait_until(|| bob.chat_summaries().iter().any(|c| c.fingerprint == key)).await;
+
+        // Carol "çevrimdışı": Alice'in listesinden düşsün.
+        alice.remove_peer(&carol_id);
+        alice.group_send(&key, "Carol yokken yazıldı").unwrap();
+        wait_flushing(&[&alice], || group_texts(&bob, &key).len() == 1).await;
+        let pending = alice.chat_history(&key).into_iter().find(|m| m.outgoing).unwrap().pending;
+        assert_eq!(pending, vec![carol_fp.clone()], "Carol için beklemeli");
+
+        // Carol geri gelince giden kutusu önce grup bilgisini, sonra mesajı teslim eder.
+        introduce(&alice, &carol);
+        for _ in 0..40 {
+            alice.flush_outbox();
+            if group_texts(&carol, &key).len() == 1 {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(group_texts(&carol, &key), vec!["Carol yokken yazıldı"]);
+        wait_until(|| alice.chat_history(&key).iter().any(|m| m.outgoing && m.pending.is_empty())).await;
+    }
+
+    #[tokio::test]
+    async fn group_only_admin_can_change_and_non_members_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        let carol = make_node(tmp.path(), "carol").await;
+        let mallory = make_node(tmp.path(), "mallory").await;
+        introduce_all(&[&alice, &bob, &carol, &mallory]);
+        let key = alice.group_create("Gizli", &[bob.identity.fingerprint.clone()]).unwrap().fingerprint;
+        wait_until(|| bob.chat_summaries().iter().any(|c| c.fingerprint == key)).await;
+        let group = bob.group_of(&key).unwrap().0;
+
+        // Bob (yönetici değil) düzenleyemez.
+        assert!(bob.group_edit(&key, Some("Bob'un grubu".into()), &[], &[]).is_err());
+        // Mallory, grubu kendi yöneticiliğinde "güncellemeye" çalışır → reddedilir.
+        let mut forged = group.clone();
+        forged.admin = mallory.identity.fingerprint.clone();
+        forged.rev += 10;
+        forged.members.push(crate::chat::GroupMember { fingerprint: mallory.identity.fingerprint.clone(), name: "mallory".into() });
+        assert!(matches!(bob.accept_group_update(&mallory.identity.fingerprint, forged.clone()), Message::ChatReject { .. }));
+        // Yönetici alanını doğru yazsa da gönderen (sertifika) yönetici değilse reddedilir.
+        let mut forged2 = group.clone();
+        forged2.rev += 10;
+        forged2.name = "Ele geçirildi".into();
+        assert!(matches!(bob.accept_group_update(&mallory.identity.fingerprint, forged2), Message::ChatReject { .. }));
+        assert_eq!(bob.group_of(&key).unwrap().0.name, "Gizli");
+        // Üye olmayan Mallory gruba mesaj yazamaz.
+        assert_eq!(
+            bob.accept_group_chat(mallory.device_info(), IpAddr::V4(Ipv4Addr::LOCALHOST), &group.id, "m1", "selam", 0),
+            Err("sender_not_member")
+        );
+        // Bilinmeyen grup.
+        assert_eq!(
+            carol.accept_group_chat(alice.device_info(), IpAddr::V4(Ipv4Addr::LOCALHOST), &group.id, "m2", "x", 0),
+            Err("unknown_group")
+        );
+
+        // Yönetici Carol'ı ekler, Bob'u çıkarır, adı değiştirir.
+        alice
+            .group_edit(&key, Some("Yeni Ad".into()), &[carol.identity.fingerprint.clone()], &[bob.identity.fingerprint.clone()])
+            .unwrap();
+        wait_until(|| carol.group_of(&key).map_or(false, |(g, _)| g.name == "Yeni Ad")).await;
+        wait_until(|| bob.group_of(&key).map_or(false, |(_, left)| left)).await;
+        assert!(bob.group_send(&key, "hâlâ burada mıyım?").is_err());
+    }
+
+    #[tokio::test]
+    async fn group_leave_and_admin_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        let carol = make_node(tmp.path(), "carol").await;
+        introduce_all(&[&alice, &bob, &carol]);
+        let key = alice
+            .group_create("Ekip", &[bob.identity.fingerprint.clone(), carol.identity.fingerprint.clone()])
+            .unwrap()
+            .fingerprint;
+        wait_until(|| bob.group_of(&key).is_some() && carol.group_of(&key).is_some()).await;
+
+        // Bob ayrılır → yönetici çıkarır → Carol'a da yansır.
+        bob.group_leave(&key).unwrap();
+        wait_until(|| !alice.group_of(&key).unwrap().0.has(&bob.identity.fingerprint)).await;
+        for _ in 0..40 {
+            alice.flush_outbox();
+            if !carol.group_of(&key).unwrap().0.has(&bob.identity.fingerprint) {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!carol.group_of(&key).unwrap().0.has(&bob.identity.fingerprint));
+
+        // Yönetici grubu siler → Carol için grup kapanır.
+        alice.group_leave(&key).unwrap();
+        wait_until(|| carol.group_of(&key).map_or(false, |(g, left)| g.deleted && left)).await;
+        assert!(carol.group_send(&key, "x").is_err());
     }
 
     #[tokio::test]

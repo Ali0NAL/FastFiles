@@ -16,7 +16,7 @@ pub enum MsgStatus {
     Received,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
     pub id: String,
@@ -27,15 +27,86 @@ pub struct ChatMessage {
     pub status: MsgStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Grup mesajı: gönderenin parmak izi ve adı (gelen mesajlarda).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_name: Option<String>,
+    /// Grup mesajı (giden): henüz iletilemeyen üyeler. Çevrimiçi olunca otomatik gönderilir.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<String>,
+    /// Grup mesajı (giden): toplam alıcı sayısı.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub recipients: u32,
+    /// "Ahmet gruba eklendi" gibi bilgi satırı.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub system: bool,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+impl Default for MsgStatus {
+    fn default() -> Self {
+        MsgStatus::Received
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupMember {
+    pub fingerprint: String,
+    pub name: String,
+}
+
+/// Grup bilgisi. Yalnızca `admin` (oluşturan cihazın parmak izi) değiştirebilir;
+/// her değişiklikte `rev` artar, eski sürümler yok sayılır.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupInfo {
+    pub id: String,
+    pub name: String,
+    pub admin: String,
+    pub members: Vec<GroupMember>,
+    pub rev: u64,
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+impl GroupInfo {
+    pub fn has(&self, fp: &str) -> bool {
+        self.members.iter().any(|m| m.fingerprint == fp)
+    }
+    pub fn member_name(&self, fp: &str) -> Option<&str> {
+        self.members.iter().find(|m| m.fingerprint == fp).map(|m| m.name.as_str())
+    }
+}
+
+/// Grup sohbetlerinin anahtarı. Birebir sohbetlerde anahtar karşı cihazın parmak izidir.
+pub fn group_key(id: &str) -> String {
+    format!("g:{id}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Conversation {
+    /// Sohbet anahtarı: karşı cihazın parmak izi ya da grup için "g:<id>".
     pub fingerprint: String,
     pub name: String,
     pub unread: u32,
     pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub group: Option<GroupInfo>,
+    /// Gruptan ayrıldım / çıkarıldım / grup silindi.
+    #[serde(default)]
+    pub left: bool,
+    /// (Yönetici) son grup bilgisini henüz almamış üyeler.
+    #[serde(default)]
+    pub sync_pending: Vec<String>,
+    /// (Üye) ayrıldığımı yöneticiye henüz bildiremedim.
+    #[serde(default)]
+    pub leave_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -45,7 +116,23 @@ pub struct ConversationSummary {
     pub name: String,
     pub unread: u32,
     pub last: Option<ChatMessage>,
+    pub group: Option<GroupInfo>,
+    pub left: bool,
 }
+
+/// Çevrimiçi olunca yapılacak teslimatlar.
+#[derive(Debug, Clone)]
+pub enum OutboxItem {
+    /// Yönetici → üye: güncel grup bilgisi
+    GroupSync { key: String, to: String, group: GroupInfo },
+    /// Grup mesajı → henüz almamış üye
+    Message { key: String, to: String, group_id: String, msg: ChatMessage },
+    /// Üye → yönetici: ayrılıyorum
+    Leave { key: String, to: String, group_id: String },
+}
+
+/// Bekleyen grup mesajlarından bu kadar eskiyse vazgeçilir.
+const OUTBOX_MAX_AGE_MS: u64 = 3 * 24 * 60 * 60 * 1000;
 
 pub struct ChatStore {
     path: PathBuf,
@@ -146,17 +233,94 @@ impl ChatStore {
         }
     }
 
+    fn summarize(c: &Conversation) -> ConversationSummary {
+        ConversationSummary {
+            fingerprint: c.fingerprint.clone(),
+            name: c.name.clone(),
+            unread: c.unread,
+            last: c.messages.last().cloned(),
+            group: c.group.clone(),
+            left: c.left,
+        }
+    }
+
+    pub fn summary(&self, key: &str) -> Option<ConversationSummary> {
+        self.convs.get(key).map(Self::summarize)
+    }
+
+    pub fn conv(&self, key: &str) -> Option<&Conversation> {
+        self.convs.get(key)
+    }
+
+    /// Sohbeti değiştirir ve kaydeder.
+    pub fn with<R>(&mut self, key: &str, f: impl FnOnce(&mut Conversation) -> R) -> Option<R> {
+        let r = f(self.convs.get_mut(key)?);
+        self.save();
+        Some(r)
+    }
+
+    pub fn insert(&mut self, conv: Conversation) {
+        self.convs.insert(conv.fingerprint.clone(), conv);
+        self.save();
+    }
+
+    /// Bilgi satırı ekler ("Ahmet gruba eklendi").
+    pub fn push_system(&mut self, key: &str, text: String, at: u64) -> Option<ChatMessage> {
+        let msg = ChatMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            text,
+            at,
+            system: true,
+            ..Default::default()
+        };
+        let conv = self.convs.get_mut(key)?;
+        conv.messages.push(msg.clone());
+        if conv.messages.len() > MAX_PER_CONVERSATION {
+            let extra = conv.messages.len() - MAX_PER_CONVERSATION;
+            conv.messages.drain(..extra);
+        }
+        self.save();
+        Some(msg)
+    }
+
+    /// Yapılması gereken teslimatlar. Çok eski bekleyen mesajlardan vazgeçilir.
+    pub fn outbox(&mut self, now: u64, my_fp: &str) -> Vec<OutboxItem> {
+        let mut items = Vec::new();
+        let mut changed = false;
+        for conv in self.convs.values_mut() {
+            let Some(group) = conv.group.clone() else { continue };
+            if group.admin == my_fp {
+                for to in &conv.sync_pending {
+                    items.push(OutboxItem::GroupSync { key: conv.fingerprint.clone(), to: to.clone(), group: group.clone() });
+                }
+            }
+            if conv.leave_pending && !group.admin.is_empty() && group.admin != my_fp {
+                items.push(OutboxItem::Leave { key: conv.fingerprint.clone(), to: group.admin.clone(), group_id: group.id.clone() });
+            }
+            for m in conv.messages.iter_mut().filter(|m| m.outgoing && !m.pending.is_empty()) {
+                if now.saturating_sub(m.at) > OUTBOX_MAX_AGE_MS || conv.left {
+                    m.pending.clear();
+                    changed = true;
+                    continue;
+                }
+                for to in &m.pending {
+                    items.push(OutboxItem::Message {
+                        key: conv.fingerprint.clone(),
+                        to: to.clone(),
+                        group_id: group.id.clone(),
+                        msg: m.clone(),
+                    });
+                }
+            }
+        }
+        if changed {
+            self.save();
+        }
+        items
+    }
+
     pub fn summaries(&self) -> Vec<ConversationSummary> {
-        let mut list: Vec<ConversationSummary> = self
-            .convs
-            .values()
-            .map(|c| ConversationSummary {
-                fingerprint: c.fingerprint.clone(),
-                name: c.name.clone(),
-                unread: c.unread,
-                last: c.messages.last().cloned(),
-            })
-            .collect();
+        let mut list: Vec<ConversationSummary> = self.convs.values().map(Self::summarize).collect();
         list.sort_by(|a, b| {
             let at = |s: &ConversationSummary| s.last.as_ref().map_or(0, |m| m.at);
             at(b).cmp(&at(a))

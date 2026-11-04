@@ -211,6 +211,27 @@ a { color: var(--accent); }
 .composer-note { font-size: 11.5px; color: var(--muted); padding: 2px 16px 10px; min-height: 22px; }
 .composer-note.warn { color: var(--danger); }
 
+/* ─── Gruplar ─── */
+.convs-head { display: flex; justify-content: flex-end; margin: -4px 0 8px; }
+.avatar.group svg { width: 18px; height: 18px; color: #fff; }
+.avatar.sm.group svg { width: 16px; height: 16px; }
+.conv .c-count { color: var(--muted); font-weight: 500; font-size: 12px; }
+.conv.left .c-name span:first-child { opacity: .6; }
+.sys-msg {
+  align-self: center; text-align: center; max-width: 90%;
+  font-size: 12px; color: var(--muted); padding: 4px 10px; margin: 6px 0;
+}
+.msg .sender { font-size: 12px; font-weight: 700; margin: 0 4px 2px; }
+.member-list { display: flex; flex-direction: column; gap: 4px; max-height: 240px; overflow: auto; }
+.member { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface-2); }
+.member .avatar { width: 30px; height: 30px; font-size: 12px; }
+.member .m-name { flex: 1; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.member.removing { opacity: .5; text-decoration: line-through; }
+.badge.admin { background: var(--accent-soft); color: var(--accent); }
+.recip .off { font-size: 11.5px; color: var(--muted); }
+@keyframes flash { 0%, 100% { box-shadow: none; } 30% { box-shadow: 0 0 0 3px var(--accent); } }
+.transfer.flash { animation: flash 1.4s ease-out 2; }
+
 /* ─── Kart üzerindeki mesaj butonu ─── */
 .peer .actions .chat-btn { flex: 0 0 auto; width: 38px; padding: 0; position: relative; }
 .peer .chat-btn .dot-badge { position: absolute; top: -7px; right: -7px; box-shadow: 0 0 0 2px var(--surface); }

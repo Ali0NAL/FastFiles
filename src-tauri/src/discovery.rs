@@ -171,6 +171,7 @@ pub async fn run(node: Arc<Node>) {
         announce(&sock, &node, "announce").await;
         node.prune_peers();
         node.check_for_updates();
+        node.flush_outbox();
         tick += 1;
         if tick % 4 == 0 {
             // Ağ değişikliklerinde (Wi-Fi'ya bağlanma vb.) yeni arayüzlere katıl.

@@ -112,6 +112,33 @@ fn chat_clear(node: NodeState, fingerprint: String) {
     node.chat_clear(&fingerprint);
 }
 
+// Grup komutları async: giden kutusu tokio görevleri başlatır.
+#[tauri::command]
+async fn group_create(node: NodeState<'_>, name: String, members: Vec<String>) -> Result<ConversationSummary, String> {
+    node.inner().group_create(&name, &members)
+}
+
+#[tauri::command]
+async fn group_edit(
+    node: NodeState<'_>,
+    key: String,
+    name: Option<String>,
+    add: Vec<String>,
+    remove: Vec<String>,
+) -> Result<ConversationSummary, String> {
+    node.inner().group_edit(&key, name, &add, &remove)
+}
+
+#[tauri::command]
+async fn group_leave(node: NodeState<'_>, key: String) -> Result<(), String> {
+    node.inner().group_leave(&key)
+}
+
+#[tauri::command]
+async fn group_send(node: NodeState<'_>, key: String, text: String) -> Result<ChatMessage, String> {
+    node.inner().group_send(&key, &text)
+}
+
 #[tauri::command]
 fn set_blocked(node: NodeState, fingerprint: String, name: String, blocked: bool) -> Settings {
     node.set_blocked(&fingerprint, &name, blocked)
@@ -200,13 +227,53 @@ fn in_front(app: &AppHandle) -> bool {
 }
 
 /// Pencere arkadaysa Windows bildirimi gösterir ve görev çubuğunu yakıp söndürür.
-fn notify_background(app: &AppHandle, title: &str, body: &str) {
+/// `target`: bildirime tıklanınca arayüzün açacağı yer, ör. {"view":"chat","key":...}.
+fn notify_background(app: &AppHandle, title: &str, body: &str, target: serde_json::Value) {
     if in_front(app) {
         return;
     }
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.request_user_attention(Some(tauri::UserAttentionType::Informational));
     }
+    show_notification(app, title, body, target);
+}
+
+/// Windows: bildirime tıklanınca pencereyi öne getirir ve ilgili ekranı açar.
+/// (Bildirim İşlem Merkezi'ne düştükten sonra tıklanırsa Windows uygulamayı yeniden başlatır;
+/// tek örnek koruması bu durumda açık pencereyi öne getirir.)
+#[cfg(target_os = "windows")]
+fn show_notification(app: &AppHandle, title: &str, body: &str, target: serde_json::Value) {
+    use tauri_winrt_notification::Toast;
+    // Geliştirme derlemesinde uygulama kayıtlı değildir; eklentinin yaptığı gibi PowerShell kimliği kullanılır.
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_lowercase()))
+        .unwrap_or_default();
+    let dev = exe_dir.ends_with("\\target\\debug") || exe_dir.ends_with("\\target\\release");
+    let app_id = if dev { Toast::POWERSHELL_APP_ID.to_string() } else { app.config().identifier.clone() };
+    let handle = app.clone();
+    let (title, body) = (title.to_string(), body.to_string());
+    // WinRT çağrısı arayüz iş parçacığını bekletmesin.
+    std::thread::spawn(move || {
+        let click_handle = handle.clone();
+        let result = Toast::new(&app_id)
+            .title(&title)
+            .text1(&body)
+            .on_activated(move |_action| {
+                show_main(&click_handle);
+                let _ = click_handle.emit("notification-click", target.clone());
+                Ok(())
+            })
+            .show();
+        if result.is_err() {
+            // Yedek: eklentinin bildirimi (tıklama desteği yok ama en azından görünür).
+            let _ = handle.notification().builder().title(&title).body(&body).show();
+        }
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn show_notification(app: &AppHandle, title: &str, body: &str, _target: serde_json::Value) {
     let _ = app.notification().builder().title(title).body(body).show();
 }
 
@@ -369,6 +436,7 @@ pub fn run() {
                             &emit_handle,
                             &format!("{name} dosya göndermek istiyor"),
                             &format!("{count} dosya · {} — onaylamak için tıklayın", node::fmt_bytes(total)),
+                            serde_json::json!({ "view": "transfers" }),
                         );
                         if let Some(w) = emit_handle.get_webview_window("main") {
                             let _ = w.show();
@@ -380,7 +448,13 @@ pub fn run() {
                     "chat" if payload["incoming"] == true => {
                         let name = payload["name"].as_str().unwrap_or("FastFiles");
                         let text: String = payload["message"]["text"].as_str().unwrap_or("").chars().take(140).collect();
-                        notify_background(&emit_handle, name, &text);
+                        // Grup mesajında gönderenin adı da görünsün.
+                        let body = match payload["message"]["senderName"].as_str() {
+                            Some(sender) => format!("{sender}: {text}"),
+                            None => text,
+                        };
+                        let key = payload["fingerprint"].clone();
+                        notify_background(&emit_handle, name, &body, serde_json::json!({ "view": "chat", "key": key }));
                     }
                     // Dosya alımı başladı (güvenilir cihaz) / bitti / başarısız
                     "notify" => {
@@ -388,6 +462,7 @@ pub fn run() {
                             &emit_handle,
                             payload["title"].as_str().unwrap_or("FastFiles"),
                             payload["body"].as_str().unwrap_or(""),
+                            serde_json::json!({ "view": "transfers", "transferId": payload["transferId"] }),
                         );
                     }
                     _ => {}
@@ -411,7 +486,7 @@ pub fn run() {
                     tauri::async_runtime::spawn(async move {
                         tokio::time::sleep(Duration::from_secs(3)).await;
                         let body = format!("{previous} → {}", update::CURRENT_VERSION);
-                        let _ = h.notification().builder().title("FastFiles güncellendi").body(&body).show();
+                        show_notification(&h, "FastFiles güncellendi", &body, serde_json::json!({ "view": "main" }));
                         let _ = h.emit("updated", serde_json::json!({ "from": previous, "to": update::CURRENT_VERSION }));
                     });
                 }
@@ -479,6 +554,10 @@ pub fn run() {
             chat_retry,
             chat_mark_read,
             chat_clear,
+            group_create,
+            group_edit,
+            group_leave,
+            group_send,
             update_state,
             import_update,
             install_update,

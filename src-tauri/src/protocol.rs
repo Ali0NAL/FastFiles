@@ -64,6 +64,13 @@ pub enum Message {
     ChatAck { id: String },
     /// `reason`: "blocked" | "rate" | "too_long" | "empty" | "invalid"
     ChatReject { reason: String },
+    /// Grup bilgisi (oluşturma/değişiklik/silme). Yalnızca grubun yöneticisinden kabul edilir.
+    GroupUpdate { device: DeviceInfo, group: crate::chat::GroupInfo },
+    /// Grup mesajı. Yanıt: ChatAck ya da ChatReject ("unknown_group" | "not_member" | ...).
+    GroupChat { device: DeviceInfo, group_id: String, id: String, text: String, sent_at: u64 },
+    /// Üye gruptan ayrılıyor (yöneticiye gönderilir).
+    GroupLeave { device: DeviceInfo, group_id: String },
+    GroupAck,
     /// Güncelleme paketi isteği. Yanıt: UpdateOffer + ham paket baytları ya da UpdateNone.
     UpdateRequest,
     UpdateOffer { header: crate::update::PackageHeader },
@@ -71,6 +78,12 @@ pub enum Message {
 }
 
 pub const MAX_CHAT_CHARS: usize = 4000;
+pub const MAX_GROUP_MEMBERS: usize = 50;
+
+/// SHA-256 parmak izi biçiminde mi (64 hex karakter)?
+pub fn valid_fingerprint(fp: &str) -> bool {
+    fp.len() == 64 && fp.chars().all(|c| c.is_ascii_hexdigit())
+}
 pub const MAX_NAME_CHARS: usize = 40;
 
 /// Görünmez/yön değiştiren Unicode karakterleri (ör. U+202E ile "exe.txt" → "txt.exe" taklidi).

@@ -76,6 +76,7 @@ const ic = {
   ban: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m5.6 5.6 12.8 12.8"/></svg>',
   clock: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
   checks: '<svg viewBox="0 0 24 24"><path d="m3 12 5 5L18 7M13 16l1 1L22 9"/></svg>',
+  users: '<svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3 19c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5"/><path d="M16 4.8a3.2 3.2 0 0 1 0 6.4M18 13.8c2 .7 3 2.5 3 5.2"/></svg>',
 };
 const osIcon = (os) => ic[os === 'macos' ? 'macos' : os === 'linux' ? 'linux' : 'windows'];
 
@@ -731,12 +732,19 @@ function renderConvs() {
   $('#convs-empty').hidden = list.length > 0;
   $('#convs').hidden = list.length === 0;
   $('#convs').innerHTML = list.map((c) => {
-    const online = !!peerByFp(c.fingerprint);
-    const last = c.last ? `${c.last.outgoing ? 'Siz: ' : ''}${c.last.text.replace(/\s+/g, ' ')}` : '';
+    const g = c.group;
+    const online = !g && !!peerByFp(c.fingerprint);
+    const lastText = c.last ? c.last.text.replace(/\s+/g, ' ') : '';
+    const who = !c.last || c.last.system ? '' : c.last.outgoing ? 'Siz: ' : c.last.senderName ? `${c.last.senderName}: ` : '';
+    const last = `${who}${lastText}`;
+    const avatar = g
+      ? `<div class="avatar group" style="background:${grad(c.fingerprint)}">${ic.users}</div>`
+      : `<div class="avatar" style="background:${grad(c.fingerprint)}">${esc(initials(c.name))}</div>`;
+    const extra = g ? (c.left ? '<span class="c-count">· ayrıldınız</span>' : `<span class="c-count">· ${g.members.length} kişi</span>`) : '';
     return `
-      <div class="conv ${c.unread ? 'unread' : ''}" data-fp="${esc(c.fingerprint)}">
-        <div class="avatar" style="background:${grad(c.fingerprint)}">${esc(initials(c.name))}</div>
-        <div class="c-name">${online ? '<span class="online-dot" title="Çevrimiçi"></span>' : ''}<span>${esc(c.name)}</span></div>
+      <div class="conv ${c.unread ? 'unread' : ''} ${c.left ? 'left' : ''}" data-fp="${esc(c.fingerprint)}">
+        ${avatar}
+        <div class="c-name">${online ? '<span class="online-dot" title="Çevrimiçi"></span>' : ''}<span>${esc(c.name)}</span>${extra}</div>
         <div class="c-time">${c.last ? esc(shortTime(c.last.at)) : ''}</div>
         <div class="c-last">${esc(last)}</div>
         <div>${c.unread ? `<span class="dot-badge">${c.unread}</span>` : ''}</div>
@@ -787,9 +795,39 @@ function markRead(fp) {
 }
 window.addEventListener('focus', () => { if (chatOpen()) markRead(state.openChat); });
 
+const myFp = () => state.device?.fingerprint;
+const groupOf = (key) => state.chats.get(key)?.group || null;
+
 function renderChatHead() {
   const fp = state.openChat;
   if (!fp) return;
+  const conv = state.chats.get(fp);
+  const g = conv?.group;
+  $('#chat-members').hidden = !g;
+  $('#chat-leave').hidden = !g || conv.left;
+  $('#chat-block').hidden = !!g;
+  if (g) {
+    const av = $('#chat-avatar');
+    av.className = 'avatar sm group';
+    av.style.background = grad(fp);
+    av.innerHTML = ic.users;
+    $('#chat-name').textContent = conv.name;
+    const online = g.members.filter((m) => m.fingerprint !== myFp() && peerByFp(m.fingerprint)).length;
+    const st = $('#chat-status');
+    st.className = 'chat-status';
+    st.textContent = conv.left
+      ? (g.deleted ? 'Grup silindi' : 'Bu grubun üyesi değilsiniz')
+      : `${g.members.length} kişi · ${online} çevrimiçi`;
+    $('#chat-leave').title = g.admin === myFp() ? 'Grubu herkes için sil' : 'Gruptan ayrıl';
+    const canSend = !conv.left && !g.deleted;
+    const ta = $('#composer');
+    ta.disabled = !canSend;
+    ta.placeholder = canSend ? 'Gruba mesaj yazın…' : 'Bu gruba mesaj gönderemezsiniz';
+    $('#chat-send').disabled = !canSend || !ta.value.trim();
+    updateComposerNote();
+    return;
+  }
+  $('#chat-avatar').className = 'avatar sm';
   const peer = peerByFp(fp);
   const name = peer?.name || state.chats.get(fp)?.name || '';
   const blocked = isBlocked(fp);
@@ -813,6 +851,12 @@ function renderChatHead() {
 }
 
 function statusMeta(m) {
+  // Grup mesajı: kaç kişiye ulaştı? Çevrimdışı olanlara geri gelince otomatik gider.
+  if (m.recipients) {
+    const waiting = m.pending?.length || 0;
+    if (!waiting) return `<span title="Herkese iletildi">${ic.checks}</span>`;
+    return `<span title="Çevrimdışı üyelere geri geldiklerinde otomatik iletilecek">${ic.clock}</span> ${m.recipients - waiting}/${m.recipients}`;
+  }
   if (m.status === 'sending') return `<span title="Gönderiliyor">${ic.clock}</span>`;
   if (m.status === 'sent') return `<span title="İletildi">${ic.checks}</span>`;
   if (m.status === 'failed') {
@@ -832,21 +876,32 @@ function renderMessages(forceBottom = false) {
   }
   let html = '';
   let lastDay = '';
-  let prevDir = null;
+  let prev = null; // önceki balonun yönü + göndereni (grupta isim tekrarını önlemek için)
   for (const m of list) {
     const day = new Date(m.at).toDateString();
     if (day !== lastDay) {
       html += `<div class="day-sep">${esc(dayLabel(m.at))}</div>`;
       lastDay = day;
-      prevDir = null;
+      prev = null;
+    }
+    if (m.system) {
+      html += `<div class="sys-msg">${esc(m.text)}</div>`;
+      prev = null;
+      continue;
     }
     const dir = m.outgoing ? 'out' : 'in';
+    const who = `${dir}:${m.sender || ''}`;
+    const first = prev !== who;
+    const sender = !m.outgoing && m.senderName && first
+      ? `<div class="sender" style="color:hsl(${hue(m.sender)} 65% 55%)">${esc(m.senderName)}</div>`
+      : '';
     html += `
-      <div class="msg ${dir}${prevDir !== dir ? ' first' : ''}${m.status === 'failed' ? ' failed' : ''}">
+      <div class="msg ${dir}${first ? ' first' : ''}${m.status === 'failed' ? ' failed' : ''}">
+        ${sender}
         <div class="bubble">${esc(m.text)}</div>
         <div class="meta">${esc(fmtTime(m.at))}${m.outgoing ? statusMeta(m) : ''}</div>
       </div>`;
-    prevDir = dir;
+    prev = who;
   }
   box.innerHTML = html;
   if (forceBottom || nearBottom) box.scrollTop = box.scrollHeight;
@@ -872,10 +927,13 @@ function updateComposerNote() {
 async function sendChat() {
   const ta = $('#composer');
   const text = ta.value.trim();
-  const peer = peerByFp(state.openChat);
-  if (!text || !peer || ta.disabled) return;
+  const key = state.openChat;
+  if (!text || ta.disabled || !key) return;
+  const peer = peerByFp(key);
+  if (!groupOf(key) && !peer) return;
   try {
-    await call('chat_send', { peerId: peer.id, text });
+    if (groupOf(key)) await call('group_send', { key, text });
+    else await call('chat_send', { peerId: peer.id, text });
     ta.value = '';
     autoGrow();
     updateComposerNote();
@@ -930,11 +988,213 @@ $('#chat-clear').onclick = async () => {
   if (!(await confirmDialog('Sohbet geçmişi silinsin mi?',
     'Yalnızca bu bilgisayardaki kopya silinir; karşı taraftaki mesajlar etkilenmez.', 'Sil', true))) return;
   await call('chat_clear', { fingerprint: fp });
+  const conv = state.chats.get(fp);
+  if (conv?.group && !conv.left) {
+    // Etkin grupta yalnızca mesajlar silinir, grup kalır.
+    state.history.set(fp, (state.history.get(fp) || []).filter((m) => m.outgoing && m.pending?.length));
+    conv.last = null;
+    conv.unread = 0;
+    renderMessages(true);
+    renderConvs();
+    return;
+  }
   state.history.delete(fp);
   state.chats.delete(fp);
   closeChat();
   renderPeers();
 };
+
+// ───────────────────────────── Gruplar ─────────────────────────────
+
+/// Gruba eklenebilecek kişiler: çevrimiçi cihazlar + daha önce yazışılan (çevrimdışı) kişiler.
+function candidatePeople(exclude = new Set()) {
+  const map = new Map();
+  state.peers.filter((p) => !p.blocked).forEach((p) => map.set(p.fingerprint, { fingerprint: p.fingerprint, name: p.name, online: true }));
+  state.chats.forEach((c) => {
+    if (!c.group && !map.has(c.fingerprint) && !isBlocked(c.fingerprint)) {
+      map.set(c.fingerprint, { fingerprint: c.fingerprint, name: c.name, online: false });
+    }
+  });
+  return [...map.values()]
+    .filter((p) => !exclude.has(p.fingerprint))
+    .sort((a, b) => (b.online - a.online) || a.name.localeCompare(b.name, 'tr'));
+}
+
+function personRow(p, checked) {
+  return `
+    <label class="recip ${checked ? 'on' : ''}" data-fp="${esc(p.fingerprint)}">
+      <input type="checkbox" ${checked ? 'checked' : ''} />
+      <span class="avatar" style="background:${grad(p.fingerprint)}">${esc(initials(p.name))}</span>
+      <span class="r-name">${esc(p.name)}</span>
+      ${p.online ? '<span class="online-dot" title="Çevrimiçi"></span>' : '<span class="off">çevrimdışı</span>'}
+    </label>`;
+}
+
+function showGroupCreate() {
+  const selected = new Set();
+  const m = openModal('group-new', `
+    <h3>Yeni grup</h3>
+    <p class="lead">Grup mesajları her üyeye şifreli olarak ayrı ayrı gider. Çevrimdışı üyeler, geri geldiklerinde mesajları otomatik alır.</p>
+    <div class="field">
+      <label for="g-name">Grup adı</label>
+      <input class="input" id="g-name" maxlength="40" placeholder="ör. Proje Ekibi" autofocus />
+    </div>
+    <div class="field">
+      <label>Üyeler</label>
+      <div class="recips" id="g-people"></div>
+      <div class="err" id="g-err"></div>
+    </div>
+    <div class="foot">
+      <button class="btn ghost" data-close>Vazgeç</button>
+      <button class="btn" id="g-create" disabled>Grubu oluştur</button>
+    </div>`);
+  const people = candidatePeople();
+  const render = () => {
+    m.querySelector('#g-people').innerHTML = people.length
+      ? people.map((p) => personRow(p, selected.has(p.fingerprint))).join('')
+      : '<span class="muted small">Eklenecek kimse yok. Ağda başka bir FastFiles görünmeli.</span>';
+    const name = m.querySelector('#g-name').value.trim();
+    const btn = m.querySelector('#g-create');
+    btn.disabled = !name || !selected.size;
+    btn.textContent = selected.size ? `Grubu oluştur (${selected.size + 1} kişi)` : 'Grubu oluştur';
+  };
+  m.querySelector('#g-people').addEventListener('change', (e) => {
+    const fp = e.target.closest('.recip')?.dataset.fp;
+    if (!fp) return;
+    e.target.checked ? selected.add(fp) : selected.delete(fp);
+    render();
+  });
+  m.querySelector('#g-name').addEventListener('input', render);
+  m.querySelector('[data-close]').onclick = closeModal;
+  m.querySelector('#g-create').onclick = async () => {
+    try {
+      const summary = await api.invoke('group_create', { name: m.querySelector('#g-name').value, members: [...selected] });
+      state.chats.set(summary.fingerprint, summary);
+      closeModal();
+      setTab('chats');
+      renderConvs();
+      openChat(summary.fingerprint);
+    } catch (e) {
+      m.querySelector('#g-err').textContent = String(e);
+    }
+  };
+  render();
+}
+$('#btn-new-group').onclick = showGroupCreate;
+
+function showGroupMembers() {
+  const key = state.openChat;
+  const conv = state.chats.get(key);
+  const g = conv?.group;
+  if (!g) return;
+  const isAdmin = g.admin === myFp() && !conv.left && !g.deleted;
+  const removing = new Set();
+  const adding = new Set();
+  const m = openModal('group-members', `
+    <h3>${esc(conv.name)}</h3>
+    <p class="lead">${isAdmin ? 'Grubun yöneticisi sizsiniz: adı değiştirebilir, üye ekleyip çıkarabilirsiniz.' : 'Grubu yalnızca oluşturan kişi düzenleyebilir.'}</p>
+    ${isAdmin ? `<div class="field"><label for="gm-name">Grup adı</label><input class="input" id="gm-name" maxlength="40" value="${esc(conv.name)}" /></div>` : ''}
+    <div class="field">
+      <label>Üyeler (${g.members.length})</label>
+      <div class="member-list" id="gm-list"></div>
+    </div>
+    ${isAdmin ? '<div class="field"><label>Üye ekle</label><div class="recips" id="gm-add"></div></div>' : ''}
+    <div class="err" id="gm-err"></div>
+    <div class="foot">
+      <button class="btn ghost" data-close>${isAdmin ? 'Vazgeç' : 'Kapat'}</button>
+      ${isAdmin ? '<button class="btn" id="gm-save">Kaydet</button>' : ''}
+    </div>`);
+  const render = () => {
+    m.querySelector('#gm-list').innerHTML = g.members.map((mem) => {
+      const me = mem.fingerprint === myFp();
+      const online = me || !!peerByFp(mem.fingerprint);
+      return `
+        <div class="member ${removing.has(mem.fingerprint) ? 'removing' : ''}">
+          <span class="avatar" style="background:${grad(mem.fingerprint)}">${esc(initials(mem.name))}</span>
+          <span class="m-name">${esc(mem.name)}${me ? ' <span class="muted small">(siz)</span>' : ''}
+            ${mem.fingerprint === g.admin ? '<span class="badge admin">Yönetici</span>' : ''}</span>
+          ${online ? '<span class="online-dot" title="Çevrimiçi"></span>' : '<span class="muted small">çevrimdışı</span>'}
+          ${isAdmin && !me ? `<button class="icon-btn sm" data-rm="${esc(mem.fingerprint)}" title="${removing.has(mem.fingerprint) ? 'Geri al' : 'Gruptan çıkar'}">${ic.x}</button>` : ''}
+        </div>`;
+    }).join('');
+    if (isAdmin) {
+      const people = candidatePeople(new Set(g.members.map((x) => x.fingerprint)));
+      m.querySelector('#gm-add').innerHTML = people.length
+        ? people.map((p) => personRow(p, adding.has(p.fingerprint))).join('')
+        : '<span class="muted small">Eklenebilecek başka kimse yok.</span>';
+    }
+  };
+  m.querySelector('#gm-list').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-rm]');
+    if (!b) return;
+    removing.has(b.dataset.rm) ? removing.delete(b.dataset.rm) : removing.add(b.dataset.rm);
+    render();
+  });
+  m.querySelector('#gm-add')?.addEventListener('change', (e) => {
+    const fp = e.target.closest('.recip')?.dataset.fp;
+    if (!fp) return;
+    e.target.checked ? adding.add(fp) : adding.delete(fp);
+    render();
+  });
+  m.querySelector('[data-close]').onclick = closeModal;
+  m.querySelector('#gm-save')?.addEventListener('click', async () => {
+    try {
+      const summary = await api.invoke('group_edit', {
+        key, name: m.querySelector('#gm-name').value, add: [...adding], remove: [...removing],
+      });
+      state.chats.set(key, { ...state.chats.get(key), ...summary });
+      closeModal();
+      renderChatHead();
+      renderConvs();
+    } catch (e) {
+      m.querySelector('#gm-err').textContent = String(e);
+    }
+  });
+  render();
+}
+$('#chat-members').onclick = showGroupMembers;
+
+$('#chat-leave').onclick = async () => {
+  const key = state.openChat;
+  const conv = state.chats.get(key);
+  const g = conv?.group;
+  if (!g) return;
+  const admin = g.admin === myFp();
+  const ok = await confirmDialog(
+    admin ? `“${conv.name}” herkes için silinsin mi?` : `“${conv.name}” grubundan ayrılınsın mı?`,
+    admin
+      ? 'Grubu siz oluşturdunuz. Silerseniz grup tüm üyeler için kapanır; mesaj geçmişi herkesin bilgisayarında kalır.'
+      : 'Artık bu gruptan mesaj almazsınız. Geçmiş bu bilgisayarda kalır.',
+    admin ? 'Grubu sil' : 'Ayrıl', true);
+  if (!ok) return;
+  await call('group_leave', { key });
+};
+
+function onConversation(summary) {
+  const prev = state.chats.get(summary.fingerprint) || {};
+  state.chats.set(summary.fingerprint, { ...prev, ...summary });
+  renderConvs();
+  if (state.openChat === summary.fingerprint) renderChatHead();
+}
+
+// ───────────────────────────── Bildirime tıklama ─────────────────────────────
+
+function onNotificationClick(target = {}) {
+  if (modalKind && modalKind !== 'incoming') closeModal();
+  if (target.view === 'chat' && target.key) {
+    openChat(target.key);
+  } else if (target.view === 'transfers') {
+    if (chatOpen()) closeChat();
+    setTab('transfers');
+    const el = target.transferId && document.getElementById(`t-${target.transferId}`);
+    if (el) {
+      el.scrollIntoView({ block: 'nearest' });
+      el.classList.remove('flash');
+      void el.offsetWidth;
+      el.classList.add('flash');
+    }
+  }
+}
 
 function onChat({ fingerprint: fp, name, unread, incoming, message }) {
   const c = state.chats.get(fp) || { fingerprint: fp, name, unread: 0, last: null };
@@ -952,7 +1212,8 @@ function onChat({ fingerprint: fp, name, unread, incoming, message }) {
     renderMessages(!incoming);
     if (incoming && document.hasFocus()) markRead(fp);
   } else if (incoming) {
-    toast(`${name}: ${message.text.replace(/\s+/g, ' ').slice(0, 80)}`, {
+    const who = message.senderName ? `${name} · ${message.senderName}` : name;
+    toast(`${who}: ${message.text.replace(/\s+/g, ' ').slice(0, 80)}`, {
       action: 'Aç', timeout: 6000, onAction: () => openChat(fp, name),
     });
   }
@@ -1085,6 +1346,8 @@ async function init() {
     batch?.render();
   });
   api.listen('chat', (e) => onChat(e.payload));
+  api.listen('conversation', (e) => onConversation(e.payload));
+  api.listen('notification-click', (e) => onNotificationClick(e.payload));
   api.listen('update-ready', async () => {
     state.update = await api.invoke('update_state').catch(() => state.update);
     renderUpdateBar();
@@ -1143,6 +1406,26 @@ function createPreviewApi() {
     { fingerprint: fp1, name: 'Ahmet', unread: 0, last: { id: 'a1', outgoing: true, text: 'Proje dosyalarını gönderdim', at: now - 3 * 3600e3, status: 'sent' } },
     { fingerprint: 'cc' + fp.slice(2), name: 'Mehmet (İzinde)', unread: 0, last: { id: 'b1', outgoing: false, text: 'Pazartesi görüşürüz', at: now - 5 * 86400e3, status: 'received' } },
   ];
+  // Örnek grup (bu cihaz yönetici). Önizlemede cihazın kendi parmak izi diğerlerinden farklı olmalı.
+  snap.device.fingerprint = 'dd' + fp.slice(2);
+  const me = snap.device.fingerprint;
+  const fpM = 'cc' + fp.slice(2);
+  const gkey = 'g:grp-1';
+  const group = {
+    id: 'grp-1', name: 'Proje Ekibi', admin: me, rev: 2, deleted: false,
+    members: [{ fingerprint: me, name: 'Nur' }, { fingerprint: fp1, name: 'Ahmet' }, { fingerprint: fp2, name: 'Elif (Tasarım)' }, { fingerprint: fpM, name: 'Mehmet (İzinde)' }],
+  };
+  history[gkey] = [
+    { id: 'g0', system: true, text: 'Grubu oluşturdunuz', at: now - 50 * 60e3 },
+    { id: 'g1', outgoing: false, sender: fp1, senderName: 'Ahmet', text: 'Build bu akşam hazır olur mu?', at: now - 40 * 60e3, status: 'received' },
+    { id: 'g2', outgoing: false, sender: fp2, senderName: 'Elif (Tasarım)', text: 'Arayüz görselleri tamam, klasörü gönderdim.', at: now - 38 * 60e3, status: 'received' },
+    { id: 'g3', outgoing: false, sender: fp2, senderName: 'Elif (Tasarım)', text: 'Bir de ikonlar var, onları yarın atarım.', at: now - 37 * 60e3, status: 'received' },
+    { id: 'g4', system: true, text: 'Mehmet (İzinde) gruba eklendi', at: now - 30 * 60e3 },
+    { id: 'g5', outgoing: true, text: 'Evet, 18:00 gibi paylaşırım 👍', at: now - 20 * 60e3, status: 'sending', recipients: 3, pending: [fpM] },
+    { id: 'g6', outgoing: false, sender: fp1, senderName: 'Ahmet', text: 'Süper, teşekkürler', at: now - 5 * 60e3, status: 'received' },
+  ];
+  snap.conversations.unshift({ fingerprint: gkey, name: 'Proje Ekibi', unread: 1, last: history[gkey].at(-1), group, left: false });
+
   snap.update = location.hash.includes('update')
     ? { current: '1.2.0', ready: '1.2.1', serving: '1.2.1' }
     : { current: '1.2.0', ready: null, serving: null };
@@ -1153,6 +1436,7 @@ function createPreviewApi() {
   window.__preview = { emit, snap };
   setTimeout(() => {
     if (location.hash.includes('chat')) document.querySelector('.peer[data-id="p2"] [data-act="chat"]')?.click();
+    if (location.hash.includes('group')) openChat(gkey);
     if (location.hash.includes('batch')) {
       showBatch(['C:\\Projeler\\Sunum_v4.pptx', 'C:\\Projeler\\Marka Kiti', 'D:\\Render\\final_cut.mp4'], ['p1', 'p2']);
     }
@@ -1174,6 +1458,35 @@ function createPreviewApi() {
         emit('chat', { fingerprint: peer.fingerprint, name: peer.name, unread: 0, incoming: false, message: msg });
         setTimeout(() => emit('chat', { fingerprint: peer.fingerprint, name: peer.name, unread: 0, incoming: false, message: { ...msg, status: 'sent' } }), 500);
         return msg;
+      }
+      if (cmd === 'group_send') {
+        const g = snap.conversations.find((c) => c.fingerprint === args.key).group;
+        const others = g.members.filter((m) => m.fingerprint !== me).map((m) => m.fingerprint);
+        const msg = { id: `gm${Date.now()}`, outgoing: true, text: args.text.trim(), at: Date.now(), status: 'sending', recipients: others.length, pending: others };
+        history[args.key].push(msg);
+        emit('chat', { fingerprint: args.key, name: g.name, unread: 0, incoming: false, message: msg });
+        setTimeout(() => emit('chat', { fingerprint: args.key, name: g.name, unread: 0, incoming: false, message: { ...msg, pending: [fpM] } }), 400);
+        return msg;
+      }
+      if (cmd === 'group_create') {
+        const g = { id: `grp-${Date.now()}`, name: args.name.trim(), admin: me, rev: 1, deleted: false,
+          members: [{ fingerprint: me, name: 'Nur' }, ...args.members.map((f) => ({ fingerprint: f, name: snap.peers.find((p) => p.fingerprint === f)?.name || 'Kişi' }))] };
+        const key = `g:${g.id}`;
+        history[key] = [{ id: 's1', system: true, text: 'Grubu oluşturdunuz', at: Date.now() }];
+        return { fingerprint: key, name: g.name, unread: 0, last: history[key][0], group: g, left: false };
+      }
+      if (cmd === 'group_edit') {
+        const c = snap.conversations.find((x) => x.fingerprint === args.key);
+        if (args.name) c.name = c.group.name = args.name;
+        c.group.members = c.group.members.filter((m) => !args.remove.includes(m.fingerprint));
+        args.add.forEach((f) => c.group.members.push({ fingerprint: f, name: snap.peers.find((p) => p.fingerprint === f)?.name || 'Kişi' }));
+        return structuredClone(c);
+      }
+      if (cmd === 'group_leave') {
+        const c = snap.conversations.find((x) => x.fingerprint === args.key);
+        c.left = true; c.group.deleted = c.group.admin === me;
+        emit('conversation', structuredClone(c));
+        return null;
       }
       if (cmd === 'set_blocked') {
         snap.settings.blocked = args.blocked ? [...(snap.settings.blocked || []), { fingerprint: args.fingerprint, name: args.name }] : (snap.settings.blocked || []).filter((b) => b.fingerprint !== args.fingerprint);

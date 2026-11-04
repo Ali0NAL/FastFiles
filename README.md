@@ -18,12 +18,15 @@ Aynı ağa (Wi-Fi veya ethernet) bağlı bilgisayarlar birbirini otomatik bulur.
 - **IP ile ekleme.** Otomatik keşfin ulaşmadığı ağlar için cihaz adresiyle eklenebilir.
 - **Toplu gönderme.** "Toplu gönder" ile aynı dosya ve klasörler birden fazla kişiye tek seferde gönderilir. Dosyaları kartların dışındaki boş alana bırakmak da bu pencereyi açar. Her alıcı ayrıca onaylar.
 - **Mesajlaşma.** Cihaz kartındaki mesaj butonuyla sohbet açılır. Okunmamış mesajlar rozetle gösterilir. Pencere arkadayken Windows bildirimi gelir ve görev çubuğu yanıp söner.
+- **Grup mesajlaşma.** Mesajlar sekmesinde "Yeni grup" ile grup kurulur. Mesajlar her üyeye şifreli olarak ayrı ayrı gider. **Çevrimdışı üyeler geri geldiklerinde bekleyen mesajları otomatik alır** (en fazla 3 gün). Mesajın kaç kişiye ulaştığı görünür (ör. 2/3). Grubu yalnızca oluşturan kişi (yönetici) yeniden adlandırabilir, üye ekleyip çıkarabilir veya silebilir; yönetici sertifika parmak iziyle tanındığı için bu yetki taklit edilemez. Üyeler istedikleri zaman ayrılabilir.
 - **Engelleme.** Engellenen cihazdan gelen mesaj ve dosyalar otomatik reddedilir.
 - **Windows bildirimleri.** Pencere arkadayken veya tepsideyken bildirim gelir:
   - güvenilir cihazdan dosya gelmeye başladığında,
   - dosya alımı bittiğinde ya da başarısız olduğunda,
   - onay bekleyen bir gönderim geldiğinde,
   - yeni mesaj geldiğinde.
+
+  Bildirime tıklayınca uygulama açılır ve ilgili ekran gelir: mesajda o sohbet, dosyada aktarımlar.
 - **Otomatik güncelleme.** Güncellemeler sunucu olmadan ağdaki FastFiles'lar arasında kendiliğinden yayılır. Ayrıntılar aşağıda.
 
 ### Otomatik güncelleme nasıl çalışır?
