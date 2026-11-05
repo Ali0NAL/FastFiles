@@ -134,6 +134,12 @@ pub enum Message {
     AbortAck,
     /// Gönderen aktarımı duraklattı (yarım dosyalar korunur). Yanıt: AbortAck.
     PauseNotice { device: DeviceInfo, transfer_id: String },
+    /// "Yazıyor…" sinyali (yanıt beklenmez). `group_id` varsa grup sohbetinde yazılıyor.
+    Typing {
+        device: DeviceInfo,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group_id: Option<String>,
+    },
 }
 
 pub const MAX_CHAT_CHARS: usize = 4000;

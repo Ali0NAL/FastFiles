@@ -370,6 +370,16 @@ impl ChatStore {
         items
     }
 
+    /// Tüm mesajları siler (PIN unutulunca). Grup üyelikleri korunur, yalnızca mesajlar gider.
+    pub fn wipe_messages(&mut self) {
+        self.convs.retain(|_, c| c.group.is_some());
+        for c in self.convs.values_mut() {
+            c.messages.clear();
+            c.unread = 0;
+        }
+        self.save();
+    }
+
     pub fn summaries(&self) -> Vec<ConversationSummary> {
         let mut list: Vec<ConversationSummary> = self.convs.values().map(Self::summarize).collect();
         list.sort_by(|a, b| {

@@ -78,6 +78,12 @@ pub struct Settings {
     pub speed_limit_mb: u32,
     /// Gezgin'de sağ tık → "FastFiles ile gönder" menüsü.
     pub shell_menu: bool,
+    /// Renk teması: mor | okyanus | orman | gunbatimi | gul | grafit
+    pub theme: String,
+    /// Görünüm: system | light | dark
+    pub appearance: String,
+    /// Bu kadar dakika işlem yapılmazsa kilitlenir (PIN tanımlıysa). 0 = kapalı.
+    pub lock_minutes: u32,
 }
 
 impl Default for Settings {
@@ -94,6 +100,9 @@ impl Default for Settings {
             compress: true,
             speed_limit_mb: 0,
             shell_menu: true,
+            theme: "mor".into(),
+            appearance: "system".into(),
+            lock_minutes: 0,
         }
     }
 }

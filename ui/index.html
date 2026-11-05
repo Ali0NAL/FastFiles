@@ -21,6 +21,9 @@
       <span class="me-ip" id="me-ip"></span>
     </div>
     <div class="top-actions">
+      <button class="icon-btn" id="btn-lock" title="Uygulamayı kilitle">
+        <svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
+      </button>
       <button class="icon-btn" id="btn-downloads" title="İndirilenler klasörünü aç">
         <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
       </button>
@@ -218,12 +221,16 @@
           <button class="attach-btn" id="chat-attach" title="Dosya gönder (ya da dosyaları sohbete sürükleyin)">
             <svg viewBox="0 0 24 24"><path d="M20 11.5 12.4 19a5 5 0 0 1-7.1-7.1l7.8-7.8a3.3 3.3 0 0 1 4.7 4.7l-7.8 7.8a1.7 1.7 0 0 1-2.4-2.4l7.1-7.1"/></svg>
           </button>
+          <button class="attach-btn" id="chat-emoji" title="Emoji ekle">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8.5 14.5s1.3 2 3.5 2 3.5-2 3.5-2M9 9.5h.01M15 9.5h.01"/></svg>
+          </button>
           <textarea id="composer" rows="1" maxlength="4000" placeholder="Mesaj yazın…" spellcheck="true"></textarea>
           <button class="send-btn" id="chat-send" title="Gönder (Enter)">
             <svg viewBox="0 0 24 24"><path d="M5 12h13M13 6l6 6-6 6"/></svg>
           </button>
         </div>
         <div class="composer-note" id="composer-note"></div>
+        <div class="emoji-pop" id="emoji-pop" hidden></div>
       </div>
     </aside>
   </main>
@@ -236,6 +243,25 @@
   <div class="toasts" id="toasts" aria-live="polite"></div>
 
   <script src="avatars/presets.js"></script>
-  <script type="module" src="main.js"></script>
+    <!-- Uygulama kilidi (PIN) -->
+  <div class="lock-screen" id="lock-screen" hidden>
+    <div class="lock-card">
+      <div class="logo big" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M13.5 2 5 13.2h6L9.8 22 19 10h-6.2z"/></svg></div>
+      <h2>FastFiles kilitli</h2>
+      <p class="muted">Devam etmek için 4 haneli PIN'inizi girin</p>
+      <div class="pin-dots" id="pin-dots"><i></i><i></i><i></i><i></i></div>
+      <input id="pin-input" class="pin-input" type="password" inputmode="numeric" maxlength="4" autocomplete="off" aria-label="PIN" />
+      <div class="err" id="pin-err"></div>
+      <div class="pin-pad" id="pin-pad">
+        <button data-k="1">1</button><button data-k="2">2</button><button data-k="3">3</button>
+        <button data-k="4">4</button><button data-k="5">5</button><button data-k="6">6</button>
+        <button data-k="7">7</button><button data-k="8">8</button><button data-k="9">9</button>
+        <span></span><button data-k="0">0</button><button data-k="back" title="Sil">⌫</button>
+      </div>
+      <button class="link-btn" id="pin-forgot">PIN'imi unuttum</button>
+    </div>
+  </div>
+
+<script type="module" src="main.js"></script>
 </body>
 </html>

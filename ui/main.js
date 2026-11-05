@@ -745,6 +745,38 @@ function showSettings() {
       <span>Pencere kapatılınca sistem tepsisinde çalışmaya devam et<br><span class="muted small">Kapalıyken de dosya alabilmek için önerilir.</span></span></label>
     <hr class="sep" />
     <div class="field">
+      <label>Renk teması</label>
+      <div class="theme-row" id="s-themes">${THEMES.map((t) => `
+        <button class="swatch ${t.id === (s.theme || 'mor') ? 'on' : ''}" data-theme="${t.id}" title="${esc(t.name)}"
+          style="background:linear-gradient(135deg, ${t.a}, ${t.b})"></button>`).join('')}</div>
+    </div>
+    <div class="field">
+      <label for="s-appearance">Görünüm</label>
+      <select class="input" id="s-appearance">
+        ${[['system', 'Sistemle aynı'], ['light', 'Açık'], ['dark', 'Koyu']].map(([v, l]) => `<option value="${v}" ${(s.appearance || 'system') === v ? 'selected' : ''}>${l}</option>`).join('')}
+      </select>
+    </div>
+    <hr class="sep" />
+    <div class="field">
+      <label>Uygulama kilidi</label>
+      <span class="help">${state.lock?.hasPin
+        ? 'Açılışta 4 haneli PIN sorulur. Üst çubuktaki kilit düğmesiyle istediğiniz an kilitleyebilirsiniz.'
+        : 'İsterseniz açılışta 4 haneli bir PIN sorulsun. PIN unutulursa kilit ekranından sıfırlanabilir; bu durumda mesajlar ve aktarım geçmişi silinir.'}</span>
+      <div class="row">
+        ${state.lock?.hasPin
+          ? '<button class="btn ghost small" id="s-pin-change">PIN\'i değiştir</button><button class="btn ghost small" id="s-pin-remove">PIN\'i kaldır</button>'
+          : '<button class="btn soft small" id="s-pin-set">PIN belirle</button>'}
+      </div>
+    </div>
+    <div class="field">
+      <label for="s-autolock">Otomatik kilit</label>
+      <select class="input" id="s-autolock" ${state.lock?.hasPin ? '' : 'disabled'}>
+        ${[[0, 'Kapalı'], [1, '1 dakika işlem yapılmazsa'], [5, '5 dakika işlem yapılmazsa'], [15, '15 dakika işlem yapılmazsa'], [30, '30 dakika işlem yapılmazsa'], [60, '1 saat işlem yapılmazsa']]
+          .map(([v, l]) => `<option value="${v}" ${(s.lockMinutes || 0) === v ? 'selected' : ''}>${l}</option>`).join('')}
+      </select>
+    </div>
+    <hr class="sep" />
+    <div class="field">
       <label for="s-limit">Gönderim hız sınırı</label>
       <select class="input" id="s-limit">${limitOptions(s.speedLimitMb || 0)}</select>
       <span class="help">Büyük gönderimler ofis ağını tıkamasın diye bu bilgisayarın toplam gönderim hızını sınırlar. Alım hızı etkilenmez.</span>
@@ -857,7 +889,11 @@ function showSettings() {
         compress: m.querySelector('#s-compress').checked,
         shellMenu: m.querySelector('#s-shell').checked,
         speedLimitMb: Number(m.querySelector('#s-limit').value),
+        theme: m.querySelector('.swatch.on')?.dataset.theme || 'mor',
+        appearance: m.querySelector('#s-appearance').value,
+        lockMinutes: Number(m.querySelector('#s-autolock').value),
       });
+      applyTheme(state.settings);
       renderMe();
       closeModal();
       toast('Ayarlar kaydedildi', { type: 'success' });
@@ -865,7 +901,221 @@ function showSettings() {
   };
   m.querySelector('#s-save').onclick = save;
   m.querySelector('#s-name').addEventListener('keydown', (e) => e.key === 'Enter' && save());
+  // Tema: tıklayınca önizlenir; kaydedilmezse pencere kapanınca eskisine döner.
+  const preview = () => applyTheme({ theme: m.querySelector('.swatch.on')?.dataset.theme, appearance: m.querySelector('#s-appearance').value });
+  m.querySelector('#s-themes').addEventListener('click', (e) => {
+    const b = e.target.closest('.swatch');
+    if (!b) return;
+    m.querySelectorAll('.swatch').forEach((x) => x.classList.toggle('on', x === b));
+    preview();
+  });
+  m.querySelector('#s-appearance').onchange = preview;
+  modalOnClose = () => applyTheme(state.settings);
+  m.querySelector('#s-pin-set')?.addEventListener('click', () => showPinSetup('set'));
+  m.querySelector('#s-pin-change')?.addEventListener('click', () => showPinSetup('change'));
+  m.querySelector('#s-pin-remove')?.addEventListener('click', () => showPinSetup('remove'));
 }
+
+// ───────────────────────────── Renk temaları ─────────────────────────────
+
+const THEMES = [
+  { id: 'mor', name: 'Mor', a: '#5b55f6', b: '#22c5e0' },
+  { id: 'okyanus', name: 'Okyanus', a: '#0a7cff', b: '#2ec4b6' },
+  { id: 'orman', name: 'Orman', a: '#1f9d6b', b: '#9ccc3d' },
+  { id: 'gunbatimi', name: 'Gün batımı', a: '#ef6a2e', b: '#f5b52a' },
+  { id: 'gul', name: 'Gül', a: '#e0457b', b: '#a26bff' },
+  { id: 'grafit', name: 'Grafit', a: '#4b5567', b: '#7f8ba0' },
+];
+
+function applyTheme(s) {
+  const root = document.documentElement;
+  const theme = THEMES.some((t) => t.id === s?.theme) ? s.theme : 'mor';
+  const mode = ['light', 'dark'].includes(s?.appearance) ? s.appearance : 'system';
+  if (theme === 'mor') delete root.dataset.theme; else root.dataset.theme = theme;
+  if (mode === 'system') delete root.dataset.mode; else root.dataset.mode = mode;
+  try { localStorage.setItem('ff-theme', JSON.stringify({ theme, appearance: mode })); } catch { /* yok say */ }
+}
+// Ayarlar yüklenmeden önce son temayı uygula (açılışta renk sıçramasın).
+try { applyTheme(JSON.parse(localStorage.getItem('ff-theme') || 'null')); } catch { /* yok say */ }
+
+// ───────────────────────────── Uygulama kilidi ─────────────────────────────
+
+const lockUi = { pin: '', busy: false, timer: null };
+const lockVisible = () => !$('#lock-screen').hidden;
+
+function renderPinDots() {
+  $('#pin-input').value = lockUi.pin;
+  $('#pin-dots').querySelectorAll('i').forEach((d, i) => d.classList.toggle('on', i < lockUi.pin.length));
+}
+
+function showLock() {
+  closeEmoji();
+  lockUi.pin = '';
+  renderPinDots();
+  $('#pin-err').textContent = '';
+  $('#lock-screen').hidden = false;
+  $('#lock-forgot-box')?.remove();
+  $('#pin-pad').hidden = false;
+  setTimeout(() => $('#pin-input').focus(), 50);
+}
+
+function waitRetry(seconds) {
+  clearInterval(lockUi.timer);
+  let left = seconds;
+  const pad = $('#pin-pad').querySelectorAll('button');
+  const tick = () => {
+    pad.forEach((b) => (b.disabled = left > 0));
+    $('#pin-err').textContent = left > 0 ? `Çok fazla yanlış deneme. ${left} sn bekleyin` : '';
+    if (left-- <= 0) clearInterval(lockUi.timer);
+  };
+  tick();
+  lockUi.timer = setInterval(tick, 1000);
+}
+
+async function submitPin() {
+  if (lockUi.busy) return;
+  lockUi.busy = true;
+  const pin = lockUi.pin;
+  try {
+    await api.invoke('unlock_app', { pin });
+    state.lock = { ...(state.lock || {}), locked: false };
+    $('#lock-screen').hidden = true;
+    lastActivity = Date.now();
+    if (!state.booted) init().catch((e) => toast(`Başlatılamadı: ${e}`, { type: 'error', timeout: 15000 }));
+  } catch (e) {
+    lockUi.pin = '';
+    renderPinDots();
+    const dots = $('#pin-dots');
+    dots.classList.remove('shake');
+    void dots.offsetWidth;
+    dots.classList.add('shake');
+    const ls = await api.invoke('lock_state').catch(() => null);
+    if (ls?.retryAfter > 0) waitRetry(ls.retryAfter);
+    else $('#pin-err').textContent = String(e);
+  } finally {
+    lockUi.busy = false;
+  }
+}
+
+function pinKey(k) {
+  if (lockUi.busy || $('#pin-pad').hidden) return;
+  if ([...$('#pin-pad').querySelectorAll('button')].some((b) => b.disabled)) return;
+  if (k === 'back') lockUi.pin = lockUi.pin.slice(0, -1);
+  else if (/^\d$/.test(k) && lockUi.pin.length < 4) lockUi.pin += k;
+  $('#pin-err').textContent = '';
+  renderPinDots();
+  if (lockUi.pin.length === 4) submitPin();
+}
+
+// Yapıştırma / ekran klavyesi gibi tuş olayı üretmeyen girişler.
+$('#pin-input').addEventListener('input', () => {
+  const digits = $('#pin-input').value.replace(/\D/g, '').slice(0, 4);
+  if (lockUi.busy || digits === lockUi.pin) return;
+  lockUi.pin = digits;
+  $('#pin-err').textContent = '';
+  renderPinDots();
+  if (lockUi.pin.length === 4) submitPin();
+});
+
+$('#pin-pad').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-k]');
+  if (b) pinKey(b.dataset.k);
+});
+// Kilitliyken klavye yalnızca PIN girer; diğer kısayollar (Esc vb.) çalışmaz.
+window.addEventListener('keydown', (e) => {
+  if (!lockVisible()) return;
+  e.stopImmediatePropagation();
+  if (/^\d$/.test(e.key)) pinKey(e.key);
+  else if (e.key === 'Backspace') pinKey('back');
+  if (e.key !== 'Tab') e.preventDefault();
+}, true);
+
+$('#pin-forgot').onclick = () => {
+  $('#pin-pad').hidden = true;
+  const box = document.createElement('div');
+  box.id = 'lock-forgot-box';
+  box.innerHTML = `
+    <p class="muted small">PIN sıfırlanırsa bu bilgisayardaki <b>tüm mesajlar ve aktarım geçmişi silinir</b>. Grup üyelikleri, ortak klasörler ve indirilmiş dosyalar kalır.</p>
+    <div class="row" style="justify-content:center">
+      <button class="btn ghost small" id="forgot-no">Vazgeç</button>
+      <button class="btn danger small" id="forgot-yes">Sil ve PIN'i kaldır</button>
+    </div>`;
+  $('#pin-forgot').before(box);
+  box.querySelector('#forgot-no').onclick = () => { box.remove(); $('#pin-pad').hidden = false; };
+  box.querySelector('#forgot-yes').onclick = async () => {
+    await api.invoke('forget_pin').catch(() => {});
+    location.reload();
+  };
+};
+
+$('#btn-lock').onclick = async () => {
+  if (!state.lock?.hasPin) return showPinSetup('set', true);
+  try {
+    await call('lock_app');
+    state.lock.locked = true;
+    showLock();
+  } catch { /* toast gösterildi */ }
+};
+
+function updateLockButton() {
+  $('#btn-lock').title = state.lock?.hasPin ? 'Uygulamayı kilitle' : 'Uygulama kilidi (PIN belirleyin)';
+}
+
+// PIN belirleme / değiştirme / kaldırma penceresi.
+function showPinSetup(mode, lockAfter = false) {
+  const needCurrent = mode !== 'set';
+  const needNew = mode !== 'remove';
+  const title = { set: 'PIN belirle', change: 'PIN\'i değiştir', remove: 'PIN\'i kaldır' }[mode];
+  const digits = (id, ph) => `<input class="input" id="${id}" type="password" inputmode="numeric" maxlength="4" placeholder="${ph}" autocomplete="off" />`;
+  const m = openModal('pin', `
+    <h3>${title}</h3>
+    <p class="lead">${mode === 'remove' ? 'Uygulama artık açılışta PIN sormayacak.' : 'Uygulama açılırken ve kilitlediğinizde bu 4 haneli PIN sorulur. Unutursanız kilit ekranından sıfırlayabilirsiniz; bu durumda mesajlar ve aktarım geçmişi silinir.'}</p>
+    <div class="pin-fields">
+      ${needCurrent ? digits('p-cur', 'Mevcut PIN') : ''}
+      ${needNew ? digits('p-new', 'Yeni PIN') + digits('p-new2', 'Tekrar') : ''}
+    </div>
+    <div class="err" id="p-err"></div>
+    <div class="foot">
+      <button class="btn ghost" data-close>Vazgeç</button>
+      <button class="btn ${mode === 'remove' ? 'danger' : ''}" id="p-go">${mode === 'remove' ? 'Kaldır' : 'Kaydet'}</button>
+    </div>`);
+  m.querySelectorAll('input').forEach((i) => i.addEventListener('input', () => { i.value = i.value.replace(/\D/g, '').slice(0, 4); }));
+  setTimeout(() => m.querySelector('input')?.focus(), 30);
+  m.querySelector('[data-close]').onclick = closeModal;
+  const go = async () => {
+    const val = (id) => m.querySelector(`#${id}`)?.value || '';
+    const err = (t) => { m.querySelector('#p-err').textContent = t; };
+    if (needNew && !/^\d{4}$/.test(val('p-new'))) return err('PIN 4 rakamdan oluşmalı');
+    if (needNew && val('p-new') !== val('p-new2')) return err('PIN\'ler aynı değil');
+    try {
+      state.lock = await api.invoke('set_app_pin', { pin: needNew ? val('p-new') : null, current: needCurrent ? val('p-cur') : null });
+      updateLockButton();
+      closeModal();
+      toast(mode === 'remove' ? 'PIN kaldırıldı' : 'PIN kaydedildi', { type: 'success' });
+      if (lockAfter) $('#btn-lock').click();
+    } catch (e) {
+      err(String(e));
+    }
+  };
+  m.querySelector('#p-go').onclick = go;
+  m.querySelectorAll('input').forEach((i) => i.addEventListener('keydown', (e) => e.key === 'Enter' && go()));
+}
+
+// Otomatik kilit: ayardaki süre boyunca fare/klavye hareketi yoksa.
+let lastActivity = Date.now();
+['mousemove', 'mousedown', 'keydown', 'wheel', 'touchstart'].forEach((ev) =>
+  window.addEventListener(ev, () => { lastActivity = Date.now(); }, { passive: true, capture: true }));
+setInterval(async () => {
+  const mins = state.settings?.lockMinutes || 0;
+  if (!mins || !state.lock?.hasPin || lockVisible()) return;
+  if (Date.now() - lastActivity >= mins * 60000) {
+    try {
+      await api.invoke('lock_app');
+      state.lock.locked = true;
+      showLock();
+    } catch { /* yok say */ }
+  }
+}, 10000);
 $('#btn-settings').onclick = showSettings;
 $('#me').onclick = showSettings;
 $('#btn-downloads').onclick = () => call('open_path', { path: state.settings.downloadDir });
@@ -951,7 +1201,7 @@ function renderConvs() {
         ${avatar}
         <div class="c-name">${online ? '<span class="online-dot" title="Çevrimiçi"></span>' : ''}<span>${esc(c.name)}</span>${extra}</div>
         <div class="c-time">${c.last ? esc(shortTime(c.last.at)) : ''}</div>
-        <div class="c-last">${esc(last)}</div>
+        <div class="c-last">${typingText(c.fingerprint) ? `<span class="typing">${esc(typingText(c.fingerprint))}</span>` : esc(last)}</div>
         <div>${c.unread ? `<span class="dot-badge">${c.unread}</span>` : ''}</div>
       </div>`;
   }).join('');
@@ -1008,7 +1258,28 @@ window.addEventListener('focus', () => { if (chatOpen()) markRead(state.openChat
 const myFp = () => state.device?.fingerprint;
 const groupOf = (key) => state.chats.get(key)?.group || null;
 
+// "Yazıyor…": sohbet anahtarı → { name, fp, until }
+const typingText = (key) => {
+  const t = state.typing?.get(key);
+  if (!t || t.until < Date.now()) return '';
+  return groupOf(key) ? `${t.name} yazıyor…` : 'yazıyor…';
+};
+
+function onTyping({ key, fingerprint, name }) {
+  state.typing ||= new Map();
+  state.typing.set(key, { name, fp: fingerprint, until: Date.now() + 6000 });
+  renderChatHead();
+  renderConvs();
+  setTimeout(() => { renderChatHead(); renderConvs(); }, 6100);
+}
+
 function renderChatHead() {
+  renderChatHeadBase();
+  const t = state.openChat && typingText(state.openChat);
+  if (t) $('#chat-status').innerHTML = `<span class="typing">${esc(t)}</span>`;
+}
+
+function renderChatHeadBase() {
   const fp = state.openChat;
   if (!fp) return;
   const conv = state.chats.get(fp);
@@ -1033,6 +1304,7 @@ function renderChatHead() {
     const ta = $('#composer');
     ta.disabled = !canSend;
     $('#chat-attach').disabled = !canSend;
+    $('#chat-emoji').disabled = !canSend;
     ta.placeholder = canSend ? 'Gruba mesaj yazın…' : 'Bu gruba mesaj gönderemezsiniz';
     $('#chat-send').disabled = !canSend || !ta.value.trim();
     updateComposerNote();
@@ -1057,6 +1329,7 @@ function renderChatHead() {
   const ta = $('#composer');
   ta.disabled = !canSend;
   $('#chat-attach').disabled = !canSend;
+  $('#chat-emoji').disabled = !canSend;
   ta.placeholder = canSend ? 'Mesaj yazın…' : blocked ? 'Bu cihazı engellediniz' : 'Cihaz çevrimdışı, mesaj gönderilemez';
   $('#chat-send').disabled = !canSend || !ta.value.trim();
   updateComposerNote();
@@ -1230,6 +1503,7 @@ function updateComposerNote() {
 }
 
 async function sendChat() {
+  closeEmoji();
   const ta = $('#composer');
   const text = ta.value.trim();
   const key = state.openChat;
@@ -1246,7 +1520,13 @@ async function sendChat() {
   } catch { /* toast gösterildi */ }
 }
 
+let lastTypingSent = 0;
 $('#composer').addEventListener('input', () => {
+  // Karşı tarafa "yazıyor…" sinyali (en fazla 2,5 sn'de bir).
+  if (state.openChat && $('#composer').value.trim() && Date.now() - lastTypingSent > 2500) {
+    lastTypingSent = Date.now();
+    api.invoke('send_typing', { key: state.openChat }).catch(() => {});
+  }
   autoGrow();
   updateComposerNote();
   $('#chat-send').disabled = $('#composer').disabled || !$('#composer').value.trim();
@@ -1273,6 +1553,50 @@ async function sendToChat(paths) {
   if (!peer) return toast('Bu cihaz çevrimdışı, dosya gönderilemez', { type: 'error' });
   sendPaths(peer, paths);
 }
+
+// ───────── Emoji ─────────
+const EMOJI_SETS = [
+  ['Yüzler', '😀 😃 😄 😁 😆 😅 😂 🤣 😊 😇 🙂 😉 😍 🥰 😘 😋 😜 🤪 🤗 🤔 🤨 😐 😑 😶 🙄 😏 😬 😌 😔 😴 😷 🤒 🤯 🥳 😎 🤓 😕 🙁 😮 😲 😳 🥺 😢 😭 😱 😤 😡'],
+  ['Eller', '👍 👎 👌 ✌️ 🤞 🤝 🙏 👏 🙌 👋 💪 ✍️ 👀 🫡 🤷 🙋'],
+  ['Kalpler ve semboller', '❤️ 🧡 💛 💚 💙 💜 🖤 🤍 💯 ✅ ❌ ⚠️ ❗ ❓ ⭐ ✨ 🔥 💡 🎉 🎊 🚀 ⏰ 📌 🔒'],
+  ['İş', '📁 📂 📄 📎 📊 📈 📉 🗂️ 🗓️ 📅 ✉️ 📧 💻 🖥️ 🖨️ ⌨️ 📱 ☎️ 💾 🔗 🧾 💼 ☕ 🍕'],
+];
+function recentEmoji() {
+  try { return JSON.parse(localStorage.getItem('ff-emoji') || '[]'); } catch { return []; }
+}
+function rememberEmoji(e) {
+  try { localStorage.setItem('ff-emoji', JSON.stringify([e, ...recentEmoji().filter((x) => x !== e)].slice(0, 16))); } catch { /* yok say */ }
+}
+function renderEmoji() {
+  const recent = recentEmoji();
+  const sets = recent.length ? [['Son kullanılanlar', recent.join(' ')], ...EMOJI_SETS] : EMOJI_SETS;
+  $('#emoji-pop').innerHTML = sets.map(([title, list]) => `
+    <h4>${esc(title)}</h4>
+    <div class="emoji-grid">${list.split(' ').filter(Boolean).map((e) => `<button data-emoji="${esc(e)}">${e}</button>`).join('')}</div>`).join('');
+}
+const emojiOpen = () => !$('#emoji-pop').hidden;
+function closeEmoji() { $('#emoji-pop').hidden = true; }
+$('#chat-emoji').onclick = (e) => {
+  e.stopPropagation();
+  if ($('#composer').disabled) return;
+  if (emojiOpen()) return closeEmoji();
+  renderEmoji();
+  $('#emoji-pop').hidden = false;
+};
+$('#emoji-pop').addEventListener('click', (e) => {
+  e.stopPropagation();
+  const b = e.target.closest('[data-emoji]');
+  if (!b) return;
+  const ta = $('#composer');
+  ta.setRangeText(b.dataset.emoji, ta.selectionStart, ta.selectionEnd, 'end');
+  ta.dispatchEvent(new Event('input'));
+  ta.focus();
+  rememberEmoji(b.dataset.emoji);
+});
+document.addEventListener('click', (e) => { if (emojiOpen() && !e.target.closest('#emoji-pop')) closeEmoji(); });
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && emojiOpen()) { closeEmoji(); e.stopImmediatePropagation(); }
+}, true);
 
 $('#chat-attach').onclick = async () => {
   if ($('#composer').disabled) return;
@@ -1539,6 +1863,8 @@ function onNotificationClick(target = {}) {
 }
 
 function onChat({ fingerprint: fp, name, unread, incoming, message }) {
+  // Mesaj geldi: o kişinin "yazıyor…" göstergesi kalkar.
+  if (incoming && state.typing?.get(fp) && (!message.sender || state.typing.get(fp).fp === message.sender)) state.typing.delete(fp);
   const c = state.chats.get(fp) || { fingerprint: fp, name, unread: 0, last: null };
   c.name = name;
   c.unread = unread;
@@ -1678,10 +2004,15 @@ function renderShares() {
       <div class="c-name"><span>${esc(s.name)}</span>${s.protected ? `<span class="c-count" title="Şifreli">${lockIcon.replace('<svg', '<svg style="width:12px;height:12px"')}</span>` : ''}</div>
       <div class="c-time"></div>
       <div class="c-last">${shareStatus(s)}</div>
-      <div></div>
+      <div><button class="icon-btn sm row-del" data-del="${esc(s.id)}" title="${s.admin === myFp() && !s.left && !s.deleted ? 'Klasörü herkes için sil' : 'Klasörü listeden kaldır'}">${ic.trash}</button></div>
     </div>`).join('');
 }
 $('#shares').addEventListener('click', (e) => {
+  const del = e.target.closest('[data-del]');
+  if (del) {
+    e.stopPropagation();
+    return confirmShareDelete(del.dataset.del);
+  }
   const el = e.target.closest('[data-share]');
   if (el) openShare(el.dataset.share);
 });
@@ -1821,8 +2152,10 @@ async function unlockShare() {
 $('#share-unlock').onclick = unlockShare;
 $('#share-pass').addEventListener('keydown', (e) => e.key === 'Enter' && unlockShare());
 
-$('#share-leave').onclick = () => {
-  const s = shareById(state.openShare);
+$('#share-leave').onclick = () => confirmShareDelete(state.openShare);
+
+function confirmShareDelete(id) {
+  const s = shareById(id);
   if (!s) return;
   const admin = s.admin === myFp() && !s.left && !s.deleted;
   const active = !s.left && !s.deleted;
@@ -1847,14 +2180,14 @@ $('#share-leave').onclick = () => {
       await api.invoke('share_delete', { id: s.id, deleteFiles });
       state.shares = state.shares.filter((x) => x.id !== s.id);
       closeModal();
-      closeShare();
+      if (state.openShare === s.id) closeShare();
       renderShares();
       toast(deleteFiles ? 'Klasör ve dosyaları silindi' : 'Klasör silindi; dosyalar bilgisayarınızda duruyor', { type: 'success' });
     } catch (e) {
       m.querySelector('#sd-err').textContent = String(e);
     }
   };
-};
+}
 
 function passwordFields(prefix) {
   return `
@@ -2351,7 +2684,10 @@ async function refreshSnapshot() {
 }
 
 async function init() {
+  state.booted = true;
   const snap = await refreshSnapshot();
+  applyTheme(state.settings);
+  updateLockButton();
   state.chats = new Map((snap.conversations || []).map((c) => [c.fingerprint, c]));
   state.update = snap.update;
   state.avatars = new Map(Object.entries(snap.avatars || {}));
@@ -2395,6 +2731,9 @@ async function init() {
   api.listen('transfers', (e) => setTransfers(e.payload));
   api.listen('incoming', (e) => onIncoming(e.payload));
   api.listen('incoming-closed', (e) => onIncomingClosed(e.payload));
+  api.listen('typing', (e) => onTyping(e.payload));
+  // Karşı taraf gönderimi elle onayladı.
+  api.listen('accepted', (e) => toast(`${e.payload.peerName} kabul etti · "${e.payload.title}" gönderiliyor`, { type: 'success' }));
   // Gezgin'de sağ tık → "FastFiles ile gönder".
   api.listen('send-request', () => takePendingSend());
   takePendingSend();
@@ -2406,7 +2745,16 @@ async function init() {
 }
 
 document.addEventListener('contextmenu', (e) => { if (!e.target.closest('input')) e.preventDefault(); });
-init().catch((e) => toast(`Başlatılamadı: ${e}`, { type: 'error', timeout: 15000 }));
+// PIN tanımlıysa uygulama kilitli açılır; veriler kilit açılınca yüklenir.
+(async () => {
+  state.lock = await api.invoke('lock_state').catch(() => ({ hasPin: false, locked: false, retryAfter: 0 }));
+  if (state.lock.locked) {
+    showLock();
+    if (state.lock.retryAfter > 0) waitRetry(state.lock.retryAfter);
+    return;
+  }
+  await init();
+})().catch((e) => toast(`Başlatılamadı: ${e}`, { type: 'error', timeout: 15000 }));
 
 // ───────────────────────────── Tarayıcı önizlemesi ─────────────────────────────
 
@@ -2643,6 +2991,11 @@ function createPreviewApi() {
       if (cmd === 'remove_transfer') return (snap.transfers = snap.transfers.filter((t) => t.id !== args.id));
       if (cmd === 'retry_transfer') return args.id;
       if (cmd === 'pause_transfer') return null;
+      if (cmd === 'lock_state') return { hasPin: location.hash.includes('applock') || !!window.__pin, locked: location.hash.includes('applock') && !window.__unlocked, retryAfter: 0 };
+      if (cmd === 'unlock_app') { if (args.pin !== '1234') throw 'PIN yanlış'; window.__unlocked = true; return null; }
+      if (cmd === 'lock_app') { window.__unlocked = false; return null; }
+      if (cmd === 'set_app_pin') { window.__pin = args.pin; return { hasPin: !!args.pin, locked: false, retryAfter: 0 }; }
+      if (cmd === 'forget_pin' || cmd === 'send_typing') return null;
       if (cmd === 'take_pending_send') return location.hash.includes('sendto') ? ['C:\\Projeler\\Teklif.docx', 'C:\\Projeler\\Görseller'] : [];
       if (cmd === 'group_send_files') return null;
       if (cmd === 'send_clipboard') return { kind: 'image', count: args.peerIds.length };

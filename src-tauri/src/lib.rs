@@ -1,3 +1,4 @@
+mod applock;
 mod chat;
 mod clipboard;
 mod config;
@@ -65,6 +66,9 @@ fn update_settings(
     compress: Option<bool>,
     speed_limit_mb: Option<u32>,
     shell_menu: Option<bool>,
+    theme: Option<String>,
+    appearance: Option<String>,
+    lock_minutes: Option<u32>,
 ) -> Result<Settings, String> {
     if let Some(name) = &device_name {
         if name.trim().is_empty() {
@@ -93,11 +97,61 @@ fn update_settings(
         if let Some(v) = speed_limit_mb {
             s.speed_limit_mb = v.min(10_000);
         }
+        if let Some(v) = theme.filter(|t| THEMES.contains(&t.as_str())) {
+            s.theme = v;
+        }
+        if let Some(v) = appearance.filter(|a| ["system", "light", "dark"].contains(&a.as_str())) {
+            s.appearance = v;
+        }
+        if let Some(v) = lock_minutes {
+            s.lock_minutes = v.min(24 * 60);
+        }
         if let Some(v) = shell_menu {
             s.shell_menu = v;
             std::thread::spawn(move || shell::apply(v));
         }
     }))
+}
+
+const THEMES: [&str; 6] = ["mor", "okyanus", "orman", "gunbatimi", "gul", "grafit"];
+
+// ───────────────────────────── Uygulama kilidi ─────────────────────────────
+
+type LockState<'a> = State<'a, Arc<applock::AppLock>>;
+
+#[tauri::command]
+fn lock_state(lock: LockState) -> applock::LockState {
+    lock.state()
+}
+
+#[tauri::command]
+fn unlock_app(lock: LockState, pin: String) -> Result<(), String> {
+    lock.unlock(&pin)
+}
+
+#[tauri::command]
+fn lock_app(lock: LockState) -> Result<(), String> {
+    lock.lock()
+}
+
+/// PIN belirler, değiştirir ya da (`pin` boşsa) kaldırır.
+#[tauri::command]
+fn set_app_pin(lock: LockState, pin: Option<String>, current: Option<String>) -> Result<applock::LockState, String> {
+    lock.set_pin(pin.as_deref(), current.as_deref())?;
+    Ok(lock.state())
+}
+
+/// "PIN'imi unuttum": mesajlar ve aktarım geçmişi silinir, PIN kaldırılır.
+#[tauri::command]
+fn forget_pin(lock: LockState, node: NodeState) -> applock::LockState {
+    node.wipe_private_data();
+    lock.forget();
+    lock.state()
+}
+
+#[tauri::command]
+fn send_typing(node: NodeState, key: String) {
+    node.inner().send_typing(&key);
 }
 
 // ───────────────────────────── Gezgin'den gönderme ─────────────────────────────
@@ -424,9 +478,12 @@ fn in_front(app: &AppHandle) -> bool {
 /// Pencere arkadaysa Windows bildirimi gösterir ve görev çubuğunu yakıp söndürür.
 /// `target`: bildirime tıklanınca arayüzün açacağı yer, ör. {"view":"chat","key":...}.
 fn notify_background(app: &AppHandle, title: &str, body: &str, target: serde_json::Value) {
-    if in_front(app) {
+    // Uygulama kilitliyken bildirim gelir ama içeriği (kimden, ne) gösterilmez.
+    let locked = app.try_state::<Arc<applock::AppLock>>().is_some_and(|l| l.is_locked());
+    if in_front(app) && !locked {
         return;
     }
+    let (title, body) = if locked { ("FastFiles", "Yeni bir bildiriminiz var") } else { (title, body) };
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.request_user_attention(Some(tauri::UserAttentionType::Informational));
     }
@@ -673,6 +730,7 @@ pub fn run() {
                 let _ = emit_handle.emit(event, payload);
             });
 
+            app.manage(Arc::new(applock::AppLock::load(&config_dir.join("applock.json"))));
             let node = Node::new(&config_dir, &download_dir, emitter)?;
             tauri::async_runtime::block_on(node.start_server(DEFAULT_PORT))?;
             tauri::async_runtime::spawn(discovery::run(node.clone()));
@@ -776,6 +834,12 @@ pub fn run() {
             group_send,
             group_send_files,
             take_pending_send,
+            lock_state,
+            unlock_app,
+            lock_app,
+            set_app_pin,
+            forget_pin,
+            send_typing,
             set_avatar,
             share_list,
             share_files,

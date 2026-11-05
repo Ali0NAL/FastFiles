@@ -32,6 +32,11 @@ Aynı ağa (Wi-Fi veya ethernet) bağlı bilgisayarlar birbirini otomatik bulur.
 - **Ortak klasörler.** "Klasörler" sekmesinden bir klasör oluşturup kişi eklenir. Klasöre eklenen, düzenlenen veya silinen dosyalar her üyenin bilgisayarındaki kopyaya (`İndirilenler\FastFiles\Ortak\<ad>`) otomatik yansır. Klasörün sahibi isteğe bağlı şifre koyabilir. Ayrıntılar aşağıda.
 - **Oylama.** "Oylama" sekmesinden soru ve seçenekler (2–10) yazılır, oy verecek kişiler seçilir. Seçilenlere bildirim gider. Sonuçlar tüm katılımcılarda canlı güncellenir. Oy, oylama kapanana kadar değiştirilebilir. İsteğe bağlı **gizli oylama** seçilirse kimin neye oy verdiği kimseye gönderilmez, yalnızca sayılar görünür. Oyları yalnızca oylamayı açan kişi toplar ve bitirir. Oylama bilgisi yalnızca açan kişiden kabul edilir (sertifika parmak iziyle doğrulanır). Oy yalnızca katılımcılardan, açık oylamaya ve geçerli bir seçeneğe kabul edilir.
 - **Profil resmi.** Ayarlar'da 20 hazır avatardan biri seçilir (`ui/avatars/`) ya da kendi resminiz yüklenir. Resim kare kırpılıp küçültülür ve diğer cihazlarda kartlarda, sohbetlerde ve üye listelerinde görünür.
+- **Emoji.** Sohbette gülen yüz düğmesiyle emoji eklenir; son kullanılanlar en üstte durur.
+- **"Yazıyor…"** Karşı taraf yazarken sohbet başlığında ve sohbet listesinde "yazıyor…" görünür; grupta kimin yazdığı yazar. Sinyal yalnızca çevrimiçi kişilere gider, saklanmaz.
+- **Kabul bildirimi.** Gönderdiğiniz dosyayı karşı taraf onaylayınca size bildirim gelir (güvenilir cihazların anında kabulünde bildirim çıkmaz).
+- **Renk temaları.** Ayarlar'dan 6 renk teması (Mor, Okyanus, Orman, Gün batımı, Gül, Grafit) ve görünüm (sistemle aynı / açık / koyu) seçilir.
+- **Uygulama kilidi (isteğe bağlı).** Ayarlar'dan 4 haneli PIN belirlenirse uygulama kilitli açılır. Üst çubuktaki kilit düğmesiyle istenen an, ayardaki süre boyunca işlem yapılmazsa otomatik kilitlenir. Kilitliyken bildirimler gelir ama içeriği (kimden, ne) gösterilmez. PIN yalnızca bu bilgisayarda PBKDF2 özeti olarak saklanır; 5 yanlış denemeden sonra bekleme süresi uygulanır. **PIN unutulursa** kilit ekranındaki "PIN'imi unuttum" ile sıfırlanır: bu bilgisayardaki tüm mesajlar ve aktarım geçmişi silinir (grup üyelikleri, ortak klasörler ve indirilmiş dosyalar kalır). Bu, ofis içi kullanım için bilinçli olarak seçilmiş bir koruma düzeyidir: PIN'i bilmeyen biri eski mesajları göremez.
 - **Engelleme.** Engellenen cihazdan gelen mesaj ve dosyalar otomatik reddedilir.
 
 ### Ortak klasörler nasıl çalışır?
@@ -40,7 +45,7 @@ Aynı ağa (Wi-Fi veya ethernet) bağlı bilgisayarlar birbirini otomatik bulur.
 - **Çakışma:** Aynı dosya iki yerde değişirse en son değişiklik geçerli olur. Üzerine yazılan veya silinen her dosyanın eski hâli `.fastfiles\silinen` klasörüne taşınır; hiçbir şey kalıcı olarak kaybolmaz.
 - **Üyelik:** Klasörü yalnızca oluşturan kişi (sahip) yönetebilir: üye ekleme/çıkarma, ad değiştirme, şifre. Sahip, sertifika parmak iziyle tanınır, taklit edilemez. Eklenmeyen kişiler klasörü göremez ve hiçbir dosya isteyemez. Çıkarılan üyenin eşitlemesi durur; o ana kadar aldığı dosyalar onun bilgisayarında kalır.
 - **Şifre:** Sahip isterse şifre koyar. Üyeler şifreyi **bir kez** girer. Şifreyi girmemiş üyeye dosya gönderilmez ve o üye dosya listesini de alamaz. Şifre yalnızca sahibin bilgisayarında PBKDF2-HMAC-SHA256 özeti olarak (100.000 tur, rastgele tuz) saklanır ve ağda yalnızca TLS içinde gider. Tahmin denemelerine karşı cihaz başına 5 dakikada en fazla 5 deneme hakkı vardır.
-- **Silme:** Klasör ekranındaki çöp kutusu simgesiyle yapılır. Sahip silerse klasör tüm üyeler için kapanır; çevrimdışı olanlara açıldıklarında bildirilir. Üye silerse klasörden ayrılır. İsteğe bağlı olarak bu bilgisayardaki dosyalar da silinir; diğer üyelerin kopyalarına dokunulmaz.
+- **Silme:** Klasör listesinde satırın üzerine gelince çıkan ya da klasör ekranındaki çöp kutusu simgesiyle yapılır. Sahip silerse klasör tüm üyeler için kapanır; çevrimdışı olanlara açıldıklarında bildirilir. Üye silerse klasörden ayrılır. İsteğe bağlı olarak bu bilgisayardaki dosyalar da silinir; diğer üyelerin kopyalarına dokunulmaz.
 - **Güvenlik:** Ağdan gelen dosya yolları temizlenir (`..` gibi klasör dışına çıkan yollar reddedilir). Kısayol/sembolik bağlantılar izlenmez ve paylaşılmaz.
 - **Windows bildirimleri.** Pencere arkadayken veya tepsideyken bildirim gelir:
   - güvenilir cihazdan dosya gelmeye başladığında,
@@ -120,6 +125,7 @@ FastFiles/
         ├── pipeline.rs    Disk tarafı: okuyucu, paralel yazıcılar, blok çerçevesi, zstd
         ├── resume.rs      Yarıda kalan alımların kaydı (kaldığı yerden devam)
         ├── shell.rs       Gezgin sağ tık menüsü ve "Gönder" kısayolu
+        ├── applock.rs     İsteğe bağlı açılış PIN'i (uygulama kilidi)
         ├── clipboard.rs   "Panoyu gönder": dosya / ekran görüntüsü / metin
         ├── tls.rs         Sertifika parmak izi ile karşılıklı TLS
         └── config.rs      Cihaz kimliği ve ayarlar

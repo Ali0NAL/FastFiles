@@ -227,6 +227,9 @@ pub struct Node {
     clip_dir: PathBuf,
     /// Duraklatılması istenen gönderimler.
     pauses: Mutex<HashSet<String>>,
+    /// "Yazıyor…" sinyali: sohbet başına son gönderim / cihaz başına son alım zamanı.
+    typing_sent: Mutex<HashMap<String, Instant>>,
+    typing_seen: Mutex<HashMap<String, Instant>>,
     /// Gönderim hız sınırı için jeton kovası: (son güncelleme, jeton).
     bucket: Mutex<(Instant, f64)>,
     pending: Mutex<HashMap<String, oneshot::Sender<Decision>>>,
@@ -291,6 +294,8 @@ impl Node {
             clip_dir: config_dir.join("clipboard"),
             bucket: Mutex::new((Instant::now(), 0.0)),
             pauses: Mutex::new(HashSet::new()),
+            typing_sent: Mutex::new(HashMap::new()),
+            typing_seen: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             emit,
             acceptor,
@@ -1084,6 +1089,12 @@ impl Node {
                 let reply = self.serve_avatar();
                 write_msg(&mut wr, &reply).await.map_err(|e| e.to_string())
             }
+            Message::Typing { device, group_id } => {
+                if device.fingerprint == client_fp {
+                    self.accept_typing(&device, group_id.as_deref());
+                }
+                Ok(())
+            }
             Message::PauseNotice { device, transfer_id } => {
                 if device.fingerprint != client_fp {
                     return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
@@ -1615,6 +1626,72 @@ impl Node {
         }
     }
 
+    /// "Yazıyor…" sinyali gönderir (sohbet başına en fazla 2,5 sn'de bir). Grupta çevrimiçi
+    /// üyelere, birebir sohbette karşı cihaza gider; yanıt beklenmez.
+    pub fn send_typing(self: &Arc<Self>, key: &str) {
+        let now = Instant::now();
+        {
+            let mut sent = self.typing_sent.lock().unwrap();
+            if sent.get(key).is_some_and(|t| now.duration_since(*t) < Duration::from_millis(2500)) {
+                return;
+            }
+            sent.insert(key.to_string(), now);
+        }
+        let me = self.identity.fingerprint.clone();
+        let (targets, group_id): (Vec<String>, Option<String>) = match self.group_of(key) {
+            Some((g, left)) => {
+                if left || g.deleted {
+                    return;
+                }
+                (g.members.iter().map(|m| m.fingerprint.clone()).filter(|f| *f != me).collect(), Some(g.id))
+            }
+            None => (vec![key.to_string()], None),
+        };
+        for peer in self.peers().into_iter().filter(|p| !p.blocked && targets.contains(&p.fingerprint)) {
+            let node = self.clone();
+            let group_id = group_id.clone();
+            tokio::spawn(async move {
+                if let Ok(mut s) = node.connect(&node.candidates(&peer), Some(peer.fingerprint.clone())).await {
+                    let _ = write_msg(&mut s, &Message::Typing { device: node.device_info(), group_id }).await;
+                    let _ = s.shutdown().await;
+                }
+            });
+        }
+    }
+
+    fn accept_typing(&self, device: &DeviceInfo, group_id: Option<&str>) {
+        let fp = device.fingerprint.clone();
+        if self.is_blocked(&fp) {
+            return;
+        }
+        // Grup sinyali yalnızca iki taraf da üyeyse geçerli; değilse yok sayılır.
+        let key = match group_id {
+            Some(gid) => match self.shared_group(gid, &fp) {
+                Some((key, _)) => key,
+                None => return,
+            },
+            None => fp.clone(),
+        };
+        {
+            // Aynı sohbette aynı cihazdan saniyede birden sık sinyal yok sayılır.
+            let mut seen = self.typing_seen.lock().unwrap();
+            let now = Instant::now();
+            let slot = format!("{fp}|{key}");
+            if seen.get(&slot).is_some_and(|t| now.duration_since(*t) < Duration::from_millis(900)) {
+                return;
+            }
+            seen.insert(slot, now);
+        }
+        self.emit("typing", json!({ "key": key, "fingerprint": fp, "name": sanitize_name(&device.name) }));
+    }
+
+    /// PIN unutulunca: mesajlar ve aktarım geçmişi silinir.
+    pub fn wipe_private_data(&self) {
+        self.chats.lock().unwrap().wipe_messages();
+        self.transfers.lock().unwrap().retain(|_, t| !t.is_finished());
+        self.save_history();
+    }
+
     pub fn chat_summaries(&self) -> Vec<ConversationSummary> {
         self.chats.lock().unwrap().summaries()
     }
@@ -1981,13 +2058,22 @@ impl Node {
 
         // Yeniden denemede alıcı onay sormaz ama yarım dosyaları özetlemesi sürebilir.
         let accept_wait = DECISION_TIMEOUT + Duration::from_secs(if retrying { 300 } else { 10 });
+        let asked = Instant::now();
         let reply = tokio::select! {
             r = read_msg(&mut rd) => r.map_err(|_| lost("Alıcı bağlantıyı kapattı".into()))?,
             _ = token.cancelled() => return Ok(SendOutcome::Cancelled),
             _ = sleep(accept_wait) => return Err("Alıcı yanıt vermedi".to_string().into()),
         };
         let (features, offsets) = match reply {
-            Message::Accept { features, offsets } => (features, offsets),
+            Message::Accept { features, offsets } => {
+                // Karşı taraf elle onayladıysa (anında kabul = güvenilir cihaz) gönderene haber ver.
+                if !retrying && asked.elapsed() > Duration::from_secs(2) {
+                    let title = self.transfers.lock().unwrap().get(id).map(|t| t.title.clone()).unwrap_or_default();
+                    self.notify(&format!("{} kabul etti", peer.name), &format!("{title} gönderiliyor"), Some(id));
+                    self.emit("accepted", json!({ "transferId": id, "peerName": peer.name, "title": title }));
+                }
+                (features, offsets)
+            }
             Message::Decline { reason } => return Ok(SendOutcome::Declined(reason)),
             _ => return Err("Beklenmeyen yanıt".to_string().into()),
         };
@@ -3283,6 +3369,51 @@ mod tests {
         }
         assert_eq!(group_texts(&carol, &key), vec!["Carol yokken yazıldı"]);
         wait_until(|| alice.chat_history(&key).iter().any(|m| m.outgoing && m.pending.is_empty())).await;
+    }
+
+    #[tokio::test]
+    async fn typing_signal_reaches_chat_and_group_and_wipe_keeps_groups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev = events.clone();
+        let emitter: Emitter = Arc::new(move |name, payload| {
+            if name == "typing" {
+                ev.lock().unwrap().push(payload);
+            }
+        });
+        let bob = Node::new(&tmp.path().join("bob/config"), &tmp.path().join("bob/dl"), emitter).unwrap();
+        bob.update_settings(|s| s.device_name = "bob".into());
+        bob.start_server(0).await.unwrap();
+        introduce_all(&[&alice, &bob]);
+        let (afp, bfp) = (alice.identity.fingerprint.clone(), bob.identity.fingerprint.clone());
+        let seen = |key: &str| events.lock().unwrap().iter().any(|e| e["key"] == key && e["fingerprint"] == afp.as_str());
+
+        alice.send_typing(&bfp);
+        wait_until(|| seen(&afp)).await;
+        assert_eq!(events.lock().unwrap()[0]["name"], "alice");
+
+        let key = alice.group_create("Ekip", &[bfp.clone()]).unwrap().fingerprint;
+        wait_until(|| bob.chat_summaries().iter().any(|c| c.fingerprint == key)).await;
+        alice.send_typing(&key);
+        wait_until(|| seen(&key)).await;
+
+        // Engellenen cihazın sinyali gösterilmez.
+        bob.set_blocked(&afp, "alice", true);
+        events.lock().unwrap().clear();
+        sleep(Duration::from_millis(1000)).await;
+        alice.typing_sent.lock().unwrap().clear();
+        alice.send_typing(&bfp);
+        sleep(Duration::from_millis(600)).await;
+        assert!(events.lock().unwrap().is_empty());
+
+        // PIN unutulunca: mesajlar gider, grup üyeliği kalır.
+        bob.set_blocked(&afp, "alice", false);
+        alice.chat_send(&bob.identity.id, "gizli").unwrap();
+        wait_until(|| !bob.chat_history(&afp).is_empty()).await;
+        bob.wipe_private_data();
+        assert!(bob.chat_history(&afp).is_empty());
+        assert!(bob.group_of(&key).is_some(), "grup üyeliği korunmalı");
     }
 
     fn file_bubbles(node: &Node, key: &str) -> Vec<ChatMessage> {

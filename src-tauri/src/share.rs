@@ -1028,7 +1028,8 @@ impl Node {
                 }
                 let mut map = self.shares.lock().unwrap();
                 if let Some(st) = map.get_mut(&info.id) {
-                    st.left = info.deleted || !info.has(&me);
+                    // Kullanıcı klasörü sildiyse (ayrılık bildirimi yolda) güncelleme onu geri katmaz.
+                    st.left = st.forgotten || info.deleted || !info.has(&me);
                     st.info = info;
                     if st.left || !st.info.can_access(&me) {
                         st.wanted.clear();
