@@ -149,9 +149,12 @@ fn forget_pin(lock: LockState, node: NodeState) -> applock::LockState {
     lock.state()
 }
 
+/// async: senkron Tauri komutları tokio çalışma ortamının dışında (ana iş parçacığında) çalışır;
+/// `send_typing` arka planda görev başlattığı için orada panikler ve uygulama kapanırdı.
 #[tauri::command]
-fn send_typing(node: NodeState, key: String) {
+async fn send_typing(node: NodeState<'_>, key: String) -> Result<(), String> {
     node.inner().send_typing(&key);
+    Ok(())
 }
 
 // ───────────────────────────── Gezgin'den gönderme ─────────────────────────────

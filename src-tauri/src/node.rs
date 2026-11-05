@@ -1629,6 +1629,12 @@ impl Node {
     /// "Yazıyor…" sinyali gönderir (sohbet başına en fazla 2,5 sn'de bir). Grupta çevrimiçi
     /// üyelere, birebir sohbette karşı cihaza gider; yanıt beklenmez.
     pub fn send_typing(self: &Arc<Self>, key: &str) {
+        // Tokio çalışma ortamı dışından çağrılırsa (ör. senkron bir komut) çökmek yerine atla:
+        // sürüm derlemesinde panik uygulamayı kapatır. "Yazıyor…" kaybı önemsizdir.
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            eprintln!("[fastfiles] send_typing çalışma ortamı dışında çağrıldı; atlandı");
+            return;
+        };
         let now = Instant::now();
         {
             let mut sent = self.typing_sent.lock().unwrap();
@@ -1650,7 +1656,7 @@ impl Node {
         for peer in self.peers().into_iter().filter(|p| !p.blocked && targets.contains(&p.fingerprint)) {
             let node = self.clone();
             let group_id = group_id.clone();
-            tokio::spawn(async move {
+            rt.spawn(async move {
                 if let Ok(mut s) = node.connect(&node.candidates(&peer), Some(peer.fingerprint.clone())).await {
                     let _ = write_msg(&mut s, &Message::Typing { device: node.device_info(), group_id }).await;
                     let _ = s.shutdown().await;
@@ -3369,6 +3375,18 @@ mod tests {
         }
         assert_eq!(group_texts(&carol, &key), vec!["Carol yokken yazıldı"]);
         wait_until(|| alice.chat_history(&key).iter().any(|m| m.outgoing && m.pending.is_empty())).await;
+    }
+
+    /// Regresyon: "yazıyor…" senkron bağlamdan (tokio çalışma ortamı yok) çağrılınca
+    /// panik → sürüm derlemesinde uygulama kapanıyordu.
+    #[test]
+    fn send_typing_outside_runtime_does_not_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::new(&tmp.path().join("cfg"), &tmp.path().join("dl"), quiet()).unwrap();
+        let fp = "ab".repeat(32);
+        let dev = DeviceInfo { id: "p1".into(), name: "Ahmet".into(), port: 1, fingerprint: fp.clone(), os: "windows".into(), ..Default::default() };
+        node.upsert_peer(dev, IpAddr::V4(Ipv4Addr::LOCALHOST), None);
+        node.send_typing(&fp);
     }
 
     #[tokio::test]
