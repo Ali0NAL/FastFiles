@@ -25,6 +25,16 @@ const MAX_WAIT: Duration = Duration::from_secs(300);
 struct PinRecord {
     salt: String,
     hash: String,
+    /// Yanlış deneme sayısı ve bekleme bitişi (Unix ms): uygulamayı yeniden başlatmak
+    /// deneme sınırını sıfırlamasın.
+    #[serde(default)]
+    fails: u32,
+    #[serde(default)]
+    until_ms: u64,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
 #[derive(Default)]
@@ -64,7 +74,17 @@ impl AppLock {
     pub fn load(path: &Path) -> Self {
         let record: Option<PinRecord> = std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok());
         let locked = record.is_some();
-        Self { path: path.to_path_buf(), record: Mutex::new(record), locked: AtomicBool::new(locked), attempts: Mutex::default() }
+        let attempts = record.as_ref().map_or_else(Attempts::default, |r| Attempts {
+            fails: r.fails,
+            until: (r.until_ms > now_ms()).then(|| Instant::now() + Duration::from_millis(r.until_ms - now_ms())),
+        });
+        Self { path: path.to_path_buf(), record: Mutex::new(record), locked: AtomicBool::new(locked), attempts: Mutex::new(attempts) }
+    }
+
+    fn write_record(&self, rec: &PinRecord) -> Result<(), String> {
+        let tmp = self.path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(rec).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())
     }
 
     pub fn is_locked(&self) -> bool {
@@ -94,14 +114,28 @@ impl AppLock {
         let (Ok(salt), Ok(hash)) = (hex::decode(&rec.salt), hex::decode(&rec.hash)) else { return Ok(false) };
         let ok = valid_pin(pin)
             && pbkdf2::verify(pbkdf2::PBKDF2_HMAC_SHA256, NonZeroU32::new(ITERATIONS).unwrap(), &salt, pin.as_bytes(), &hash).is_ok();
-        let mut a = self.attempts.lock().unwrap();
-        if ok {
-            *a = Attempts::default();
-        } else {
-            a.fails += 1;
-            if a.fails >= FREE_ATTEMPTS {
-                let extra = (a.fails - FREE_ATTEMPTS).min(4);
-                a.until = Some(Instant::now() + (FIRST_WAIT * 2u32.pow(extra)).min(MAX_WAIT));
+        let (fails, until_ms) = {
+            let mut a = self.attempts.lock().unwrap();
+            let mut until_ms = 0;
+            if ok {
+                *a = Attempts::default();
+            } else {
+                a.fails += 1;
+                if a.fails >= FREE_ATTEMPTS {
+                    let extra = (a.fails - FREE_ATTEMPTS).min(4);
+                    let wait = (FIRST_WAIT * 2u32.pow(extra)).min(MAX_WAIT);
+                    a.until = Some(Instant::now() + wait);
+                    until_ms = now_ms() + wait.as_millis() as u64;
+                }
+            }
+            (a.fails, until_ms)
+        };
+        let mut guard = self.record.lock().unwrap();
+        if let Some(rec) = guard.as_mut() {
+            if rec.fails != fails || rec.until_ms != until_ms {
+                rec.fails = fails;
+                rec.until_ms = until_ms;
+                let _ = self.write_record(rec);
             }
         }
         Ok(ok)
@@ -137,10 +171,8 @@ impl AppLock {
                 }
                 let mut salt = [0u8; 16];
                 ring::rand::SystemRandom::new().fill(&mut salt).map_err(|_| "Rastgele sayı üretilemedi".to_string())?;
-                let rec = PinRecord { salt: hex::encode(salt), hash: hex::encode(derive(pin, &salt)) };
-                let tmp = self.path.with_extension("json.tmp");
-                std::fs::write(&tmp, serde_json::to_vec(&rec).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-                std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
+                let rec = PinRecord { salt: hex::encode(salt), hash: hex::encode(derive(pin, &salt)), fails: 0, until_ms: 0 };
+                self.write_record(&rec)?;
                 *self.record.lock().unwrap() = Some(rec);
             }
             None => {
@@ -198,6 +230,10 @@ mod tests {
         assert!(lock.state().retry_after > 0);
         assert!(lock.unlock("5678").unwrap_err().contains("sn sonra"));
         assert!(lock.is_locked());
+        // Uygulamayı yeniden başlatmak bekleme süresini sıfırlamaz.
+        let lock = AppLock::load(&path);
+        assert!(lock.state().retry_after > 0, "yeniden başlatma deneme sınırını sıfırlamamalı");
+        assert!(lock.unlock("5678").unwrap_err().contains("sn sonra"));
 
         // Unuttum: PIN kalkar, kilit açılır.
         lock.forget();

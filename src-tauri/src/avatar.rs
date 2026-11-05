@@ -173,7 +173,8 @@ impl Node {
     async fn fetch_avatar(&self, peer: &Peer) -> Result<(), String> {
         let mut stream = self.connect(&self.candidates(peer), Some(peer.fingerprint.clone())).await?;
         write_msg(&mut stream, &Message::AvatarRequest).await.map_err(|e| e.to_string())?;
-        let reply = timeout(Duration::from_secs(8), read_msg(&mut stream))
+        // Resim en fazla ~96 KB; yanıt okunmadan önce boyutu sınırlanır (64 MB'lık genel sınır yerine).
+        let reply = timeout(Duration::from_secs(8), read_msg_max(&mut stream, 256 * 1024))
             .await
             .map_err(|_| "yanıt yok".to_string())?
             .map_err(|e| e.to_string())?;

@@ -190,6 +190,11 @@ impl Node {
         }
         p.voted = voted;
         p.ballots = if p.anonymous { Vec::new() } else { ballots };
+        // Gizli oylamada sonuçlar kapanana kadar gönderilmez: ardışık iki güncellemede
+        // "X oy verdi" ile "k seçeneği bir arttı" karşılaştırılıp X'in oyu çıkarılamasın.
+        if p.anonymous && !p.closed {
+            p.counts = vec![0; p.options.len()];
+        }
         p.rev += 1;
         st.sync_pending = p.audience().into_iter().filter(|f| *f != me).collect();
     }

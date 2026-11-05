@@ -11,7 +11,17 @@
 //! - Engellenen cihazlar, hız sınırı, uzunluk sınırı ve metin temizliği birebir sohbetteki gibidir.
 
 use super::*;
-use crate::chat::{group_key, Conversation, FileRef, FileTransferRef, GroupInfo, GroupMember, OutboxItem};
+use crate::chat::{group_key, settle, Conversation, FileRef, FileTransferRef, GroupInfo, GroupMember, OutboxItem};
+
+/// Bekleyen bildirim listesine ekler; henüz bildirilmemiş eski alıcılar (ör. az önce gruptan
+/// çıkarılan üye) listeden düşmez.
+fn merge_pending(list: &mut Vec<String>, add: Vec<String>) {
+    for f in add {
+        if !list.contains(&f) {
+            list.push(f);
+        }
+    }
+}
 
 /// Başarısız teslimattan sonra aynı alıcıyı yeniden denemeden önce beklenecek süre.
 const OUTBOX_BACKOFF: Duration = Duration::from_secs(20);
@@ -198,9 +208,10 @@ impl Node {
         self.chats.lock().unwrap().with(key, |c| {
             c.name = new_group.name.clone();
             c.group = Some(new_group.clone());
-            c.sync_pending = sync;
+            merge_pending(&mut c.sync_pending, sync);
             for m in c.messages.iter_mut() {
                 m.pending.retain(|fp| new_group.has(fp));
+                settle(m);
             }
         });
         for n in notes {
@@ -226,7 +237,7 @@ impl Node {
             self.chats.lock().unwrap().with(key, |c| {
                 c.group = Some(deleted);
                 c.left = true;
-                c.sync_pending = others;
+                merge_pending(&mut c.sync_pending, others);
             });
             self.system_note(key, "Grubu herkes için sildiniz".into());
         } else {
@@ -331,7 +342,24 @@ impl Node {
                 _ => None,
             })
             .collect();
+        // Aynı alıcıya aynı sohbetten mesajlar sırayla gitsin (eşzamanlı gönderim sırayı bozar
+        // ve alıcının hız sınırına takılır): her turda alıcı başına en eski bekleyen mesaj.
+        let busy_pairs: HashSet<(String, String)> = self
+            .outbox_in_flight
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f.strip_prefix("msg:").and_then(|r| r.rsplit_once(':')).and_then(|(kt, _)| kt.rsplit_once(':')))
+            .map(|(k, t)| (k.to_string(), t.to_string()))
+            .collect();
+        let mut queued_pairs: HashSet<(String, String)> = HashSet::new();
         for item in items {
+            if let OutboxItem::Message { key, to, .. } = &item {
+                let pair = (key.clone(), to.clone());
+                if busy_pairs.contains(&pair) || !queued_pairs.insert(pair) {
+                    continue;
+                }
+            }
             let (to, flight) = match &item {
                 OutboxItem::GroupSync { key, to, group } => (to.clone(), format!("sync:{key}:{to}:{}", group.rev)),
                 OutboxItem::Message { key, to, msg, .. } => {
@@ -419,8 +447,10 @@ impl Node {
                     _ => (false, false),
                 };
                 let me = self.my_fp();
+                let mut am_admin = false;
                 let updated = self.chats.lock().unwrap().with(&key, |c| {
-                    if unknown_group && c.group.as_ref().map_or(false, |g| g.admin == me) && !c.sync_pending.contains(&to) {
+                    am_admin = c.group.as_ref().map_or(false, |g| g.admin == me);
+                    if unknown_group && am_admin && !c.sync_pending.contains(&to) {
                         c.sync_pending.push(to.clone());
                     }
                     let m = c.messages.iter_mut().find(|m| m.id == msg.id)?;
@@ -428,6 +458,7 @@ impl Node {
                         m.pending.retain(|f| *f != to);
                         if m.pending.is_empty() {
                             m.status = MsgStatus::Sent;
+                            m.error = None;
                         }
                     }
                     Some(m.clone())
@@ -437,9 +468,11 @@ impl Node {
                 }
                 if done {
                     Delivery::Done
-                } else if unknown_group {
+                } else if unknown_group && am_admin {
+                    // Grup bilgisi bir sonraki turda gidecek; ardından mesaj hemen denensin.
                     Delivery::RetrySoon
                 } else {
+                    // Yönetici değilsek grup bilgisini biz gönderemeyiz: sık deneme yapma.
                     Delivery::RetryLater
                 }
             }
@@ -464,8 +497,10 @@ impl Node {
                             m.error = Some(e.clone());
                         }
                     }
-                    if m.pending.is_empty() {
+                    if m.pending.is_empty() && started.is_ok() {
                         m.status = MsgStatus::Sent;
+                    } else if m.pending.is_empty() {
+                        m.status = MsgStatus::Failed;
                     }
                 });
                 if let Some(m) = updated {
@@ -510,8 +545,13 @@ impl Node {
                 if group.rev <= old.rev {
                     return Message::GroupAck;
                 }
-                let left = group.deleted || !group.has(&me);
-                if group.deleted {
+                // Kendi isteğimle ayrıldıysam (ayrılık bildirimi yolda ya da sohbeti sildim),
+                // yöneticinin eski üye listesi beni gruba geri katmaz.
+                let i_left = self.chats.lock().unwrap().conv(&key).map_or(false, |c| c.left && (c.leave_pending || c.hidden));
+                let left = i_left || group.deleted || !group.has(&me);
+                if i_left {
+                    // Bilgi güncellenir ama not düşülmez.
+                } else if group.deleted {
                     notes.push(format!("{admin_name} grubu sildi"));
                 } else if !group.has(&me) {
                     notes.push(format!("{admin_name} sizi gruptan çıkardı"));
@@ -584,6 +624,10 @@ impl Node {
         if !group.has(&sender) {
             return Err("sender_not_member");
         }
+        // Zaten alınmış mesajın yeniden gönderimi hız sınırından düşmez.
+        if self.chats.lock().unwrap().contains(&key, id) {
+            return Ok(());
+        }
         if !self.chat_rate_ok(&sender) {
             return Err("rate");
         }
@@ -629,9 +673,10 @@ impl Node {
         self.chats.lock().unwrap().with(&key, |c| {
             for m in c.messages.iter_mut() {
                 m.pending.retain(|f| f != sender_fp);
+                settle(m);
             }
             c.group = Some(ng);
-            c.sync_pending = sync;
+            merge_pending(&mut c.sync_pending, sync);
         });
         self.system_note(&key, format!("{name} gruptan ayrıldı"));
         self.emit_conversation(&key);

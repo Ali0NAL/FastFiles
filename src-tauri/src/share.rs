@@ -217,6 +217,11 @@ fn clean_entry(mut e: ShareEntry) -> Option<ShareEntry> {
     if !valid_fingerprint(&e.author) {
         return None;
     }
+    // Sürüm bir zaman damgasıdır; çok ilerideki (ör. u64::MAX) bir sürüm o dosyayı kalıcı
+    // olarak "kilitlerdi".
+    if e.version > now_ms() + 7 * 24 * 60 * 60 * 1000 {
+        return None;
+    }
     e.path = parts.join("/");
     Some(e)
 }
@@ -233,20 +238,34 @@ fn digest_of(entries: &HashMap<String, ShareEntry>) -> String {
     hex::encode(h.finalize())[..16].to_string()
 }
 
+/// Bekleyen bildirim listesine ekler; henüz bildirilmemiş eski alıcılar listeden düşmez.
+fn merge_pending(list: &mut Vec<String>, add: Vec<String>) {
+    for f in add {
+        if !list.contains(&f) {
+            list.push(f);
+        }
+    }
+}
+
 /// Yerel dosyayı silmek/üzerine yazmak yerine `.fastfiles\silinen` içine taşır.
-fn move_to_trash(dir: &Path, rel: &str) {
+/// Taşınamazsa `false` döner ve dosyaya **dokunulmaz**: yedeksiz silme yapılmaz.
+fn move_to_trash(dir: &Path, rel: &str) -> bool {
     let src = dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
     if !src.exists() {
-        return;
+        return true;
+    }
+    // Klasör çöpe taşınmaz (içindeki her dosya bir sonraki taramada silinmiş sayılırdı).
+    if src.is_dir() {
+        return false;
     }
     let trash = dir.join(SHARE_META_DIR).join("silinen");
     let _ = std::fs::create_dir_all(&trash);
     let stamp = chrono_stamp();
     let name = rel.replace('/', " - ");
-    let dst = trash.join(format!("{stamp} {name}"));
-    if std::fs::rename(&src, &dst).is_err() {
-        let _ = std::fs::remove_file(&src);
-    }
+    // Uzun yollarda tek dosya adı 255 karakteri aşabilir: kısa adla tekrar dene.
+    let short: String = rel.rsplit('/').next().unwrap_or(rel).chars().rev().take(120).collect::<Vec<_>>().into_iter().rev().collect();
+    let candidates = [trash.join(format!("{stamp} {name}")), trash.join(format!("{stamp} {short}"))];
+    candidates.iter().any(|dst| std::fs::rename(&src, dst).is_ok())
 }
 
 fn chrono_stamp() -> String {
@@ -255,21 +274,30 @@ fn chrono_stamp() -> String {
 }
 
 /// Klasördeki dosyaları listeler (FastFiles'ın kendi klasörü ve geçici dosyalar hariç).
-fn list_dir(dir: &Path) -> Vec<(String, u64, u64)> {
+/// İkinci değer: listeleme eksiksiz mi (okunamayan alt klasör/dosya yoksa `true`).
+fn list_dir(dir: &Path) -> (Vec<(String, u64, u64)>, bool) {
     let mut out = Vec::new();
+    let mut complete = true;
     let walker = walkdir::WalkDir::new(dir).follow_links(false).into_iter().filter_entry(|e| {
         !(e.depth() == 1 && e.file_type().is_dir() && e.file_name().to_string_lossy().eq_ignore_ascii_case(SHARE_META_DIR))
     });
-    for entry in walker.flatten() {
+    for entry in walker {
+        let Ok(entry) = entry else {
+            complete = false;
+            continue;
+        };
         if !entry.file_type().is_file() || ignored(&entry.file_name().to_string_lossy()) {
             continue;
         }
         let Ok(rel) = entry.path().strip_prefix(dir) else { continue };
-        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(meta) = entry.metadata() else {
+            complete = false;
+            continue;
+        };
         let rel = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/");
         out.push((rel, meta.len(), meta.modified().map(system_ms).unwrap_or(0)));
     }
-    out
+    (out, complete)
 }
 
 impl Node {
@@ -377,7 +405,9 @@ impl Node {
         let used: HashSet<String> = self.shares.lock().unwrap().values().map(|s| s.dir.to_lowercase()).collect();
         let mut candidate = root.join(&base);
         let mut i = 1;
-        while used.contains(&candidate.to_string_lossy().to_lowercase()) {
+        // Diskte kalmış eski bir klasör de (ör. "dosyaları silme" ile silinmiş klasör) kullanılmaz:
+        // yoksa içindeki eski dosyalar yeni klasörün üyelerine yayılırdı.
+        while used.contains(&candidate.to_string_lossy().to_lowercase()) || candidate.exists() {
             candidate = root.join(format!("{base} ({i})"));
             i += 1;
         }
@@ -478,7 +508,7 @@ impl Node {
                 // Kalanlara ve çıkarılanlara bildir.
                 let mut sync: Vec<String> = st.info.members.iter().map(|m| m.fingerprint.clone()).filter(|f| *f != me).collect();
                 sync.extend(old.members.iter().map(|m| m.fingerprint.clone()).filter(|f| *f != me && !st.info.has(f)));
-                st.sync_pending = sync;
+                merge_pending(&mut st.sync_pending, sync);
                 self.save_share(st);
             }
             self.summary_of(st)
@@ -512,7 +542,7 @@ impl Node {
             }
             st.password = hashed;
             st.info.rev += 1;
-            st.sync_pending = st.info.members.iter().map(|m| m.fingerprint.clone()).filter(|f| *f != me).collect();
+            merge_pending(&mut st.sync_pending, st.info.members.iter().map(|m| m.fingerprint.clone()).filter(|f| *f != me).collect());
             self.save_share(st);
             self.summary_of(st)
         };
@@ -529,7 +559,7 @@ impl Node {
             if st.info.admin == me {
                 st.info.deleted = true;
                 st.info.rev += 1;
-                st.sync_pending = st.info.members.iter().map(|m| m.fingerprint.clone()).filter(|f| *f != me).collect();
+                merge_pending(&mut st.sync_pending, st.info.members.iter().map(|m| m.fingerprint.clone()).filter(|f| *f != me).collect());
             } else {
                 st.leave_pending = true;
             }
@@ -553,7 +583,7 @@ impl Node {
                 if st.info.admin == me {
                     st.info.deleted = true;
                     st.info.rev += 1;
-                    st.sync_pending = st.info.members.iter().map(|m| m.fingerprint.clone()).filter(|f| *f != me).collect();
+                    merge_pending(&mut st.sync_pending, st.info.members.iter().map(|m| m.fingerprint.clone()).filter(|f| *f != me).collect());
                 } else {
                     st.leave_pending = true;
                 }
@@ -620,8 +650,8 @@ impl Node {
                 if let Some(parent) = dst.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
-                if dst.exists() {
-                    move_to_trash(&dir, &parts.join("/"));
+                if dst.exists() && !move_to_trash(&dir, &parts.join("/")) {
+                    return Err(format!("{}: mevcut dosya yedeklenemediği için üzerine yazılmadı", e.path));
                 }
                 std::fs::copy(&src, &dst).map_err(|err| format!("{} kopyalanamadı: {err}", e.path))?;
                 n += 1;
@@ -671,9 +701,17 @@ impl Node {
                 _ => return false,
             }
         };
-        let _ = tokio::fs::create_dir_all(&dir).await;
+        // Klasör yoksa (USB/ağ sürücüsü takılı değil, elle silinmiş) tarama yapılmaz: boş liste
+        // "her şey silindi" sayılır ve silme diğer üyelere yayılırdı.
+        let has_entries = self.shares.lock().unwrap().get(id).map_or(false, |st| !st.entries.is_empty());
+        if !dir.is_dir() {
+            if has_entries {
+                return false;
+            }
+            let _ = tokio::fs::create_dir_all(&dir).await;
+        }
         let d2 = dir.clone();
-        let Ok(listing) = tokio::task::spawn_blocking(move || list_dir(&d2)).await else { return false };
+        let Ok((listing, complete)) = tokio::task::spawn_blocking(move || list_dir(&d2)).await else { return false };
         let now = now_ms();
         let changed = {
             let mut map = self.shares.lock().unwrap();
@@ -684,21 +722,23 @@ impl Node {
                 let key = key_of(&path);
                 seen.insert(key.clone());
                 // Yazılmakta olan dosyayı yarım yayınlamamak için birkaç saniye bekle.
-                if now.saturating_sub(mtime) < SCAN_SETTLE_MS {
+                if mtime <= now && now - mtime < SCAN_SETTLE_MS {
                     continue;
                 }
                 let current = st.entries.get(&key);
                 let same = current.map_or(false, |e| !e.deleted && e.size == size && e.mtime == mtime);
                 if !same {
-                    let version = now.max(current.map_or(0, |e| e.version + 1));
+                    let version = now.max(current.map_or(0, |e| e.version.saturating_add(1)));
                     st.entries.insert(key, ShareEntry { path, size, mtime, version, author: me.clone(), deleted: false });
                     changed = true;
                 }
             }
             for (key, e) in st.entries.iter_mut() {
-                if !e.deleted && !seen.contains(key) {
+                // Listeleme eksikse (okunamayan klasör) silme yayılmaz. Listelemeden sonra
+                // indirilen dosya da (yarış) burada yeniden kontrol edilir.
+                if !e.deleted && !seen.contains(key) && complete && !dir.join(e.path.replace('/', std::path::MAIN_SEPARATOR_STR)).exists() {
                     e.deleted = true;
-                    e.version = now.max(e.version + 1);
+                    e.version = now.max(e.version.saturating_add(1));
                     e.author = me.clone();
                     changed = true;
                 }
@@ -861,8 +901,9 @@ impl Node {
                     continue;
                 }
                 if e.deleted {
-                    if local.map_or(false, |l| !l.deleted) {
-                        move_to_trash(&dir, &local.unwrap().path);
+                    if local.map_or(false, |l| !l.deleted) && !move_to_trash(&dir, &local.unwrap().path) {
+                        // Yedeklenemeyen dosya silinmez; sonraki taramada yeniden yayınlanır.
+                        continue;
                     }
                     st.wanted.remove(&key);
                     st.entries.insert(key, e);
@@ -926,7 +967,10 @@ impl Node {
                 w.flush().await.map_err(|e| e.to_string())?;
                 let f = w.into_inner().into_std().await;
                 // Değişiklik algılamanın tutması için dosyanın zamanı kaynakla aynı olsun.
-                let _ = f.set_modified(UNIX_EPOCH + Duration::from_millis(served.mtime));
+                // Ağdan gelen zaman çok büyükse toplama taşar (panik → uygulama kapanırdı).
+                if let Some(t) = UNIX_EPOCH.checked_add(Duration::from_millis(served.mtime)) {
+                    let _ = f.set_modified(t);
+                }
                 drop(f);
                 Ok(())
             }
@@ -951,10 +995,14 @@ impl Node {
                 return Ok(None);
             }
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e.to_string());
+                }
             }
-            if target.exists() {
-                move_to_trash(&dir, &served.path);
+            if target.exists() && !move_to_trash(&dir, &served.path) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(format!("{}: aynı adda klasör var ya da mevcut dosya yedeklenemedi", served.path));
             }
             std::fs::rename(&tmp, &target).map_err(|e| {
                 let _ = std::fs::remove_file(&tmp);
@@ -1029,7 +1077,7 @@ impl Node {
                 let mut map = self.shares.lock().unwrap();
                 if let Some(st) = map.get_mut(&info.id) {
                     // Kullanıcı klasörü sildiyse (ayrılık bildirimi yolda) güncelleme onu geri katmaz.
-                    st.left = st.forgotten || info.deleted || !info.has(&me);
+                    st.left = st.forgotten || st.leave_pending || info.deleted || !info.has(&me);
                     st.info = info;
                     if st.left || !st.info.can_access(&me) {
                         st.wanted.clear();
@@ -1122,7 +1170,7 @@ impl Node {
         if !st.info.unlocked.iter().any(|f| f == sender) {
             st.info.unlocked.push(sender.to_string());
             st.info.rev += 1;
-            st.sync_pending = st.info.members.iter().map(|m| m.fingerprint.clone()).filter(|f| *f != me).collect();
+            merge_pending(&mut st.sync_pending, st.info.members.iter().map(|m| m.fingerprint.clone()).filter(|f| *f != me).collect());
             self.save_share(st);
         }
         self.unlock_attempts.lock().unwrap().remove(sender);
@@ -1142,7 +1190,7 @@ impl Node {
             st.info.members.retain(|m| m.fingerprint != sender);
             st.info.unlocked.retain(|f| f != sender);
             st.info.rev += 1;
-            st.sync_pending = st.info.members.iter().map(|m| m.fingerprint.clone()).filter(|f| *f != me).collect();
+            merge_pending(&mut st.sync_pending, st.info.members.iter().map(|m| m.fingerprint.clone()).filter(|f| *f != me).collect());
             self.save_share(st);
         }
         self.emit_shares();
@@ -1171,6 +1219,71 @@ impl ShareJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_node(root: &Path) -> Arc<Node> {
+        let quiet: Emitter = Arc::new(|_, _| {});
+        Node::new(&root.join("cfg"), &root.join("dl"), quiet).unwrap()
+    }
+
+    fn live_files(node: &Node, id: &str) -> usize {
+        node.shares.lock().unwrap().get(id).unwrap().entries.values().filter(|e| !e.deleted).count()
+    }
+
+    /// Klasör erişilemezse (sürücü takılı değil / silinmiş) tarama "her şey silindi" sonucuna
+    /// varıp silmeyi diğer üyelere yaymamalı.
+    #[tokio::test]
+    async fn missing_share_folder_does_not_tombstone_everything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = test_node(tmp.path());
+        let id = node.share_create("Proje", &[], None).unwrap().id;
+        let dir = PathBuf::from(node.shares.lock().unwrap().get(&id).unwrap().dir.clone());
+        std::fs::write(dir.join("rapor.txt"), "x").unwrap();
+        // Yazılan dosya "yerleşsin" diye zamanını geriye al.
+        let old = std::time::SystemTime::now() - Duration::from_secs(60);
+        std::fs::File::options().write(true).open(dir.join("rapor.txt")).unwrap().set_modified(old).unwrap();
+        node.share_scan(&id).await;
+        assert_eq!(live_files(&node, &id), 1);
+
+        std::fs::rename(&dir, tmp.path().join("baska-yer")).unwrap();
+        node.share_scan(&id).await;
+        assert_eq!(live_files(&node, &id), 1, "erişilemeyen klasör silme olarak yayılmamalı");
+        assert!(!dir.exists(), "eksik klasör boş olarak yeniden oluşturulmamalı");
+    }
+
+    #[test]
+    fn trash_never_deletes_without_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        assert!(move_to_trash(dir, "a.txt"));
+        assert!(!dir.join("a.txt").exists());
+        assert_eq!(std::fs::read_dir(dir.join(SHARE_META_DIR).join("silinen")).unwrap().count(), 1);
+        // Klasör çöpe taşınmaz ve silinmez.
+        std::fs::create_dir_all(dir.join("Alt").join("ic")).unwrap();
+        std::fs::write(dir.join("Alt").join("ic").join("b.txt"), "b").unwrap();
+        assert!(!move_to_trash(dir, "Alt"));
+        assert!(dir.join("Alt").join("ic").join("b.txt").exists());
+    }
+
+    /// Silinmiş (dosyaları bırakılmış) klasörün adı yeni bir klasör için yeniden kullanılmamalı:
+    /// içindeki eski dosyalar yeni klasörün üyelerine yayılırdı.
+    #[test]
+    fn new_share_does_not_reuse_leftover_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = test_node(tmp.path());
+        let first = node.share_create("Proje", &[], None).unwrap();
+        node.share_delete(&first.id, false).unwrap();
+        assert!(PathBuf::from(&first.dir).exists());
+        let second = node.share_create("Proje", &[], None).unwrap();
+        assert_ne!(second.dir.to_lowercase(), first.dir.to_lowercase());
+    }
+
+    #[test]
+    fn absurd_versions_from_network_are_rejected() {
+        let fp = "a".repeat(64);
+        let e = ShareEntry { path: "a.txt".into(), size: 1, mtime: 1, version: u64::MAX, author: fp, deleted: true };
+        assert!(clean_entry(e).is_none());
+    }
 
     #[test]
     fn password_hashing() {

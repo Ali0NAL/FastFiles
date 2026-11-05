@@ -134,6 +134,33 @@ pub struct Conversation {
     /// (Üye) ayrıldığımı yöneticiye henüz bildiremedim.
     #[serde(default)]
     pub leave_pending: bool,
+    /// Kullanıcı sildi ama bekleyen bildirimler (ayrılık/silme) var: listede gösterilmez,
+    /// bildirimler gidince tamamen kaldırılır.
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+/// Giden kutusu mesajı bekleyen alıcısı kalmadıysa "gönderiliyor" durumunda takılı kalmasın.
+pub fn settle(m: &mut ChatMessage) {
+    if m.outgoing && m.pending.is_empty() && m.status == MsgStatus::Sending {
+        m.status = MsgStatus::Sent;
+    }
+}
+
+/// En eski mesajları atarak sohbeti sınırda tutar; henüz iletilmemiş giden mesajlar atılmaz.
+fn trim(messages: &mut Vec<ChatMessage>) {
+    let mut extra = messages.len().saturating_sub(MAX_PER_CONVERSATION);
+    if extra == 0 {
+        return;
+    }
+    messages.retain(|m| {
+        if extra > 0 && !(m.outgoing && !m.pending.is_empty()) {
+            extra -= 1;
+            false
+        } else {
+            true
+        }
+    });
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -176,8 +203,9 @@ impl ChatStore {
             .unwrap_or_default();
         let mut convs = HashMap::new();
         for mut c in list {
-            // Uygulama kapanırken yolda kalan mesajlar gönderilememiş sayılır.
-            for m in c.messages.iter_mut().filter(|m| m.status == MsgStatus::Sending) {
+            // Uygulama kapanırken yolda kalan birebir mesajlar gönderilememiş sayılır.
+            // (Grup mesajları giden kutusundan teslim edilmeye devam eder.)
+            for m in c.messages.iter_mut().filter(|m| m.status == MsgStatus::Sending && m.pending.is_empty()) {
                 m.status = MsgStatus::Failed;
                 m.error = Some("Uygulama kapandı".into());
             }
@@ -224,11 +252,9 @@ impl ChatStore {
         if !msg.outgoing && count_unread {
             conv.unread += 1;
         }
+        conv.hidden = false;
         conv.messages.push(msg);
-        if conv.messages.len() > MAX_PER_CONVERSATION {
-            let extra = conv.messages.len() - MAX_PER_CONVERSATION;
-            conv.messages.drain(..extra);
-        }
+        trim(&mut conv.messages);
         let unread = conv.unread;
         self.save();
         unread
@@ -322,10 +348,7 @@ impl ChatStore {
         };
         let conv = self.convs.get_mut(key)?;
         conv.messages.push(msg.clone());
-        if conv.messages.len() > MAX_PER_CONVERSATION {
-            let extra = conv.messages.len() - MAX_PER_CONVERSATION;
-            conv.messages.drain(..extra);
-        }
+        trim(&mut conv.messages);
         self.save();
         Some(msg)
     }
@@ -333,7 +356,10 @@ impl ChatStore {
     /// Yapılması gereken teslimatlar. Çok eski bekleyen mesajlardan vazgeçilir.
     pub fn outbox(&mut self, now: u64, my_fp: &str) -> Vec<OutboxItem> {
         let mut items = Vec::new();
-        let mut changed = false;
+        // Silinmiş ve bekleyen bildirimi kalmamış sohbetler tamamen kaldırılır.
+        let before = self.convs.len();
+        self.convs.retain(|_, c| !(c.hidden && !c.leave_pending && c.sync_pending.is_empty()));
+        let mut changed = self.convs.len() != before;
         for conv in self.convs.values_mut() {
             let Some(group) = conv.group.clone() else { continue };
             if group.admin == my_fp {
@@ -346,6 +372,12 @@ impl ChatStore {
             }
             for m in conv.messages.iter_mut().filter(|m| m.outgoing && !m.pending.is_empty()) {
                 if now.saturating_sub(m.at) > OUTBOX_MAX_AGE_MS || conv.left {
+                    if !conv.left {
+                        m.status = MsgStatus::Failed;
+                        m.error = Some(format!("{} kişiye 3 gün içinde ulaştırılamadı", m.pending.len()));
+                    } else {
+                        settle(m);
+                    }
                     m.pending.clear();
                     changed = true;
                     continue;
@@ -381,7 +413,7 @@ impl ChatStore {
     }
 
     pub fn summaries(&self) -> Vec<ConversationSummary> {
-        let mut list: Vec<ConversationSummary> = self.convs.values().map(Self::summarize).collect();
+        let mut list: Vec<ConversationSummary> = self.convs.values().filter(|c| !c.hidden).map(Self::summarize).collect();
         list.sort_by(|a, b| {
             let at = |s: &ConversationSummary| s.last.as_ref().map_or(0, |m| m.at);
             at(b).cmp(&at(a))

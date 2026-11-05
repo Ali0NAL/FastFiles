@@ -378,9 +378,11 @@ fn respond_incoming(node: NodeState, request_id: String, accept: bool, trust: bo
     node.respond(&request_id, Decision { accept, trust })
 }
 
+/// async: duraklatılmış gönderimin iptali alıcıya arka planda bildirim gönderir.
 #[tauri::command]
-fn cancel_transfer(node: NodeState, id: String) {
-    node.cancel_transfer(&id);
+async fn cancel_transfer(node: NodeState<'_>, id: String) -> Result<(), String> {
+    node.inner().cancel_transfer(&id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -451,8 +453,16 @@ fn reveal_path(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn open_path(path: String) -> Result<(), String> {
-    std::fs::create_dir_all(&path).ok();
+fn open_path(node: NodeState, path: String) -> Result<(), String> {
+    // Yalnızca indirme klasörü yoksa oluşturulur; başka bir yol (ör. eşitlemede silinmiş bir
+    // dosya) yoksa onun yerine boş klasör oluşturulmaz.
+    if !std::path::Path::new(&path).exists() {
+        if path == node.settings().download_dir {
+            std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+        } else {
+            return Err("Dosya ya da klasör artık yok".into());
+        }
+    }
     #[cfg(target_os = "windows")]
     let cmd = "explorer";
     #[cfg(target_os = "macos")]
@@ -566,9 +576,13 @@ fn update_state(node: NodeState) -> UpdateState {
     update_state_of(&node)
 }
 
+/// async + ayrı iş parçacığı: paket doğrulama/kopyalama pencereyi dondurmasın.
 #[tauri::command]
-fn import_update(node: NodeState, path: String) -> Result<UpdateState, String> {
-    node.import_update(std::path::Path::new(&path))?;
+async fn import_update(node: NodeState<'_>, path: String) -> Result<UpdateState, String> {
+    let n = node.inner().clone();
+    tokio::task::spawn_blocking(move || n.import_update(std::path::Path::new(&path)))
+        .await
+        .map_err(|e| e.to_string())??;
     Ok(update_state_of(&node))
 }
 
@@ -584,6 +598,11 @@ fn postpone_update(gate: State<UpdateGate>) {
 
 fn start_install(app: &AppHandle, node: &Node) -> Result<(), String> {
     let (setup, version) = node.prepare_install()?;
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    node.update_settings(|s| {
+        s.install_attempt = version.clone();
+        s.install_attempt_at = at;
+    });
     let hidden = app.get_webview_window("main").map_or(true, |w| !w.is_visible().unwrap_or(false));
     launch_installer(&setup, hidden)?;
     eprintln!("[fastfiles] {version} kuruluyor, uygulama yeniden başlatılacak");
@@ -640,7 +659,12 @@ fn spawn_auto_updater(app: AppHandle, node: Arc<Node>) {
                 .lock()
                 .unwrap()
                 .map_or(false, |t| Instant::now() < t);
-            if since.elapsed() < AUTO_INSTALL_DELAY || postponed || node.is_busy() {
+            // Bu sürüm yakın zamanda zaten kurulmaya çalışıldıysa (ve hâlâ eski sürümdeysek)
+            // kurulum başarısız olmuş demektir: 6 saat kendiliğinden tekrar deneme.
+            let s = node.settings();
+            let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+            let recently_failed = s.install_attempt == version && now_ms.saturating_sub(s.install_attempt_at) < 6 * 60 * 60 * 1000;
+            if since.elapsed() < AUTO_INSTALL_DELAY || postponed || node.is_busy() || recently_failed {
                 continue;
             }
             if let Err(e) = start_install(&app, &node) {

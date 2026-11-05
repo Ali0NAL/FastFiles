@@ -39,9 +39,15 @@ impl Identity {
         let key_der = ck.key_pair.serialize_der();
         let id = uuid::Uuid::new_v4().to_string();
 
-        fs::write(&id_path, &id).map_err(|e| e.to_string())?;
-        fs::write(&cert_path, &cert_der).map_err(|e| e.to_string())?;
-        fs::write(&key_path, &key_der).map_err(|e| e.to_string())?;
+        // Yarım yazılmış kimlik dosyası (elektrik kesintisi) uygulamayı açılmaz hale getirmesin.
+        let write_atomic = |path: &Path, data: &[u8]| -> Result<(), String> {
+            let tmp = path.with_extension("tmp");
+            fs::write(&tmp, data).map_err(|e| e.to_string())?;
+            fs::rename(&tmp, path).map_err(|e| e.to_string())
+        };
+        write_atomic(&key_path, &key_der)?;
+        write_atomic(&cert_path, &cert_der)?;
+        write_atomic(&id_path, id.as_bytes())?;
 
         let fingerprint = fingerprint(&cert_der);
         Ok(Self { id, cert_der, key_der, fingerprint })
@@ -84,6 +90,10 @@ pub struct Settings {
     pub appearance: String,
     /// Bu kadar dakika işlem yapılmazsa kilitlenir (PIN tanımlıysa). 0 = kapalı.
     pub lock_minutes: u32,
+    /// Son otomatik kurulum denemesi (sürüm, Unix ms). Kurulum başarısız olup eski sürüm
+    /// yeniden açılırsa sonsuz "kur → yeniden başlat" döngüsüne girilmesin.
+    pub install_attempt: String,
+    pub install_attempt_at: u64,
 }
 
 impl Default for Settings {
@@ -103,6 +113,8 @@ impl Default for Settings {
             theme: "mor".into(),
             appearance: "system".into(),
             lock_minutes: 0,
+            install_attempt: String::new(),
+            install_attempt_at: 0,
         }
     }
 }

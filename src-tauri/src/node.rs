@@ -220,6 +220,7 @@ pub struct Node {
     peers: Mutex<HashMap<String, Peer>>,
     transfers: Mutex<HashMap<String, Transfer>>,
     history_path: PathBuf,
+    history_write: Mutex<()>,
     cancels: Mutex<HashMap<String, CancellationToken>>,
     /// Alıcıda süren aktarımı, aynı aktarımın yeni bağlantısı gelince kesmek için.
     interrupts: Mutex<HashMap<String, CancellationToken>>,
@@ -270,10 +271,23 @@ fn now_ms() -> u64 {
 impl Node {
     pub fn new(config_dir: &Path, default_download: &Path, emit: Emitter) -> Result<Arc<Self>, String> {
         std::fs::create_dir_all(config_dir).map_err(|e| e.to_string())?;
-        let identity = Identity::load_or_create(config_dir)?;
+        let mut identity = Identity::load_or_create(config_dir)?;
         let settings_path = config_dir.join("settings.json");
         let settings = Settings::load(&settings_path, default_download);
-        let acceptor = TlsAcceptor::from(tls::server_config(&identity)?);
+        // Kimlik dosyaları bozuksa (TLS kurulamıyorsa) her açılışta çökmek yerine yeni kimlik
+        // üretilir. Diğer cihazlar bu bilgisayarı yeni bir cihaz olarak görür.
+        let server_cfg = match tls::server_config(&identity) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[fastfiles] kimlik kullanılamıyor ({e}); yeni kimlik oluşturuluyor");
+                for f in ["device-id", "cert.der", "key.der"] {
+                    let _ = std::fs::remove_file(config_dir.join(f));
+                }
+                identity = Identity::load_or_create(config_dir)?;
+                tls::server_config(&identity)?
+            }
+        };
+        let acceptor = TlsAcceptor::from(server_cfg);
         let chats = ChatStore::load(&config_dir.join("chats.json"));
         let update_dir = config_dir.join("updates");
         std::fs::create_dir_all(&update_dir).map_err(|e| e.to_string())?;
@@ -288,6 +302,7 @@ impl Node {
             peers: Mutex::new(HashMap::new()),
             transfers: Mutex::new(history),
             history_path,
+            history_write: Mutex::new(()),
             cancels: Mutex::new(HashMap::new()),
             interrupts: Mutex::new(HashMap::new()),
             resume: Mutex::new(resume),
@@ -617,15 +632,14 @@ impl Node {
     }
 
     pub fn update_settings(&self, f: impl FnOnce(&mut Settings)) -> Settings {
-        let snapshot = {
-            let mut s = self.settings.lock().unwrap();
-            f(&mut s);
-            s.clone()
-        };
-        if let Err(e) = snapshot.save(&self.settings_path) {
+        // Kaydetme kilit altında: eşzamanlı iki değişiklik aynı geçici dosyaya yazıp birbirini
+        // geri almasın (ör. kaldırılan bir engel geri gelmesin).
+        let mut s = self.settings.lock().unwrap();
+        f(&mut s);
+        if let Err(e) = s.save(&self.settings_path) {
             eprintln!("[fastfiles] ayarlar kaydedilemedi: {e}");
         }
-        snapshot
+        s.clone()
     }
 
     pub fn is_trusted(&self, fp: &str) -> bool {
@@ -724,6 +738,9 @@ impl Node {
         let changed = {
             let mut peers = self.peers.lock().unwrap();
             match peers.get_mut(&d.id) {
+                // Aynı cihaz kimliğini başka bir sertifika kullanıyorsa ve asıl cihaz hâlâ
+                // görünüyorsa duyuruyu yok say: başkası "Bob" kartını ele geçiremesin.
+                Some(p) if p.fingerprint != d.fingerprint && p.last_seen.is_some_and(|t| now.duration_since(t) < PEER_TTL) => false,
                 Some(p) => {
                     match p.addrs.iter_mut().find(|(a, _)| *a == ip) {
                         Some(entry) => entry.1 = now,
@@ -888,8 +905,10 @@ impl Node {
         self.save_history();
     }
 
-    /// Biten aktarımları diske yazar (en yeni `HISTORY_MAX` kayıt).
+    /// Biten aktarımları diske yazar (en yeni `HISTORY_MAX` kayıt). Aynı anda biten iki aktarım
+    /// aynı geçici dosyaya yazıp geçmişi bozmasın diye yazımlar sıraya alınır.
     fn save_history(&self) {
+        let _guard = self.history_write.lock().unwrap();
         let mut done: Vec<Transfer> = self.transfers.lock().unwrap().values().filter(|t| t.is_finished()).cloned().collect();
         done.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         if done.len() > HISTORY_MAX {
@@ -906,11 +925,35 @@ impl Node {
         }
     }
 
-    pub fn cancel_transfer(&self, id: &str) {
+    pub fn cancel_transfer(self: &Arc<Self>, id: &str) {
         self.pauses.lock().unwrap().remove(id);
         if let Some(tok) = self.cancels.lock().unwrap().get(id) {
             tok.cancel();
+            return;
         }
+        // Duraklatılmış / yarıda kalmış gönderim: alıcıdaki yarım dosyalar silinsin.
+        let t = self.transfers.lock().unwrap().get(id).cloned();
+        let Some(t) = t.filter(|t| t.direction == Direction::Send && t.resumable && matches!(t.status, Status::Paused | Status::Failed)) else {
+            return;
+        };
+        self.update_transfer(id, |t| {
+            t.status = Status::Cancelled;
+            t.error = None;
+        });
+        self.save_history();
+        if let Some(peer) = self.peer(&t.peer_id) {
+            let node = self.clone();
+            let tid = id.to_string();
+            tokio::spawn(async move {
+                node.send_notice(&peer, Message::Abort { device: node.device_info(), transfer_id: tid }).await;
+            });
+        }
+    }
+
+    /// Süresi dolan yarım alımları (ve `.ffpart` dosyalarını) temizler; uygulama uzun süre
+    /// açık kalsa da birikmesin.
+    pub fn prune_resume(&self) {
+        self.resume.lock().unwrap().prune(now_ms());
     }
 
     /// Gönderimi duraklatır: bağlantı kapanır, alıcıdaki yarım dosyalar korunur.
@@ -1176,9 +1219,12 @@ impl Node {
         let signature = files_signature(&files);
         let prior = if resume { self.resume.lock().unwrap().find(&fp, &transfer_id, &signature) } else { None };
 
+        // HashSet: çok sayıda farklı üst düzey adla gelen bir teklif, onay sorulmadan önce
+        // karesel tarama yüzünden uygulamayı kilitleyemesin.
         let mut top_names: Vec<String> = Vec::new();
+        let mut top_seen: HashSet<&str> = HashSet::new();
         for (parts, _) in &sanitized {
-            if !top_names.contains(&parts[0]) {
+            if top_seen.insert(parts[0].as_str()) {
                 top_names.push(parts[0].clone());
             }
         }
@@ -1281,11 +1327,18 @@ impl Node {
         if prior.is_some() {
             self.interrupt_receive(&local_id).await;
         }
+        // Kesme anahtarı hemen kaydedilir: yarım dosyaların özetlenmesi uzun sürebilir ve bu
+        // sırada gelen yeni bağlantı bu işi durdurabilmeli (aynı dosyaya iki yazıcı olmasın).
+        let interrupt = CancellationToken::new();
+        self.interrupts.lock().unwrap().insert(local_id.clone(), interrupt.clone());
 
         // ── Devam noktaları ve yarım dosyaların mevcut kısmının özeti ──
         let mut offsets = vec![0u64; sanitized.len()];
         let mut prefix_hashers: HashMap<usize, blake3::Hasher> = HashMap::new();
-        if prior.is_some() {
+        let prepare = async {
+            if prior.is_none() {
+                return;
+            }
             for (i, ((_, size), target)) in sanitized.iter().zip(&targets).enumerate() {
                 let part = part_path(target);
                 offsets[i] = match tokio::fs::metadata(&part).await {
@@ -1305,6 +1358,14 @@ impl Node {
                     }
                 }
             }
+        };
+        let interrupted = tokio::select! {
+            _ = prepare => false,
+            _ = interrupt.cancelled() => true,
+        };
+        if interrupted {
+            self.interrupts.lock().unwrap().remove(&local_id);
+            return Ok(());
         }
         if resume && prior.is_none() {
             self.resume.lock().unwrap().insert(ResumeEntry {
@@ -1323,13 +1384,18 @@ impl Node {
         } else {
             Message::Accept { features: vec![], offsets: vec![] }
         };
-        write_msg(&mut wr, &accept).await.map_err(|e| e.to_string())?;
+        if let Err(e) = write_msg(&mut wr, &accept).await {
+            // Kabul iletilemedi: yeni açılan devam kaydı adları boşuna ayırmasın.
+            if resume && prior.is_none() {
+                self.resume.lock().unwrap().remove(&fp, &transfer_id);
+            }
+            self.interrupts.lock().unwrap().remove(&local_id);
+            return Err(e.to_string());
+        }
 
         let id = local_id;
         let token = CancellationToken::new();
-        let interrupt = CancellationToken::new();
         self.cancels.lock().unwrap().insert(id.clone(), token.clone());
-        self.interrupts.lock().unwrap().insert(id.clone(), interrupt.clone());
         let summary = format!("{title} · {}", fmt_bytes(total));
         let already: u64 = offsets.iter().sum();
         let mut t = Transfer::new(
@@ -1553,6 +1619,10 @@ impl Node {
         if text.chars().count() > MAX_CHAT_CHARS {
             return Err("too_long");
         }
+        // Zaten alınmış mesajın yeniden gönderimi (onay kaybolduysa) hız sınırından düşmez.
+        if self.chats.lock().unwrap().contains(&fp, id) {
+            return Ok(());
+        }
         if !self.chat_rate_ok(&fp) {
             return Err("rate");
         }
@@ -1714,11 +1784,21 @@ impl Node {
     /// ayrılınmış gruplar tamamen kaldırılır.
     pub fn chat_clear(&self, key: &str) {
         let mut chats = self.chats.lock().unwrap();
-        let active_group = chats.conv(key).map_or(false, |c| c.group.is_some() && !c.left);
+        let (active_group, notices_pending) = chats.conv(key).map_or((false, false), |c| {
+            (c.group.is_some() && !c.left, c.leave_pending || !c.sync_pending.is_empty())
+        });
         if active_group {
             chats.with(key, |c| {
                 c.messages.retain(|m| m.outgoing && !m.pending.is_empty());
                 c.unread = 0;
+            });
+        } else if notices_pending {
+            // Ayrılık/silme bildirimi henüz gitmedi: kaydı silersek bildirim kaybolur ve
+            // yönetici beni gruba geri katar. Gizle; bildirim gidince kaldırılır.
+            chats.with(key, |c| {
+                c.messages.clear();
+                c.unread = 0;
+                c.hidden = true;
             });
         } else {
             chats.clear(key);
@@ -1877,6 +1957,10 @@ impl Node {
         group_id: Option<String>,
     ) -> String {
         let total: u64 = entries.iter().map(|e| e.1.size).sum();
+        let was_resumable = reuse_id
+            .as_ref()
+            .and_then(|r| self.transfers.lock().unwrap().get(r).map(|t| t.resumable))
+            .unwrap_or(false);
         let id = reuse_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         // Birebir gönderim o kişiyle sohbette dosya balonu olarak görünür
         // (grup gönderiminde balon grup sohbetindedir).
@@ -1904,6 +1988,7 @@ impl Node {
         );
         t.sources = sources;
         t.group_id = group_id;
+        t.resumable = was_resumable;
         self.insert_transfer(t);
 
         let node = self.clone();
@@ -1911,11 +1996,13 @@ impl Node {
         tokio::spawn(async move {
             let mut peer = peer;
             // Alıcı kaldığı yerden devamı destekliyorsa kopan bağlantıda otomatik yeniden denenir.
-            let mut resumable = false;
+            // Daha önce devam desteğiyle başlamış bir aktarımın yeniden başlatılması (duraklat →
+            // devam, Tekrar dene): alıcı önce yarım dosyaları özetler, bu uzun sürebilir.
+            let mut resumable = was_resumable;
             let mut failures = 0usize;
             let outcome = loop {
                 let before = node.transfer_done(&tid);
-                match node.run_send(&tid, &peer, entries.clone(), &token, &mut resumable, failures > 0).await {
+                match node.run_send(&tid, &peer, entries.clone(), &token, &mut resumable, failures > 0 || was_resumable).await {
                     Err(e) if e.retry && resumable && !token.is_cancelled() => {
                         if node.transfer_done(&tid) > before {
                             failures = 0; // ilerleme oldu: deneme hakkı yenilenir
@@ -1955,16 +2042,18 @@ impl Node {
                     };
                     node.finish_transfer(&tid, Status::Declined, msg)
                 }
+                // Bildirim, kayıt "bitti" olmadan önce gönderilir: yoksa hemen "devam" denince
+                // geç gelen bildirim yeni başlayan aktarımı keserdi.
                 Ok(SendOutcome::Cancelled) if node.pauses.lock().unwrap().remove(&tid) => {
-                    node.finish_transfer(&tid, Status::Paused, None);
                     node.send_notice(&peer, Message::PauseNotice { device: node.device_info(), transfer_id: tid.clone() }).await;
+                    node.finish_transfer(&tid, Status::Paused, None);
                 }
                 Ok(SendOutcome::Cancelled) => {
-                    node.finish_transfer(&tid, Status::Cancelled, None);
                     // Alıcıda bekleyen yarım dosyalar boşuna yer kaplamasın.
                     if resumable {
                         node.send_notice(&peer, Message::Abort { device: node.device_info(), transfer_id: tid.clone() }).await;
                     }
+                    node.finish_transfer(&tid, Status::Cancelled, None);
                 }
                 Ok(SendOutcome::PeerCancelled) => node.finish_transfer(
                     &tid,
@@ -3389,6 +3478,50 @@ mod tests {
         node.send_typing(&fp);
     }
 
+    /// Başka bir sertifika, görünür durumdaki bir cihazın kimliğini (id) ele geçiremez.
+    #[test]
+    fn peer_id_cannot_be_hijacked_by_another_certificate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::new(&tmp.path().join("cfg"), &tmp.path().join("dl"), quiet()).unwrap();
+        let bob = DeviceInfo { id: "bob-id".into(), name: "Bob".into(), port: 1, fingerprint: "b".repeat(64), os: "windows".into(), ..Default::default() };
+        node.upsert_peer(bob.clone(), IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)), None);
+        let fake = DeviceInfo { fingerprint: "e".repeat(64), ..bob.clone() };
+        node.upsert_peer(fake, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 66)), None);
+        let p = node.peer("bob-id").unwrap();
+        assert_eq!(p.fingerprint, "b".repeat(64));
+        assert_eq!(p.ip, "192.168.1.20");
+        assert!(node.candidates(&p).iter().all(|a| a.ip() != IpAddr::V4(Ipv4Addr::new(192, 168, 1, 66))));
+    }
+
+    /// Yönetici çevrimdışı bir üyeyi çıkardıktan sonra grubu yeniden düzenlerse, çıkarılan
+    /// üyeye gidecek bildirim kaybolmamalı (yoksa üye gruptan çıkarıldığını hiç öğrenmez).
+    #[test]
+    fn removed_member_stays_pending_after_further_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::new(&tmp.path().join("cfg"), &tmp.path().join("dl"), quiet()).unwrap();
+        let (y, z) = ("c".repeat(64), "d".repeat(64));
+        let key = node.group_create_offline("Ekip", &[y.clone(), z.clone()]);
+        node.group_edit(&key, None, &[], &[y.clone()]).unwrap();
+        node.group_edit(&key, Some("Yeni ad".into()), &[], &[]).unwrap();
+        let pending = node.chats.lock().unwrap().conv(&key).unwrap().sync_pending.clone();
+        assert!(pending.contains(&y), "çıkarılan üye bildirim listesinden düşmemeli");
+        assert!(pending.contains(&z));
+    }
+
+    impl Node {
+        /// Test: giden kutusu tetiklenmeden grup oluşturur (tokio gerektirmez).
+        fn group_create_offline(&self, name: &str, members: &[String]) -> String {
+            let me = self.identity.fingerprint.clone();
+            let id = uuid::Uuid::new_v4().to_string();
+            let key = crate::chat::group_key(&id);
+            let mut all = vec![crate::chat::GroupMember { fingerprint: me.clone(), name: "ben".into() }];
+            all.extend(members.iter().map(|f| crate::chat::GroupMember { fingerprint: f.clone(), name: f[..4].to_string() }));
+            let group = crate::chat::GroupInfo { id, name: name.into(), admin: me, members: all, rev: 1, deleted: false };
+            self.chats.lock().unwrap().insert(crate::chat::Conversation { fingerprint: key.clone(), name: name.into(), group: Some(group), ..Default::default() });
+            key
+        }
+    }
+
     #[tokio::test]
     async fn typing_signal_reaches_chat_and_group_and_wipe_keeps_groups() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3874,14 +4007,18 @@ mod tests {
         poll_ticks(&all, || poll_of(&bob, &id).is_some()).await;
         assert!(alice.poll_vote(&id, 0).is_err(), "kendini eklemeyen sahip oy kullanmaz");
         bob.poll_vote(&id, 1).unwrap();
-        poll_ticks(&all, || poll_of(&bob, &id).map_or(false, |v| v.poll.counts == vec![0, 1])).await;
+        // Açıkken kimin oy verdiği görünür ama sayılar gönderilmez (oy çıkarımı yapılamasın).
+        poll_ticks(&all, || poll_of(&bob, &id).map_or(false, |v| v.poll.voted.contains(&bob.identity.fingerprint))).await;
+        assert_eq!(poll_of(&bob, &id).unwrap().poll.counts, vec![0, 0]);
         assert!(poll_of(&bob, &id).unwrap().poll.ballots.is_empty());
         assert!(poll_of(&alice, &id).unwrap().poll.ballots.is_empty());
 
-        // Listeden kaldırma: açık oylamayı kaldıran sahip onu önce bitirir.
+        // Listeden kaldırma: açık oylamayı kaldıran sahip onu önce bitirir; sonuç o an açıklanır.
         alice.poll_remove(&id).unwrap();
         assert!(poll_of(&alice, &id).is_none());
         poll_ticks(&all, || poll_of(&bob, &id).map_or(false, |v| v.poll.closed)).await;
+        assert_eq!(poll_of(&bob, &id).unwrap().poll.counts, vec![0, 1]);
+        assert!(poll_of(&bob, &id).unwrap().poll.ballots.is_empty());
     }
 
     struct ShareInfoForTest;

@@ -193,6 +193,19 @@ pub async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &Message) -> io::R
     w.flush().await
 }
 
+/// `read_msg` gibi, ama en fazla `max` baytlık mesaj kabul eder (küçük yanıtlar için).
+pub async fn read_msg_max<R: AsyncRead + Unpin>(r: &mut R, max: usize) -> io::Result<Message> {
+    let mut len = [0u8; 4];
+    r.read_exact(&mut len).await?;
+    let len = u32::from_be_bytes(len) as usize;
+    if len > max.min(MAX_FRAME) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "mesaj çok büyük"));
+    }
+    let mut body = vec![0u8; len];
+    r.read_exact(&mut body).await?;
+    serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 pub async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Message> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len).await?;

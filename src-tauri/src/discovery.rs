@@ -175,6 +175,9 @@ pub async fn run(node: Arc<Node>) {
         node.flush_outbox();
         node.flush_polls();
         node.check_avatars();
+        if tick % 600 == 0 {
+            node.prune_resume();
+        }
         tick += 1;
         if tick % 4 == 0 {
             // Ağ değişikliklerinde (Wi-Fi'ya bağlanma vb.) yeni arayüzlere katıl.

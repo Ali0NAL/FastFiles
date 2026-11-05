@@ -136,10 +136,14 @@ function openModal(kind, html, { onClose } = {}) {
 
 function closeModal() {
   const cb = modalOnClose;
+  const wasOther = modalKind && modalKind !== 'incoming';
   modalKind = null;
   modalOnClose = null;
   $('#modal-root').innerHTML = '';
   cb?.();
+  // Bekleyen gelen istek varsa, kapanan pencereden sonra göster (hemen başka pencere
+  // açılmadıysa).
+  if (wasOther && state.incoming.length) setTimeout(() => { if (!modalKind) showNextIncoming(); }, 0);
 }
 
 $('#modal-root').addEventListener('mousedown', (e) => {
@@ -630,8 +634,14 @@ const responded = new Set();
 function onIncoming(req) {
   req.receivedAt = Date.now();
   state.incoming.push(req);
-  if (modalKind !== 'incoming') showNextIncoming();
-  else renderQueueNote();
+  if (modalKind === 'incoming') return renderQueueNote();
+  // Başka bir pencere açıksa (Toplu gönder, Ayarlar, PIN…) onu kapatıp içindekileri
+  // kaybettirme: o pencere kapanınca istek gösterilir.
+  if (modalKind) {
+    toast(`${req.device.name} dosya göndermek istiyor`, { action: 'Göster', timeout: 10000, onAction: () => { closeModal(); showNextIncoming(); } });
+    return;
+  }
+  showNextIncoming();
 }
 
 function onIncomingClosed({ requestId }) {
@@ -1215,6 +1225,7 @@ $('#convs').addEventListener('click', (e) => {
 });
 
 async function openChat(fp, name) {
+  closeEmoji();
   if (!state.chats.has(fp)) {
     state.chats.set(fp, { fingerprint: fp, name: name || peerByFp(fp)?.name || 'Cihaz', unread: 0, last: null });
   }
@@ -1246,6 +1257,7 @@ function closeChat() {
 $('#chat-back').onclick = closeChat;
 
 function markRead(fp) {
+  if (lockVisible()) return; // kilitliyken görülmemiş mesajlar okundu sayılmaz
   const c = state.chats.get(fp);
   if (!c?.unread) return;
   c.unread = 0;
@@ -1305,6 +1317,7 @@ function renderChatHeadBase() {
     ta.disabled = !canSend;
     $('#chat-attach').disabled = !canSend;
     $('#chat-emoji').disabled = !canSend;
+    if (!canSend) closeEmoji();
     ta.placeholder = canSend ? 'Gruba mesaj yazın…' : 'Bu gruba mesaj gönderemezsiniz';
     $('#chat-send').disabled = !canSend || !ta.value.trim();
     updateComposerNote();
@@ -1330,6 +1343,7 @@ function renderChatHeadBase() {
   ta.disabled = !canSend;
   $('#chat-attach').disabled = !canSend;
   $('#chat-emoji').disabled = !canSend;
+  if (!canSend) closeEmoji();
   ta.placeholder = canSend ? 'Mesaj yazın…' : blocked ? 'Bu cihazı engellediniz' : 'Cihaz çevrimdışı, mesaj gönderilemez';
   $('#chat-send').disabled = !canSend || !ta.value.trim();
   updateComposerNote();
@@ -1540,8 +1554,8 @@ $('#composer').addEventListener('keydown', (e) => {
 $('#chat-send').onclick = sendChat;
 // Açık sohbete dosya/klasör gönderir: birebir sohbette o kişiye, grupta tüm üyelere
 // (çevrimdışı üyelere geri geldiklerinde).
-async function sendToChat(paths) {
-  const key = state.openChat;
+async function sendToChat(paths, target = state.openChat) {
+  const key = target;
   if (!key || !paths?.length) return;
   if (groupOf(key)) {
     try {
@@ -1588,6 +1602,7 @@ $('#emoji-pop').addEventListener('click', (e) => {
   const b = e.target.closest('[data-emoji]');
   if (!b) return;
   const ta = $('#composer');
+  if (ta.disabled) return closeEmoji();
   ta.setRangeText(b.dataset.emoji, ta.selectionStart, ta.selectionEnd, 'end');
   ta.dispatchEvent(new Event('input'));
   ta.focus();
@@ -1600,8 +1615,9 @@ window.addEventListener('keydown', (e) => {
 
 $('#chat-attach').onclick = async () => {
   if ($('#composer').disabled) return;
+  const key = state.openChat; // seçim penceresi açıkken sohbet değişirse yanlış kişiye gitmesin
   const sel = await api.pick({ multiple: true, directory: false, title: 'Sohbete gönderilecek dosyalar' });
-  if (sel) sendToChat(Array.isArray(sel) ? sel : [sel]);
+  if (sel) sendToChat(Array.isArray(sel) ? sel : [sel], key);
 };
 
 // Sohbette ekran görüntüsü veya Gezgin'den kopyalanan dosya yapıştırılırsa dosya olarak gönderilir.
@@ -1841,6 +1857,8 @@ function onConversation(summary) {
 // ───────────────────────────── Bildirime tıklama ─────────────────────────────
 
 function onNotificationClick(target = {}) {
+  // Kilitliyken hiçbir ekran açılmaz; kilit açılınca kullanıcı kendisi bakar.
+  if (lockVisible()) return;
   if (modalKind && modalKind !== 'incoming') closeModal();
   if (target.view === 'chat' && target.key) {
     openChat(target.key);
@@ -1878,6 +1896,7 @@ function onChat({ fingerprint: fp, name, unread, incoming, message }) {
   const viewing = state.openChat === fp && chatOpen();
   if (viewing) {
     renderMessages(!incoming);
+    renderChatHead();
     if (incoming && document.hasFocus()) markRead(fp);
   } else if (incoming) {
     const who = message.senderName ? `${name} · ${message.senderName}` : name;
@@ -2625,15 +2644,31 @@ function endDrag() {
   document.querySelectorAll('.peer.drop-target').forEach((el) => el.classList.remove('drop-target'));
 }
 
+// Bırakma noktası açık ortak klasör panelinin üzerinde mi?
+function shareDropAt(pos) {
+  if (!pos || !shareOpen()) return false;
+  const r = window.devicePixelRatio || 1;
+  return !!document.elementFromPoint(pos.x / r, pos.y / r)?.closest('#share-view');
+}
+
+// Bırakma noktası (kullanılamaz durumdaki) sohbet/klasör panelinin üzerinde mi?
+function sidePanelAt(pos) {
+  if (!pos) return false;
+  const r = window.devicePixelRatio || 1;
+  return !!document.elementFromPoint(pos.x / r, pos.y / r)?.closest('#chat-view, #share-view');
+}
+
 api.onDragDrop((event) => {
   const p = event.payload;
+  // Kilitliyken sürükle-bırak hiçbir şey yapmaz (pencereye bırakılan dosya gönderilmesin).
+  if (lockVisible()) return endDrag();
   if (modalKind === 'incoming' || modalKind === 'welcome') return;
   if (p.type === 'enter' || p.type === 'over') {
     if (p.paths) state.dragPaths = p.paths;
     document.body.classList.add('dragging');
     if (batch) $('#drop-msg').textContent = 'Listeye eklemek için bırakın';
     else if (chatDropAt(p.position)) $('#drop-msg').textContent = `Bırak → ${state.chats.get(state.openChat)?.name || 'sohbet'}`;
-    else if (shareDropTarget()) $('#drop-msg').textContent = `“${shareDropTarget().name}” klasörüne eklemek için bırakın`;
+    else if (shareDropTarget() && shareDropAt(p.position)) $('#drop-msg').textContent = `“${shareDropTarget().name}” klasörüne eklemek için bırakın`;
     else updateDragTarget(p.position);
   } else if (p.type === 'leave') {
     endDrag();
@@ -2649,8 +2684,13 @@ api.onDragDrop((event) => {
     if (batch) return batch.add(paths);
     // Açık sohbetin üzerine bırakıldıysa o sohbete (kişiye ya da gruba) gider.
     if (!modalKind && chatDropAt(p.position)) return sendToChat(paths);
-    // Açık (ve kilidi açık) ortak klasör varsa dosyalar oraya eklenir.
-    if (shareDropTarget()) return addToShare(shareDropTarget().id, paths);
+    // Açık (ve kilidi açık) ortak klasörün üzerine bırakıldıysa oraya eklenir.
+    if (!modalKind && shareDropTarget() && shareDropAt(p.position)) return addToShare(shareDropTarget().id, paths);
+    // Kullanılamayan bir sohbet/klasör panelinin üzerine bırakıldı (çevrimdışı kişi, ayrılınan
+    // grup, kilitli klasör): başka birine gitmesin.
+    if (!modalKind && !id && sidePanelAt(p.position)) {
+      return toast('Buraya dosya gönderilemiyor (kişi çevrimdışı ya da klasör kullanılamıyor)', { type: 'error' });
+    }
     if (modalKind) closeModal();
     const peer = state.peers.find((x) => x.id === id) || (state.peers.length === 1 ? state.peers[0] : null);
     if (peer) sendPaths(peer, paths);
@@ -2664,9 +2704,14 @@ api.onDragDrop((event) => {
 async function takePendingSend() {
   const paths = await api.invoke('take_pending_send').catch(() => []);
   if (!paths?.length) return;
-  if (modalKind === 'incoming' || modalKind === 'welcome') {
-    // Önce gelen isteğe yanıt verilsin; seçim biraz sonra açılır.
-    return setTimeout(() => showBatch(paths), 1500);
+  openSendBatch(paths);
+}
+
+// Gezgin'den gelen yolları "Toplu gönder"de açar; gelen istek / karşılama ekranı / kilit
+// açıkken bekler, açık bir Toplu gönder varsa ona ekler.
+function openSendBatch(paths) {
+  if (lockVisible() || modalKind === 'incoming' || modalKind === 'welcome') {
+    return setTimeout(() => openSendBatch(paths), 1500);
   }
   if (batch) return batch.add(paths);
   const peers = state.peers.filter((p) => !p.blocked);
@@ -2729,8 +2774,6 @@ async function init() {
   api.listen('updated', (e) => toast(`FastFiles güncellendi: v${e.payload.from} → v${e.payload.to}`, { type: 'success', timeout: 7000 }));
   api.listen('transfer', (e) => onTransfer(e.payload));
   api.listen('transfers', (e) => setTransfers(e.payload));
-  api.listen('incoming', (e) => onIncoming(e.payload));
-  api.listen('incoming-closed', (e) => onIncomingClosed(e.payload));
   api.listen('typing', (e) => onTyping(e.payload));
   // Karşı taraf gönderimi elle onayladı.
   api.listen('accepted', (e) => toast(`${e.payload.peerName} kabul etti · "${e.payload.title}" gönderiliyor`, { type: 'success' }));
@@ -2747,6 +2790,10 @@ async function init() {
 document.addEventListener('contextmenu', (e) => { if (!e.target.closest('input')) e.preventDefault(); });
 // PIN tanımlıysa uygulama kilitli açılır; veriler kilit açılınca yüklenir.
 (async () => {
+  // Gelen dosya istekleri kilit açılmadan da dinlenir: uygulama kilitli açılsa bile istek
+  // kaybolmaz (pencere kilit ekranının arkasında bekler, kilit açılınca görünür).
+  api.listen('incoming', (e) => onIncoming(e.payload));
+  api.listen('incoming-closed', (e) => onIncomingClosed(e.payload));
   state.lock = await api.invoke('lock_state').catch(() => ({ hasPin: false, locked: false, retryAfter: 0 }));
   if (state.lock.locked) {
     showLock();

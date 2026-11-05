@@ -54,7 +54,8 @@ pub fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
 pub fn is_newer(candidate: &str, current: &str) -> bool {
     match (parse_version(candidate), parse_version(current)) {
         (Some(a), Some(b)) => a > b,
-        (Some(_), None) => true,
+        // Çalışan sürüm çözümlenemiyorsa (ör. "1.4.0-beta") hiçbir paket "daha yeni" sayılmaz;
+        // yoksa eski imzalı paketler de kurulurdu (sürüm düşürme).
         _ => false,
     }
 }
@@ -196,6 +197,9 @@ mod tests {
         assert!(!is_newer("1.2", "1.1.0"));
         assert!(!is_newer("abc", "1.0.0"));
         assert!(!is_newer("1.2.0.1", "1.0.0"));
+        // Çalışan sürüm çözümlenemiyorsa hiçbir paket daha yeni sayılmaz (sürüm düşürme olmasın).
+        assert!(!is_newer("0.0.1", "1.4.0-beta"));
+        assert!(!is_newer("9.9.9", ""));
     }
 
     #[test]
