@@ -5,6 +5,12 @@
 
 #[path = "group.rs"]
 mod group;
+#[path = "avatar.rs"]
+mod avatar;
+#[path = "share.rs"]
+pub mod share;
+#[path = "poll.rs"]
+pub mod poll;
 
 use crate::chat::{ChatMessage, ChatStore, ConversationSummary, MsgStatus};
 use crate::config::{fingerprint, Identity, Settings, TrustedDevice};
@@ -56,6 +62,8 @@ pub struct Peer {
     pub version: String,
     /// Karşı cihazın dağıttığı güncelleme paketi sürümü.
     pub pkg: String,
+    /// Karşı cihazın profil resmi özeti (yoksa boş).
+    pub avatar: String,
     #[serde(skip)]
     last_seen: Option<Instant>,
     /// Cihazın son görüldüğü tüm adresler (Wi-Fi + ethernet + VPN gibi birden fazla olabilir).
@@ -184,6 +192,19 @@ pub struct Node {
     update_failures: Mutex<HashMap<String, Instant>>,
     outbox_in_flight: Mutex<HashSet<String>>,
     outbox_backoff: Mutex<HashMap<String, Instant>>,
+    avatar_dir: PathBuf,
+    my_avatar: Mutex<Option<(String, Vec<u8>)>>,
+    avatar_hashes: Mutex<HashMap<String, String>>,
+    avatar_fetching: Mutex<HashSet<String>>,
+    avatar_failures: Mutex<HashMap<String, Instant>>,
+    shares: Mutex<HashMap<String, share::ShareState>>,
+    shares_dir: PathBuf,
+    share_pushed: Mutex<HashMap<(String, String), (String, Instant)>>,
+    share_fetching: Mutex<HashSet<String>>,
+    share_backoff: Mutex<HashMap<String, Instant>>,
+    unlock_attempts: Mutex<HashMap<String, VecDeque<Instant>>>,
+    polls: Mutex<HashMap<String, poll::PollState>>,
+    polls_path: PathBuf,
     pub shutdown: CancellationToken,
 }
 
@@ -223,9 +244,27 @@ impl Node {
             update_failures: Mutex::new(HashMap::new()),
             outbox_in_flight: Mutex::new(HashSet::new()),
             outbox_backoff: Mutex::new(HashMap::new()),
+            avatar_dir: config_dir.join("avatars"),
+            my_avatar: Mutex::new(None),
+            avatar_hashes: Mutex::new(HashMap::new()),
+            avatar_fetching: Mutex::new(HashSet::new()),
+            avatar_failures: Mutex::new(HashMap::new()),
+            shares: Mutex::new(HashMap::new()),
+            shares_dir: config_dir.join("shares"),
+            share_pushed: Mutex::new(HashMap::new()),
+            share_fetching: Mutex::new(HashSet::new()),
+            share_backoff: Mutex::new(HashMap::new()),
+            unlock_attempts: Mutex::new(HashMap::new()),
+            polls: Mutex::new(HashMap::new()),
+            polls_path: config_dir.join("polls.json"),
             shutdown: CancellationToken::new(),
         });
         node.load_cached_package();
+        let _ = std::fs::create_dir_all(&node.avatar_dir);
+        node.load_avatars();
+        let _ = std::fs::create_dir_all(&node.shares_dir);
+        node.load_shares();
+        node.load_polls();
         Ok(node)
     }
 
@@ -269,6 +308,11 @@ impl Node {
         (self.emit)(event, payload)
     }
 
+    /// Bildirim; tıklanınca arayüzün açacağı yer 	arget ile verilir (ör. {"view":"polls"}).
+    fn notify_to(&self, title: &str, body: &str, target: Value) {
+        self.emit("notify", json!({ "title": title, "body": body, "target": target }));
+    }
+
     /// Windows bildirimi isteği. Pencere öndeyse kabuk (lib.rs) bildirimi göstermez.
     fn notify(&self, title: &str, body: &str, transfer_id: Option<&str>) {
         self.emit("notify", json!({ "title": title, "body": body, "transferId": transfer_id }));
@@ -289,6 +333,7 @@ impl Node {
             os: std::env::consts::OS.to_string(),
             version: CURRENT_VERSION.to_string(),
             pkg: self.update_pkg.lock().unwrap().as_ref().map(|h| h.version.clone()).unwrap_or_default(),
+            avatar: self.my_avatar_hash(),
         }
     }
 
@@ -362,6 +407,25 @@ impl Node {
         std::fs::rename(&tmp, self.package_path()).map_err(|e| e.to_string())?;
         self.package_ready(&h);
         Ok(h)
+    }
+
+    /// Gelen kutusu: `updates\inbox` klasörüne bırakılan .ffupdate paketlerini içe aktarır.
+    /// Yayın betiği (release.ps1) yeni paketi buraya koyar; böylece sürüm çıkarmak tek komuttur
+    /// ve güncelleme ağa kendiliğinden yayılır. İmza her zamanki gibi doğrulanır.
+    pub fn check_update_inbox(&self) {
+        let inbox = self.update_dir.join("inbox");
+        let Ok(entries) = std::fs::read_dir(&inbox) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()).map_or(true, |e| !e.eq_ignore_ascii_case("ffupdate")) {
+                continue;
+            }
+            match self.import_update(&path) {
+                Ok(h) => eprintln!("[fastfiles] gelen kutusundan güncelleme alındı: {}", h.version),
+                Err(e) => eprintln!("[fastfiles] gelen kutusundaki paket kullanılamadı ({}): {e}", path.display()),
+            }
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     /// Ağda daha yeni paket dağıtan bir cihaz varsa arka planda indirir.
@@ -587,6 +651,9 @@ impl Node {
         if update::parse_version(&d.pkg).is_none() {
             d.pkg.clear();
         }
+        if !avatar::valid_avatar_hash(&d.avatar) {
+            d.avatar.clear();
+        }
         let now = Instant::now();
         let changed = {
             let mut peers = self.peers.lock().unwrap();
@@ -611,7 +678,9 @@ impl Node {
                         || p.port != d.port
                         || p.fingerprint != d.fingerprint
                         || p.version != d.version
-                        || p.pkg != d.pkg;
+                        || p.pkg != d.pkg
+                        || p.avatar != d.avatar;
+                    p.avatar = d.avatar;
                     p.version = d.version;
                     p.pkg = d.pkg;
                     p.name = d.name;
@@ -640,6 +709,7 @@ impl Node {
                             blocked: false,
                             version: d.version,
                             pkg: d.pkg,
+                            avatar: d.avatar,
                             last_seen: Some(now),
                             addrs: vec![(ip, now)],
                         },
@@ -846,6 +916,58 @@ impl Node {
                 self.receive(rd, wr, addr.ip(), device, files, total).await
             }
             Message::UpdateRequest => self.serve_update(&mut wr).await,
+            Message::ShareUpdate { device, share } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                let reply = self.accept_share_update(&client_fp, share);
+                write_msg(&mut wr, &reply).await.map_err(|e| e.to_string())
+            }
+            Message::ShareManifest { device, share_id, entries } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                let reply = self.accept_share_manifest(&client_fp, &share_id, entries);
+                write_msg(&mut wr, &reply).await.map_err(|e| e.to_string())
+            }
+            Message::ShareFetch { device, share_id, path } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                self.serve_share_file(&client_fp, &share_id, &path, &mut wr).await
+            }
+            Message::ShareUnlock { device, share_id, password } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                let reply = self.accept_share_unlock(&client_fp, &share_id, &password);
+                write_msg(&mut wr, &reply).await.map_err(|e| e.to_string())
+            }
+            Message::ShareLeave { device, share_id } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                self.accept_share_leave(&client_fp, &share_id);
+                write_msg(&mut wr, &Message::GroupAck).await.map_err(|e| e.to_string())
+            }
+            Message::PollUpdate { device, poll, owner_name } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                let reply = self.accept_poll_update(&client_fp, poll, &owner_name);
+                write_msg(&mut wr, &reply).await.map_err(|e| e.to_string())
+            }
+            Message::PollVote { device, poll_id, option } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                let reply = self.accept_poll_vote(&client_fp, &poll_id, option);
+                write_msg(&mut wr, &reply).await.map_err(|e| e.to_string())
+            }
+            Message::AvatarRequest => {
+                let reply = self.serve_avatar();
+                write_msg(&mut wr, &reply).await.map_err(|e| e.to_string())
+            }
             Message::GroupUpdate { device, group } => {
                 if device.fingerprint != client_fp {
                     return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
@@ -1002,65 +1124,27 @@ impl Node {
         }
 
         // ── Veri akışı ──
-        let mut current_part: Option<PathBuf> = None;
-        let result = {
-            let work = async {
-                let mut buf = vec![0u8; CHUNK];
-                for (parts, size) in &sanitized {
-                    let mut target = dest.join(&tops[&parts[0]]);
-                    for p in &parts[1..] {
-                        target.push(p);
-                    }
-                    if let Some(parent) = target.parent() {
-                        tokio::fs::create_dir_all(parent)
-                            .await
-                            .map_err(|e| format!("Klasör oluşturulamadı: {e}"))?;
-                    }
-                    let mut part_name = target.file_name().unwrap_or_default().to_os_string();
-                    part_name.push(".ffpart");
-                    let part_path = target.with_file_name(part_name);
-                    current_part = Some(part_path.clone());
-                    self.set_current_file(&id, &parts.join("/"));
-
-                    let file = tokio::fs::File::create(&part_path)
-                        .await
-                        .map_err(|e| format!("Dosya oluşturulamadı ({}): {e}", target.display()))?;
-                    let mut w = BufWriter::with_capacity(CHUNK, file);
-                    let mut remaining = *size;
-                    while remaining > 0 {
-                        let want = remaining.min(CHUNK as u64) as usize;
-                        let n = rd
-                            .read(&mut buf[..want])
-                            .await
-                            .map_err(|_| "Gönderen iptal etti veya bağlantı koptu".to_string())?;
-                        if n == 0 {
-                            return Err("Gönderen iptal etti veya bağlantı koptu".to_string());
-                        }
-                        w.write_all(&buf[..n]).await.map_err(|e| format!("Diske yazılamadı: {e}"))?;
-                        remaining -= n as u64;
-                        self.add_progress(&id, n as u64);
-                    }
-                    w.flush().await.map_err(|e| format!("Diske yazılamadı: {e}"))?;
-                    // Windows'ta açık dosya yeniden adlandırılamaz; tutamacı kesin olarak kapat.
-                    drop(w.into_inner().into_std().await);
-                    tokio::fs::rename(&part_path, &target)
-                        .await
-                        .map_err(|e| format!("Dosya kaydedilemedi: {e}"))?;
-                    current_part = None;
+        // Ağdan okuma bu görevde, diske yazma paralel disk işçilerinde yapılır (bkz. receive_files).
+        let plan: Vec<FilePlan> = sanitized
+            .iter()
+            .map(|(parts, size)| {
+                let mut target = dest.join(&tops[&parts[0]]);
+                for p in &parts[1..] {
+                    target.push(p);
                 }
-                Ok::<(), String>(())
-            };
-            tokio::select! {
-                r = work => r.map_err(RecvError::Failed),
-                _ = token.cancelled() => Err(RecvError::Cancelled),
-            }
-        };
-
-        if result.is_err() {
-            if let Some(p) = current_part.take() {
-                remove_with_retry(&p).await;
-            }
-        }
+                let mut part_name = target.file_name().unwrap_or_default().to_os_string();
+                part_name.push(".ffpart");
+                FilePlan { part: target.with_file_name(part_name), target, size: *size, display: parts.join("/") }
+            })
+            .collect();
+        let result = receive_files(
+            &mut rd,
+            plan,
+            &token,
+            |n| self.add_progress(&id, n),
+            |name| self.set_current_file(&id, name),
+        )
+        .await;
 
         match result {
             Ok(()) => {
@@ -1376,26 +1460,20 @@ impl Node {
             t.sample = None;
         });
 
+        // Diskten okuma paralel iş parçacıklarında önden yapılır; ağ yazımı diski hiç beklemez.
+        let mut readers = spawn_readers(&entries);
         let writer = async {
-            let mut buf = vec![0u8; CHUNK];
-            for (src, entry) in entries.iter() {
+            let n = readers.len();
+            for (idx, (_, entry)) in entries.iter().enumerate() {
                 self.set_current_file(id, &entry.path);
-                let mut f = tokio::fs::File::open(src)
-                    .await
-                    .map_err(|e| format!("{} açılamadı: {e}", entry.path))?;
+                let rx = &mut readers[idx % n];
                 let mut remaining = entry.size;
                 while remaining > 0 {
-                    let want = remaining.min(CHUNK as u64) as usize;
-                    let n = f
-                        .read(&mut buf[..want])
-                        .await
-                        .map_err(|e| format!("{} okunamadı: {e}", entry.path))?;
-                    if n == 0 {
-                        return Err(format!("{} gönderim sırasında değişti", entry.path));
-                    }
-                    wr.write_all(&buf[..n]).await.map_err(|_| "Bağlantı koptu".to_string())?;
-                    remaining -= n as u64;
-                    self.add_progress(id, n as u64);
+                    let (got, chunk) = rx.recv().await.ok_or_else(|| "Dosya okuma durdu".to_string())??;
+                    debug_assert_eq!(got, idx);
+                    wr.write_all(&chunk).await.map_err(|_| "Bağlantı koptu".to_string())?;
+                    remaining -= chunk.len() as u64;
+                    self.add_progress(id, chunk.len() as u64);
                 }
             }
             wr.flush().await.map_err(|_| "Bağlantı koptu".to_string())?;
@@ -1524,6 +1602,235 @@ async fn resolve(address: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("Adres çözümlenemedi: {address}"))
 }
 
+// ───────────────────────────── Hızlı aktarım boru hattı ─────────────────────────────
+
+/// Gönderende her okuyucunun önden okuduğu parça sayısı (okuyucu başına en fazla ~8 MB bellek).
+const READ_AHEAD_CHUNKS: usize = 8;
+/// Gönderende paralel disk okuyucu sayısı (küçük dosyalarda açma/kapama gecikmesini örtüştürür).
+const DISK_READERS: usize = 4;
+
+type ChunkRx = tokio::sync::mpsc::Receiver<Result<(usize, Vec<u8>), String>>;
+
+/// Gönderen: dosyaları `DISK_READERS` iş parçacığına dağıtıp önden okutur.
+/// i. dosyayı (i % N). okuyucu okur; tüketici dosya sırasıyla ilgili kanaldan alır, sıra korunur.
+fn spawn_readers(entries: &Arc<Vec<(PathBuf, FileEntry)>>) -> Vec<ChunkRx> {
+    let n = DISK_READERS.min(entries.len().max(1));
+    (0..n)
+        .map(|k| {
+            let (tx, rx) = tokio::sync::mpsc::channel(READ_AHEAD_CHUNKS);
+            let mine: Vec<(usize, PathBuf, FileEntry)> = entries
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i % n == k)
+                .map(|(i, (p, e))| (i, p.clone(), e.clone()))
+                .collect();
+            tokio::task::spawn_blocking(move || read_files_ahead(&mine, tx));
+            rx
+        })
+        .collect()
+}
+/// Alıcıda paralel disk işçisi sayısı. Küçük dosyalarda dosya açma/kapama/yeniden adlandırma
+/// (ve Windows Defender taraması) gecikmesini örtüştürür.
+const DISK_WORKERS: usize = 4;
+
+/// Gönderen: dosyaları sırayla okuyup parçalar halinde kanala koyar (engelleyen iş parçacığında).
+fn read_files_ahead(
+    entries: &[(usize, PathBuf, FileEntry)],
+    tx: tokio::sync::mpsc::Sender<Result<(usize, Vec<u8>), String>>,
+) {
+    use std::io::Read;
+    for (idx, src, entry) in entries.iter() {
+        let idx = *idx;
+        let mut f = match std::fs::File::open(src) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = tx.blocking_send(Err(format!("{} açılamadı: {e}", entry.path)));
+                return;
+            }
+        };
+        let mut remaining = entry.size;
+        while remaining > 0 {
+            let want = remaining.min(CHUNK as u64) as usize;
+            let mut buf = vec![0u8; want];
+            let mut filled = 0;
+            while filled < want {
+                match f.read(&mut buf[filled..]) {
+                    Ok(0) => {
+                        let _ = tx.blocking_send(Err(format!("{} gönderim sırasında değişti", entry.path)));
+                        return;
+                    }
+                    Ok(n) => filled += n,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(format!("{} okunamadı: {e}", entry.path)));
+                        return;
+                    }
+                }
+            }
+            remaining -= want as u64;
+            if tx.blocking_send(Ok((idx, buf))).is_err() {
+                return; // gönderim iptal edildi
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FilePlan {
+    part: PathBuf,
+    target: PathBuf,
+    size: u64,
+    display: String,
+}
+
+enum DiskCmd {
+    Start(usize),
+    Data(usize, Vec<u8>),
+    End(usize),
+}
+
+/// Paylaşılan hata durumu: ilk disk hatası kaydedilir, ağ tarafı bunu görünce durur.
+#[derive(Default)]
+struct DiskFailure {
+    failed: AtomicBool,
+    message: Mutex<Option<String>>,
+}
+
+impl DiskFailure {
+    fn set(&self, msg: String) {
+        let mut m = self.message.lock().unwrap();
+        if m.is_none() {
+            *m = Some(msg);
+        }
+        self.failed.store(true, Ordering::Relaxed);
+    }
+    fn get(&self) -> Option<String> {
+        if self.failed.load(Ordering::Relaxed) {
+            self.message.lock().unwrap().clone()
+        } else {
+            None
+        }
+    }
+}
+
+/// Alıcı disk işçisi: kendisine atanan dosyaları .ffpart olarak yazar, bitince yeniden adlandırır.
+/// Kanal kapanınca yarım kalan dosyaları siler.
+fn disk_worker(mut rx: tokio::sync::mpsc::Receiver<DiskCmd>, plan: Arc<Vec<FilePlan>>, failure: Arc<DiskFailure>) {
+    use std::io::Write;
+    let mut open: HashMap<usize, std::io::BufWriter<std::fs::File>> = HashMap::new();
+    let mut made_dirs: HashSet<PathBuf> = HashSet::new();
+    while let Some(cmd) = rx.blocking_recv() {
+        if failure.failed.load(Ordering::Relaxed) {
+            continue; // hata sonrası kanalı boşalt
+        }
+        let r: Result<(), String> = (|| match cmd {
+            DiskCmd::Start(i) => {
+                let p = &plan[i];
+                if let Some(parent) = p.target.parent() {
+                    if !made_dirs.contains(parent) {
+                        std::fs::create_dir_all(parent).map_err(|e| format!("Klasör oluşturulamadı: {e}"))?;
+                        made_dirs.insert(parent.to_path_buf());
+                    }
+                }
+                let f = std::fs::File::create(&p.part)
+                    .map_err(|e| format!("Dosya oluşturulamadı ({}): {e}", p.target.display()))?;
+                open.insert(i, std::io::BufWriter::with_capacity(512 * 1024, f));
+                Ok(())
+            }
+            DiskCmd::Data(i, bytes) => match open.get_mut(&i) {
+                Some(w) => w.write_all(&bytes).map_err(|e| format!("Diske yazılamadı: {e}")),
+                None => Ok(()),
+            },
+            DiskCmd::End(i) => {
+                if let Some(w) = open.remove(&i) {
+                    // Windows'ta açık dosya yeniden adlandırılamaz: önce kapat.
+                    let f = w.into_inner().map_err(|e| format!("Diske yazılamadı: {e}"))?;
+                    drop(f);
+                    let p = &plan[i];
+                    std::fs::rename(&p.part, &p.target).map_err(|e| format!("Dosya kaydedilemedi: {e}"))?;
+                }
+                Ok(())
+            }
+        })();
+        if let Err(e) = r {
+            failure.set(e);
+        }
+    }
+    for (i, w) in open.drain() {
+        drop(w);
+        for _ in 0..10 {
+            match std::fs::remove_file(&plan[i].part) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => std::thread::sleep(Duration::from_millis(100)),
+                _ => break,
+            }
+        }
+    }
+}
+
+/// Alıcı: dosyaların ham baytlarını okur ve paralel disk işçilerine dağıtır.
+/// Bir dosyanın tüm komutları aynı işçiye gider (sıra korunur); farklı dosyalar paralel yazılır.
+async fn receive_files<R: tokio::io::AsyncRead + Unpin>(
+    rd: &mut R,
+    plan: Vec<FilePlan>,
+    token: &CancellationToken,
+    mut on_bytes: impl FnMut(u64),
+    mut on_file: impl FnMut(&str),
+) -> Result<(), RecvError> {
+    let plan = Arc::new(plan);
+    let failure = Arc::new(DiskFailure::default());
+    let mut txs = Vec::with_capacity(DISK_WORKERS);
+    let mut workers = Vec::with_capacity(DISK_WORKERS);
+    for _ in 0..DISK_WORKERS {
+        let (tx, rx) = tokio::sync::mpsc::channel::<DiskCmd>(64);
+        let (p, f) = (plan.clone(), failure.clone());
+        workers.push(tokio::task::spawn_blocking(move || disk_worker(rx, p, f)));
+        txs.push(tx);
+    }
+    let lost = || RecvError::Failed("Gönderen iptal etti veya bağlantı koptu".into());
+    let disk_err = |f: &DiskFailure| RecvError::Failed(f.get().unwrap_or_else(|| "Disk hatası".into()));
+
+    let result: Result<(), RecvError> = async {
+        let mut buf = vec![0u8; 256 * 1024];
+        for (i, p) in plan.iter().enumerate() {
+            let worker = &txs[i % DISK_WORKERS];
+            on_file(&p.display);
+            worker.send(DiskCmd::Start(i)).await.map_err(|_| disk_err(&failure))?;
+            let mut remaining = p.size;
+            while remaining > 0 {
+                let want = remaining.min(buf.len() as u64) as usize;
+                let n = tokio::select! {
+                    r = rd.read(&mut buf[..want]) => r.map_err(|_| lost())?,
+                    _ = token.cancelled() => return Err(RecvError::Cancelled),
+                };
+                if n == 0 {
+                    return Err(lost());
+                }
+                if failure.failed.load(Ordering::Relaxed) {
+                    return Err(disk_err(&failure));
+                }
+                worker.send(DiskCmd::Data(i, buf[..n].to_vec())).await.map_err(|_| disk_err(&failure))?;
+                remaining -= n as u64;
+                on_bytes(n as u64);
+            }
+            worker.send(DiskCmd::End(i)).await.map_err(|_| disk_err(&failure))?;
+        }
+        Ok(())
+    }
+    .await;
+
+    // İşçilerin işini bitirmesini bekle (başarıda son dosyalar diske yazılır, hatada yarımlar silinir).
+    drop(txs);
+    for w in workers {
+        let _ = w.await;
+    }
+    match result {
+        Ok(()) => match failure.get() {
+            Some(e) => Err(RecvError::Failed(e)),
+            None => Ok(()),
+        },
+        Err(e) => Err(e),
+    }
+}
+
 pub fn fmt_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = n as f64;
@@ -1588,15 +1895,6 @@ fn unique_name(dir: &Path, name: &str, is_file: bool, used: &HashSet<String>) ->
         .unwrap()
 }
 
-async fn remove_with_retry(p: &Path) {
-    for _ in 0..10 {
-        match tokio::fs::remove_file(p).await {
-            Ok(()) => return,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(_) => sleep(Duration::from_millis(100)).await,
-        }
-    }
-}
 
 // ───────────────────────────── Testler ─────────────────────────────
 
@@ -1858,6 +2156,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_inbox_imports_signed_and_drops_forged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sk, pk) = update::generate_keypair().unwrap();
+        let (evil, _) = update::generate_keypair().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        alice.set_update_key(pk);
+        let inbox = alice.update_dir.join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let installer = tmp.path().join("setup.exe");
+        std::fs::write(&installer, vec![3u8; 50_000]).unwrap();
+
+        // Sahte imzalı paket içe alınmaz ve gelen kutusundan silinir.
+        update::build_package(&installer, "99.0.0", &evil, &inbox.join("sahte.ffupdate")).unwrap();
+        alice.check_update_inbox();
+        assert_eq!(alice.pending_update(), None);
+        assert_eq!(std::fs::read_dir(&inbox).unwrap().count(), 0);
+
+        // Gerçek paket içe alınır ve dağıtılmaya başlanır.
+        update::build_package(&installer, "99.0.0", &sk, &inbox.join("FastFiles-99.0.0.ffupdate")).unwrap();
+        alice.check_update_inbox();
+        assert_eq!(alice.pending_update().as_deref(), Some("99.0.0"));
+        assert_eq!(alice.device_info().pkg, "99.0.0");
+        assert_eq!(std::fs::read_dir(&inbox).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
     async fn corrupted_package_is_never_served() {
         let tmp = tempfile::tempdir().unwrap();
         let (sk, pk) = update::generate_keypair().unwrap();
@@ -1899,6 +2223,77 @@ mod tests {
         assert!(alice.is_busy());
         alice.cancel_transfer(&id);
         wait_finished(&alice, &id).await;
+    }
+
+    /// Hız ölçümü (normal test çalıştırmasında atlanır):
+    ///   cargo test --release --lib bench -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn bench_transfer_speed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        introduce(&alice, &bob);
+        bob.set_trusted(&alice.identity.fingerprint, "alice", true);
+
+        // 1) Tek büyük dosya (1 GiB)
+        let big = tmp.path().join("big.bin");
+        {
+            use std::io::Write;
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&big).unwrap());
+            let block: Vec<u8> = (0..1024 * 1024u32).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8).collect();
+            for _ in 0..1024 {
+                f.write_all(&block).unwrap();
+            }
+        }
+        let t = Instant::now();
+        let id = alice.send_one(&bob.identity.id, vec![big.to_string_lossy().into()]).await.unwrap();
+        let r = wait_finished(&alice, &id).await;
+        assert_eq!(r.status, Status::Done, "{:?}", r.error);
+        let secs = t.elapsed().as_secs_f64();
+        println!("BENCH büyük dosya : 1024 MiB in {secs:.2}s = {:.0} MB/s", 1024.0 / secs);
+
+        // 2) Çok sayıda küçük dosya (3000 × 16 KiB)
+        let dir = tmp.path().join("Proje");
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..3000 {
+            std::fs::write(dir.join(format!("f{i:05}.dat")), vec![(i % 251) as u8; 16 * 1024]).unwrap();
+        }
+        let t = Instant::now();
+        let id = alice.send_one(&bob.identity.id, vec![dir.to_string_lossy().into()]).await.unwrap();
+        let r = wait_finished(&alice, &id).await;
+        assert_eq!(r.status, Status::Done, "{:?}", r.error);
+        let secs = t.elapsed().as_secs_f64();
+        println!("BENCH küçük dosyalar: 3000 × 16 KiB in {secs:.2}s = {:.0} dosya/s, {:.1} MB/s", 3000.0 / secs, 46.875 / secs);
+    }
+
+    /// Yalnızca disk: 3000 × 16 KiB dosya yazma (iş parçacığı sayısı ve .ffpart→ad değişikliği etkisi).
+    #[test]
+    #[ignore]
+    fn bench_disk_only() {
+        for (threads, rename) in [(1, true), (4, true), (8, true), (16, true), (8, false)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = vec![7u8; 16 * 1024];
+            let t = Instant::now();
+            std::thread::scope(|s| {
+                for k in 0..threads {
+                    let (dir, data) = (tmp.path(), &data);
+                    s.spawn(move || {
+                        for i in (k..3000).step_by(threads) {
+                            let fin = dir.join(format!("f{i:05}.dat"));
+                            let part = dir.join(format!("f{i:05}.dat.ffpart"));
+                            let path = if rename { &part } else { &fin };
+                            std::fs::write(path, data).unwrap();
+                            if rename {
+                                std::fs::rename(&part, &fin).unwrap();
+                            }
+                        }
+                    });
+                }
+            });
+            let s = t.elapsed().as_secs_f64();
+            println!("BENCH disk {threads:>2} iş parçacığı, rename={rename}: {:.0} dosya/s", 3000.0 / s);
+        }
     }
 
     #[test]
@@ -2198,6 +2593,323 @@ mod tests {
         alice.group_leave(&key).unwrap();
         wait_until(|| carol.group_of(&key).map_or(false, |(g, left)| g.deleted && left)).await;
         assert!(carol.group_send(&key, "x").is_err());
+    }
+
+    #[tokio::test]
+    async fn avatar_is_shared_and_verified() {
+        use base64::Engine;
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        // Küçük "JPEG" (yalnızca imza baytları önemli).
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        jpeg.extend(std::iter::repeat(42u8).take(2000));
+        let url = format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(&jpeg));
+        alice.set_avatar(&url).unwrap();
+        assert_eq!(alice.device_info().avatar.len(), 16);
+        // SVG/çalıştırılabilir içerik reddedilir.
+        assert!(alice.set_avatar("data:image/svg+xml;base64,PHN2ZyBvbmxvYWQ9YWxlcnQoMSk+").is_err());
+
+        // Sahte özet duyurusu: resim indirilir ama özet tutmadığı için kaydedilmez.
+        let mut forged = alice.device_info();
+        forged.avatar = "0123456789abcdef".into();
+        bob.upsert_peer(forged, IpAddr::V4(Ipv4Addr::LOCALHOST), None);
+        bob.check_avatars();
+        sleep(Duration::from_millis(500)).await;
+        assert!(!bob.avatars().contains_key(&alice.identity.fingerprint));
+
+        // Gerçek duyuru: Bob resmi Alice'ten alır.
+        bob.upsert_peer(alice.device_info(), IpAddr::V4(Ipv4Addr::LOCALHOST), None);
+        bob.check_avatars();
+        wait_until(|| bob.avatars().get(&alice.identity.fingerprint) == Some(&url)).await;
+
+        // Alice resmini kaldırınca Bob'da da silinir.
+        alice.remove_avatar();
+        bob.upsert_peer(alice.device_info(), IpAddr::V4(Ipv4Addr::LOCALHOST), None);
+        bob.check_avatars();
+        assert!(!bob.avatars().contains_key(&alice.identity.fingerprint));
+    }
+
+    // ───────────── Ortak klasör testleri ─────────────
+
+    /// Dosyayı yazar ve değişim zamanını geçmişe çeker (taramadaki "yazılıyor" beklemesini atlamak için).
+    fn write_old(path: &Path, content: &[u8]) {
+        if let Some(p) = path.parent() {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(10)).unwrap();
+    }
+
+    async fn share_ticks(nodes: &[&Arc<Node>], mut cond: impl FnMut() -> bool) {
+        for _ in 0..150 {
+            if cond() {
+                return;
+            }
+            for n in nodes {
+                n.share_tick().await;
+            }
+            sleep(Duration::from_millis(80)).await;
+        }
+        panic!("ortak klasör zamanında eşitlenmedi");
+    }
+
+    fn share_dir(node: &Node, id: &str) -> PathBuf {
+        PathBuf::from(node.share_list().into_iter().find(|s| s.id == id).unwrap().dir)
+    }
+
+    fn share_paths(node: &Node, id: &str) -> Vec<String> {
+        let mut v: Vec<String> = node.share_files(id).map(|f| f.into_iter().map(|x| x.path).collect()).unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_folder_syncs_adds_edits_and_deletes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        let carol = make_node(tmp.path(), "carol").await;
+        introduce_all(&[&alice, &bob, &carol]);
+        let all = [&alice, &bob, &carol];
+
+        let s = alice
+            .share_create("Tasarım", &[bob.identity.fingerprint.clone(), carol.identity.fingerprint.clone()], None)
+            .unwrap();
+        share_ticks(&all, || bob.share_list().len() == 1 && carol.share_list().len() == 1).await;
+
+        // Alice dosya ve klasör ekler.
+        let src = tmp.path().join("kaynak");
+        write_old(&src.join("logo.png"), b"PNGDATA");
+        write_old(&src.join("Sunum/slayt1.txt"), "ilk sürüm".as_bytes());
+        alice
+            .share_add_files(&s.id, vec![src.join("logo.png").to_string_lossy().into(), src.join("Sunum").to_string_lossy().into()])
+            .await
+            .unwrap();
+        let expected = vec!["Sunum/slayt1.txt".to_string(), "logo.png".to_string()];
+        share_ticks(&all, || share_paths(&bob, &s.id) == expected && share_paths(&carol, &s.id) == expected).await;
+        assert_eq!(std::fs::read(share_dir(&carol, &s.id).join("Sunum/slayt1.txt")).unwrap(), "ilk sürüm".as_bytes());
+
+        // Bob dosyayı düzenler → herkese gider, eski hâli Alice'te çöp klasörüne taşınır.
+        write_old(&share_dir(&bob, &s.id).join("Sunum/slayt1.txt"), "ikinci sürüm".as_bytes());
+        share_ticks(&all, || {
+            std::fs::read(share_dir(&alice, &s.id).join("Sunum/slayt1.txt")).ok().as_deref() == Some("ikinci sürüm".as_bytes())
+                && std::fs::read(share_dir(&carol, &s.id).join("Sunum/slayt1.txt")).ok().as_deref() == Some("ikinci sürüm".as_bytes())
+        })
+        .await;
+        let trash = share_dir(&alice, &s.id).join(".fastfiles").join("silinen");
+        assert!(std::fs::read_dir(&trash).unwrap().count() >= 1, "üzerine yazılan sürüm saklanmalı");
+
+        // Carol bir dosyayı siler → diğerlerinde de silinir.
+        std::fs::remove_file(share_dir(&carol, &s.id).join("logo.png")).unwrap();
+        share_ticks(&all, || {
+            !share_dir(&alice, &s.id).join("logo.png").exists() && !share_dir(&bob, &s.id).join("logo.png").exists()
+        })
+        .await;
+        assert_eq!(share_paths(&bob, &s.id), vec!["Sunum/slayt1.txt".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_folder_password_and_access_control() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        let mallory = make_node(tmp.path(), "mallory").await;
+        introduce_all(&[&alice, &bob, &mallory]);
+        let all = [&alice, &bob, &mallory];
+
+        assert!(alice.share_create("Gizli", &[bob.identity.fingerprint.clone()], Some("123".into())).is_err(), "kısa şifre");
+        let s = alice.share_create("Gizli", &[bob.identity.fingerprint.clone()], Some("ofis-2026".into())).unwrap();
+        write_old(&share_dir(&alice, &s.id).join("maaslar.xlsx"), b"cok gizli");
+        share_ticks(&all, || bob.share_list().len() == 1).await;
+
+        // Bob üye ama kilidi açmadı: liste yok, dosya gelmez.
+        let bs = bob.share_list().remove(0);
+        assert!(bs.protected && !bs.can_access);
+        assert!(bob.share_files(&s.id).is_err());
+        for _ in 0..10 {
+            for n in &all {
+                n.share_tick().await;
+            }
+        }
+        assert!(!share_dir(&bob, &s.id).join("maaslar.xlsx").exists());
+        // Alice de kilidi açmamış Bob'un isteklerini reddeder.
+        assert!(matches!(alice.accept_share_manifest(&bob.identity.fingerprint, &s.id, vec![]), Message::ChatReject { .. }));
+
+        // Yanlış şifre reddedilir; doğru şifre açar ve dosyalar gelir.
+        assert_eq!(bob.share_unlock(&s.id, "yanlis").await.unwrap_err(), "Şifre yanlış");
+        bob.share_unlock(&s.id, "ofis-2026").await.unwrap();
+        share_ticks(&all, || share_dir(&bob, &s.id).join("maaslar.xlsx").exists()).await;
+        assert!(bob.share_list()[0].can_access);
+
+        // Üye olmayan Mallory: listeleyemez, dosya isteyemez, sahte yönetici bilgisi gönderemez.
+        assert!(matches!(alice.accept_share_manifest(&mallory.identity.fingerprint, &s.id, vec![]), Message::ChatReject { .. }));
+        let mut forged = ShareInfoForTest::from(&alice, &s.id);
+        forged.members.push(crate::chat::GroupMember { fingerprint: mallory.identity.fingerprint.clone(), name: "mallory".into() });
+        forged.rev += 5;
+        assert!(matches!(bob.accept_share_update(&mallory.identity.fingerprint, forged), Message::ChatReject { .. }));
+        // Kaba kuvvet sınırı: 5 hatalı denemeden sonra doğru şifre de reddedilir.
+        for _ in 0..5 {
+            let _ = alice.accept_share_unlock(&mallory.identity.fingerprint, &s.id, "tahmin");
+        }
+        assert!(matches!(
+            alice.accept_share_unlock(&mallory.identity.fingerprint, &s.id, "ofis-2026"),
+            Message::ShareUnlockResult { ok: false, .. }
+        ));
+
+        // Yönetici Bob'u çıkarınca Bob'un eşitlemesi durur.
+        alice.share_edit(&s.id, None, &[], &[bob.identity.fingerprint.clone()]).unwrap();
+        share_ticks(&all, || bob.share_list().first().map_or(false, |x| x.left)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_folder_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        introduce_all(&[&alice, &bob]);
+        let all = [&alice, &bob];
+        let s = alice.share_create("Silinecek", &[bob.identity.fingerprint.clone()], None).unwrap();
+        write_old(&share_dir(&alice, &s.id).join("a.txt"), b"x");
+        share_ticks(&all, || bob.share_list().len() == 1).await;
+        share_ticks(&all, || share_dir(&bob, &s.id).join("a.txt").exists()).await;
+        let alice_dir = share_dir(&alice, &s.id);
+        let bob_dir = share_dir(&bob, &s.id);
+
+        // Sahip siler (dosyalarıyla): listesinden hemen kalkar, Bob'da klasör kapanır.
+        alice.share_delete(&s.id, true).unwrap();
+        assert!(alice.share_list().is_empty());
+        assert!(!alice_dir.exists(), "yerel kopya silinmeli");
+        share_ticks(&all, || bob.share_list().first().map_or(false, |x| x.deleted && x.left)).await;
+        share_ticks(&all, || alice.shares.lock().unwrap().is_empty()).await;
+
+        // Bob da listesinden kaldırır ama dosyalarını tutar.
+        bob.share_delete(&s.id, false).unwrap();
+        assert!(bob.share_list().is_empty());
+        assert!(bob_dir.join("a.txt").exists());
+    }
+
+    // ───────────── Oylama testleri ─────────────
+
+    fn poll_of(node: &Node, id: &str) -> Option<poll::PollView> {
+        node.poll_list().into_iter().find(|p| p.poll.id == id)
+    }
+
+    async fn poll_ticks(nodes: &[&Arc<Node>], mut cond: impl FnMut() -> bool) {
+        for _ in 0..100 {
+            if cond() {
+                return;
+            }
+            for n in nodes {
+                n.flush_polls();
+            }
+            sleep(Duration::from_millis(60)).await;
+        }
+        panic!("oylama zamanında eşitlenmedi");
+    }
+
+    #[tokio::test]
+    async fn poll_vote_tally_and_close() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        let carol = make_node(tmp.path(), "carol").await;
+        let mallory = make_node(tmp.path(), "mallory").await;
+        introduce_all(&[&alice, &bob, &carol, &mallory]);
+        let all = [&alice, &bob, &carol];
+
+        assert!(alice.poll_create("Öğle yemeği?", &["Pizza".into()], &[bob.identity.fingerprint.clone()], true, false).is_err());
+        let p = alice
+            .poll_create(
+                "Öğle yemeği?",
+                &["Pizza".into(), "Döner".into(), " ".into()],
+                &[bob.identity.fingerprint.clone(), carol.identity.fingerprint.clone()],
+                true,
+                false,
+            )
+            .unwrap();
+        assert_eq!(p.poll.options, vec!["Pizza", "Döner"]);
+        let id = p.poll.id.clone();
+        poll_ticks(&all, || poll_of(&bob, &id).is_some() && poll_of(&carol, &id).is_some()).await;
+        assert!(poll_of(&bob, &id).unwrap().can_vote);
+        assert!(poll_of(&mallory, &id).is_none(), "katılımcı olmayan oylamayı görmez");
+
+        alice.poll_vote(&id, 0).unwrap();
+        bob.poll_vote(&id, 0).unwrap();
+        carol.poll_vote(&id, 1).unwrap();
+        poll_ticks(&all, || poll_of(&carol, &id).map_or(false, |v| v.poll.counts == vec![2, 1])).await;
+        let bv = poll_of(&bob, &id).unwrap();
+        poll_ticks(&all, || poll_of(&bob, &id).map_or(false, |v| v.poll.voted.len() == 3 && !v.vote_pending)).await;
+        assert_eq!(bv.my_vote, Some(0));
+        // İsimli oylama: kim neye oy verdi görünür.
+        assert!(poll_of(&carol, &id).unwrap().poll.ballots.iter().any(|b| b.fingerprint == bob.identity.fingerprint && b.option == 0));
+
+        // Oy değiştirme: Bob Döner'e geçer.
+        bob.poll_vote(&id, 1).unwrap();
+        poll_ticks(&all, || {
+            poll_of(&alice, &id).map_or(false, |v| v.poll.counts == vec![1, 2])
+                && poll_of(&carol, &id).map_or(false, |v| v.poll.counts == vec![1, 2])
+        })
+        .await;
+
+        // Güvenlik: katılımcı olmayan oy veremez, sahip olmayan sonuç gönderemez.
+        assert!(matches!(alice.accept_poll_vote(&mallory.identity.fingerprint, &id, 0), Message::ChatReject { .. }));
+        assert!(matches!(alice.accept_poll_vote(&bob.identity.fingerprint, &id, 9), Message::ChatReject { .. }));
+        let mut forged = poll_of(&carol, &id).unwrap().poll;
+        forged.counts = vec![99, 0];
+        forged.rev += 10;
+        assert!(matches!(carol.accept_poll_update(&bob.identity.fingerprint, forged, "bob"), Message::ChatReject { .. }));
+        assert_eq!(poll_of(&carol, &id).unwrap().poll.counts, vec![1, 2]);
+
+        // Sahip bitirir: herkes kapandığını ve sonucu görür, artık oy verilemez.
+        alice.poll_close(&id).unwrap();
+        poll_ticks(&all, || poll_of(&bob, &id).map_or(false, |v| v.poll.closed) && poll_of(&carol, &id).map_or(false, |v| v.poll.closed)).await;
+        assert!(bob.poll_vote(&id, 0).is_err());
+        assert!(matches!(alice.accept_poll_vote(&bob.identity.fingerprint, &id, 0), Message::ChatReject { .. }));
+        assert_eq!(poll_of(&bob, &id).unwrap().poll.counts, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn anonymous_poll_hides_ballots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        introduce_all(&[&alice, &bob]);
+        let all = [&alice, &bob];
+        let id = alice
+            .poll_create("Gizli oy", &["Evet".into(), "Hayır".into()], &[bob.identity.fingerprint.clone()], false, true)
+            .unwrap()
+            .poll
+            .id;
+        poll_ticks(&all, || poll_of(&bob, &id).is_some()).await;
+        assert!(alice.poll_vote(&id, 0).is_err(), "kendini eklemeyen sahip oy kullanmaz");
+        bob.poll_vote(&id, 1).unwrap();
+        poll_ticks(&all, || poll_of(&bob, &id).map_or(false, |v| v.poll.counts == vec![0, 1])).await;
+        assert!(poll_of(&bob, &id).unwrap().poll.ballots.is_empty());
+        assert!(poll_of(&alice, &id).unwrap().poll.ballots.is_empty());
+
+        // Listeden kaldırma: açık oylamayı kaldıran sahip onu önce bitirir.
+        alice.poll_remove(&id).unwrap();
+        assert!(poll_of(&alice, &id).is_none());
+        poll_ticks(&all, || poll_of(&bob, &id).map_or(false, |v| v.poll.closed)).await;
+    }
+
+    struct ShareInfoForTest;
+    impl ShareInfoForTest {
+        fn from(node: &Node, id: &str) -> share::ShareInfo {
+            let s = node.share_list().into_iter().find(|s| s.id == id).unwrap();
+            share::ShareInfo {
+                id: s.id,
+                name: s.name,
+                admin: s.admin,
+                members: s.members,
+                rev: 1,
+                deleted: false,
+                protected: s.protected,
+                unlocked: vec![],
+            }
+        }
     }
 
     #[tokio::test]

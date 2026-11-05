@@ -19,7 +19,19 @@ Aynı ağa (Wi-Fi veya ethernet) bağlı bilgisayarlar birbirini otomatik bulur.
 - **Toplu gönderme.** "Toplu gönder" ile aynı dosya ve klasörler birden fazla kişiye tek seferde gönderilir. Dosyaları kartların dışındaki boş alana bırakmak da bu pencereyi açar. Her alıcı ayrıca onaylar.
 - **Mesajlaşma.** Cihaz kartındaki mesaj butonuyla sohbet açılır. Okunmamış mesajlar rozetle gösterilir. Pencere arkadayken Windows bildirimi gelir ve görev çubuğu yanıp söner.
 - **Grup mesajlaşma.** Mesajlar sekmesinde "Yeni grup" ile grup kurulur. Mesajlar her üyeye şifreli olarak ayrı ayrı gider. **Çevrimdışı üyeler geri geldiklerinde bekleyen mesajları otomatik alır** (en fazla 3 gün). Mesajın kaç kişiye ulaştığı görünür (ör. 2/3). Grubu yalnızca oluşturan kişi (yönetici) yeniden adlandırabilir, üye ekleyip çıkarabilir veya silebilir; yönetici sertifika parmak iziyle tanındığı için bu yetki taklit edilemez. Üyeler istedikleri zaman ayrılabilir.
+- **Ortak klasörler.** "Klasörler" sekmesinden bir klasör oluşturup kişi eklenir. Klasöre eklenen, düzenlenen veya silinen dosyalar her üyenin bilgisayarındaki kopyaya (`İndirilenler\FastFiles\Ortak\<ad>`) otomatik yansır. Klasörün sahibi isteğe bağlı şifre koyabilir. Ayrıntılar aşağıda.
+- **Oylama.** "Oylama" sekmesinden soru ve seçenekler (2–10) yazılır, oy verecek kişiler seçilir. Seçilenlere bildirim gider. Sonuçlar tüm katılımcılarda canlı güncellenir. Oy, oylama kapanana kadar değiştirilebilir. İsteğe bağlı **gizli oylama** seçilirse kimin neye oy verdiği kimseye gönderilmez, yalnızca sayılar görünür. Oyları yalnızca oylamayı açan kişi toplar ve bitirir. Oylama bilgisi yalnızca açan kişiden kabul edilir (sertifika parmak iziyle doğrulanır). Oy yalnızca katılımcılardan, açık oylamaya ve geçerli bir seçeneğe kabul edilir.
+- **Profil resmi.** Ayarlar'da 20 hazır avatardan biri seçilir (`ui/avatars/`) ya da kendi resminiz yüklenir. Resim kare kırpılıp küçültülür ve diğer cihazlarda kartlarda, sohbetlerde ve üye listelerinde görünür.
 - **Engelleme.** Engellenen cihazdan gelen mesaj ve dosyalar otomatik reddedilir.
+
+### Ortak klasörler nasıl çalışır?
+
+- **Eşitleme:** FastFiles her üyenin yerel kopyasını birkaç saniyede bir tarar ve değişiklikleri çevrimiçi üyelere şifreli bağlantıyla iletir. Kapalı olan bilgisayar açılınca eksiklerini tamamlar. Klasörü Gezgin'de doğrudan kullanabilirsiniz; dosya kopyalamak, düzenlemek veya silmek yeterlidir.
+- **Çakışma:** Aynı dosya iki yerde değişirse en son değişiklik geçerli olur. Üzerine yazılan veya silinen her dosyanın eski hâli `.fastfiles\silinen` klasörüne taşınır; hiçbir şey kalıcı olarak kaybolmaz.
+- **Üyelik:** Klasörü yalnızca oluşturan kişi (sahip) yönetebilir: üye ekleme/çıkarma, ad değiştirme, şifre. Sahip, sertifika parmak iziyle tanınır, taklit edilemez. Eklenmeyen kişiler klasörü göremez ve hiçbir dosya isteyemez. Çıkarılan üyenin eşitlemesi durur; o ana kadar aldığı dosyalar onun bilgisayarında kalır.
+- **Şifre:** Sahip isterse şifre koyar. Üyeler şifreyi **bir kez** girer. Şifreyi girmemiş üyeye dosya gönderilmez ve o üye dosya listesini de alamaz. Şifre yalnızca sahibin bilgisayarında PBKDF2-HMAC-SHA256 özeti olarak (100.000 tur, rastgele tuz) saklanır ve ağda yalnızca TLS içinde gider. Tahmin denemelerine karşı cihaz başına 5 dakikada en fazla 5 deneme hakkı vardır.
+- **Silme:** Klasör ekranındaki çöp kutusu simgesiyle yapılır. Sahip silerse klasör tüm üyeler için kapanır; çevrimdışı olanlara açıldıklarında bildirilir. Üye silerse klasörden ayrılır. İsteğe bağlı olarak bu bilgisayardaki dosyalar da silinir; diğer üyelerin kopyalarına dokunulmaz.
+- **Güvenlik:** Ağdan gelen dosya yolları temizlenir (`..` gibi klasör dışına çıkan yollar reddedilir). Kısayol/sembolik bağlantılar izlenmez ve paylaşılmaz.
 - **Windows bildirimleri.** Pencere arkadayken veya tepsideyken bildirim gelir:
   - güvenilir cihazdan dosya gelmeye başladığında,
   - dosya alımı bittiğinde ya da başarısız olduğunda,
@@ -37,7 +49,7 @@ Aynı ağa (Wi-Fi veya ethernet) bağlı bilgisayarlar birbirini otomatik bulur.
    .\release.ps1
    ```
 
-2. `release\FastFiles-<sürüm>.ffupdate` dosyasını **kendi FastFiles penceresine sürükleyin** (ya da Ayarlar → "Güncelleme paketi yükle").
+2. Başka bir şey yapmanız gerekmez. Betik paketi bu bilgisayardaki FastFiles'ın gelen kutusuna (`%APPDATA%\io.twinup.fastfiles\updates\inbox`) koyar. FastFiles imzayı doğrulayıp paketi içe alır, önce kendini günceller, sonra paketi ağa dağıtır. (Paketi elle vermek isterseniz `.ffupdate` dosyasını FastFiles penceresine sürükleyin ya da Ayarlar → "Güncelleme paketi yükle".)
 3. Her FastFiles birkaç saniyede bir yaptığı duyuruda sürümünü ve elindeki paketi bildirir. Daha eski sürümdeki cihazlar paketi indirir, doğrular ve kendileri de dağıtmaya başlar.
 4. Paket hazır olduktan yaklaşık 1 dakika sonra, **süren aktarım veya bekleyen istek yoksa** sessizce kurulur. Uygulama birkaç saniyeliğine kapanıp yeniden açılır (tepsideyse tepsiye geri döner). Kullanıcı üstteki çubuktan "Şimdi güncelle" veya "Sonra" (2 saat erteleme) diyebilir.
 
@@ -154,5 +166,5 @@ py -m http.server 5178 --directory ui
 |---|---|
 | Diğer bilgisayarlar görünmüyor | İkisinde de FastFiles açık mı? Güvenlik Duvarı'nda FastFiles'a "Özel ağ" izni verildi mi? Ağ profili "Ortak" değil "Özel" olmalı. |
 | Wi-Fi'daki bilgisayar ethernet'tekileri görmüyor | Modemde "AP/Client isolation" kapalı olmalı. Farklı alt ağlardaysanız (ör. 192.168.1.x ve 192.168.2.x) **IP ile ekle** kullanın. |
-| Aktarım yavaş | Wi-Fi hızı ortamdan etkilenir. İki taraf da ethernet'teyse gigabit hız beklenir. |
+| Aktarım yavaş | Büyük dosyalarda hız ağla sınırlıdır: gigabit ethernet'te ~110 MB/sn, Wi-Fi'da çok daha az. Binlerce küçük dosyada sınır diskteki dosya oluşturma hızıdır (Windows + Defender, NVMe'de saniyede ~1000 dosya). FastFiles ağ ve diski paralel kullanır. Ölçmek için: `cargo test --release --lib bench -- --ignored --nocapture` |
 | Güvenlik Duvarı izni yanlışlıkla reddedildi | Windows Güvenlik → Güvenlik duvarı → "Uygulamaya izin ver" menüsünden FastFiles için "Özel"i işaretleyin. |

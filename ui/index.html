@@ -15,6 +15,7 @@
       <span>FastFiles</span>
     </div>
     <div class="me" id="me" title="Bu bilgisayar">
+      <span class="avatar xs" id="me-avatar" aria-hidden="true"></span>
       <span class="pulse" aria-hidden="true"></span>
       <span class="me-name" id="me-name">…</span>
       <span class="me-ip" id="me-ip"></span>
@@ -69,11 +70,13 @@
         <div class="tabs" role="tablist">
           <button class="tab active" data-tab="transfers" role="tab">Aktarımlar</button>
           <button class="tab" data-tab="chats" role="tab">Mesajlar <span class="tab-badge" id="chat-badge" hidden>0</span></button>
+          <button class="tab" data-tab="shares" role="tab">Klasörler</button>
+          <button class="tab" data-tab="polls" role="tab">Oylama <span class="tab-badge" id="poll-badge" hidden>0</span></button>
         </div>
-        <button class="btn ghost small" id="btn-clear" hidden>Temizle</button>
       </div>
 
       <div class="tab-body" id="tab-transfers">
+        <div class="convs-head"><button class="btn ghost small" id="btn-clear" hidden>Bitenleri temizle</button></div>
         <div class="transfers" id="transfers"></div>
         <div class="empty small-empty" id="transfers-empty">
           <svg viewBox="0 0 24 24" class="empty-icon"><path d="M7 7h11l-3-3M17 17H6l3 3"/></svg>
@@ -93,6 +96,100 @@
           <svg viewBox="0 0 24 24" class="empty-icon"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg>
           <h3>Henüz mesaj yok</h3>
           <p>Bir cihazın kartındaki mesaj butonuyla sohbet başlatın. Mesajlar şifreli olarak doğrudan karşı bilgisayara gider.</p>
+        </div>
+      </div>
+
+      <div class="tab-body" id="tab-shares" hidden>
+        <div class="convs-head">
+          <button class="btn soft small" id="btn-new-share">
+            <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 10v6M9 13h6"/></svg>Yeni ortak klasör
+          </button>
+        </div>
+        <div class="convs" id="shares"></div>
+        <div class="empty small-empty" id="shares-empty">
+          <svg viewBox="0 0 24 24" class="empty-icon"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+          <h3>Henüz ortak klasör yok</h3>
+          <p>Ortak klasöre eklenen dosyalar, eklediğiniz kişilerin bilgisayarına otomatik olarak kopyalanır. İsterseniz şifre koyabilirsiniz.</p>
+        </div>
+      </div>
+
+      <div class="tab-body" id="tab-polls" hidden>
+        <div class="convs-head">
+          <button class="btn soft small" id="btn-new-poll">
+            <svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>Yeni oylama
+          </button>
+        </div>
+        <div class="convs" id="polls"></div>
+        <div class="empty small-empty" id="polls-empty">
+          <svg viewBox="0 0 24 24" class="empty-icon"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>
+          <h3>Henüz oylama yok</h3>
+          <p>Bir soru sorun, seçenekleri yazın, oy vermesini istediğiniz kişileri ekleyin. Onlara bildirim gider, sonucu herkes görür.</p>
+        </div>
+      </div>
+
+      <!-- Açık oylama -->
+      <div class="chat-view" id="poll-view" hidden>
+        <div class="chat-head">
+          <button class="icon-btn sm" id="poll-back" title="Geri"><svg viewBox="0 0 24 24"><path d="M15 18 9 12l6-6"/></svg></button>
+          <div class="avatar sm folder" id="poll-icon"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg></div>
+          <div class="chat-who">
+            <div class="chat-name">Oylama</div>
+            <div class="chat-status" id="poll-status"></div>
+          </div>
+          <button class="icon-btn sm" id="poll-remove" title="Listeden kaldır">
+            <svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>
+          </button>
+        </div>
+        <div class="poll-body">
+          <h3 class="poll-question" id="poll-question"></h3>
+          <div class="poll-meta" id="poll-meta"></div>
+          <div class="poll-options" id="poll-options"></div>
+          <div class="poll-voters" id="poll-voters"></div>
+        </div>
+        <div class="poll-foot" id="poll-foot"></div>
+      </div>
+
+      <!-- Açık ortak klasör -->
+      <div class="chat-view" id="share-view" hidden>
+        <div class="chat-head">
+          <button class="icon-btn sm" id="share-back" title="Geri"><svg viewBox="0 0 24 24"><path d="M15 18 9 12l6-6"/></svg></button>
+          <div class="avatar sm folder" id="share-icon"></div>
+          <div class="chat-who">
+            <div class="chat-name" id="share-name"></div>
+            <div class="chat-status" id="share-status"></div>
+          </div>
+          <button class="icon-btn sm" id="share-members" title="Üyeler ve ayarlar">
+            <svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3 19c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5"/><path d="M16 4.8a3.2 3.2 0 0 1 0 6.4M18 13.8c2 .7 3 2.5 3 5.2"/></svg>
+          </button>
+          <button class="icon-btn sm" id="share-open" title="Klasörü Gezgin'de aç">
+            <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v1"/><path d="M3 7v10a2 2 0 0 0 2 2h12l4-8H7l-4 8"/></svg>
+          </button>
+          <button class="icon-btn sm" id="share-leave" title="Klasörü sil">
+            <svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>
+          </button>
+        </div>
+        <div class="share-locked" id="share-locked" hidden>
+          <svg viewBox="0 0 24 24" class="empty-icon"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+          <h3>Bu klasör şifreli</h3>
+          <p>Dosyaları görmek için klasörü oluşturan kişinin verdiği şifreyi girin. Şifre yalnızca bir kez sorulur.</p>
+          <div class="row">
+            <input class="input" type="password" id="share-pass" placeholder="Şifre" autocomplete="off" />
+            <button class="btn" id="share-unlock">Kilidi aç</button>
+          </div>
+          <div class="err" id="share-err"></div>
+        </div>
+        <div class="share-body" id="share-body">
+          <div class="share-tools">
+            <input class="input" id="share-search" placeholder="Dosya ara…" spellcheck="false" />
+            <button class="btn soft small" id="share-add-files" title="Dosya ekle">
+              <svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 11v6M9 14h6"/></svg>Ekle
+            </button>
+            <button class="btn ghost small" id="share-add-folder" title="Klasör ekle">
+              <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 10v6M9 13h6"/></svg>
+            </button>
+          </div>
+          <div class="share-files" id="share-files"></div>
+          <div class="composer-note" id="share-note">Dosyaları buraya sürükleyip bırakabilir veya Gezgin'de klasöre kopyalayabilirsiniz.</div>
         </div>
       </div>
 
@@ -135,6 +232,7 @@
   <div class="modal-root" id="modal-root"></div>
   <div class="toasts" id="toasts" aria-live="polite"></div>
 
+  <script src="avatars/presets.js"></script>
   <script type="module" src="main.js"></script>
 </body>
 </html>

@@ -30,6 +30,9 @@ struct Snapshot {
     transfers: Vec<Transfer>,
     conversations: Vec<ConversationSummary>,
     update: UpdateState,
+    avatars: std::collections::HashMap<String, String>,
+    shares: Vec<ShareSummary>,
+    polls: Vec<PollView>,
 }
 
 #[tauri::command]
@@ -42,6 +45,9 @@ fn get_snapshot(node: NodeState) -> Snapshot {
         transfers: node.transfers(),
         conversations: node.chat_summaries(),
         update: update_state_of(&node),
+        avatars: node.avatars(),
+        shares: node.share_list(),
+        polls: node.poll_list(),
     }
 }
 
@@ -110,6 +116,106 @@ fn chat_mark_read(node: NodeState, fingerprint: String) {
 #[tauri::command]
 fn chat_clear(node: NodeState, fingerprint: String) {
     node.chat_clear(&fingerprint);
+}
+
+// ───────────── Ortak klasörler ─────────────
+
+use node::share::{ShareFileView, ShareSummary};
+
+#[tauri::command]
+fn share_list(node: NodeState) -> Vec<ShareSummary> {
+    node.share_list()
+}
+
+#[tauri::command]
+fn share_files(node: NodeState, id: String) -> Result<Vec<ShareFileView>, String> {
+    node.share_files(&id)
+}
+
+#[tauri::command]
+async fn share_create(node: NodeState<'_>, name: String, members: Vec<String>, password: Option<String>) -> Result<ShareSummary, String> {
+    node.inner().share_create(&name, &members, password)
+}
+
+#[tauri::command]
+async fn share_edit(node: NodeState<'_>, id: String, name: Option<String>, add: Vec<String>, remove: Vec<String>) -> Result<ShareSummary, String> {
+    node.share_edit(&id, name, &add, &remove)
+}
+
+#[tauri::command]
+async fn share_set_password(node: NodeState<'_>, id: String, password: Option<String>) -> Result<ShareSummary, String> {
+    node.share_set_password(&id, password)
+}
+
+#[tauri::command]
+async fn share_unlock(node: NodeState<'_>, id: String, password: String) -> Result<(), String> {
+    node.inner().share_unlock(&id, &password).await
+}
+
+#[tauri::command]
+async fn share_leave(node: NodeState<'_>, id: String) -> Result<(), String> {
+    node.share_leave(&id)
+}
+
+#[tauri::command]
+async fn share_delete(node: NodeState<'_>, id: String, delete_files: bool) -> Result<(), String> {
+    node.share_delete(&id, delete_files)
+}
+
+// ───────────── Oylamalar ─────────────
+
+use node::poll::PollView;
+
+#[tauri::command]
+fn poll_list(node: NodeState) -> Vec<PollView> {
+    node.poll_list()
+}
+
+#[tauri::command]
+async fn poll_create(
+    node: NodeState<'_>,
+    question: String,
+    options: Vec<String>,
+    voters: Vec<String>,
+    include_me: bool,
+    anonymous: bool,
+) -> Result<PollView, String> {
+    node.poll_create(&question, &options, &voters, include_me, anonymous)
+}
+
+#[tauri::command]
+async fn poll_vote(node: NodeState<'_>, id: String, option: u32) -> Result<(), String> {
+    node.poll_vote(&id, option)
+}
+
+#[tauri::command]
+async fn poll_close(node: NodeState<'_>, id: String) -> Result<(), String> {
+    node.poll_close(&id)
+}
+
+#[tauri::command]
+async fn poll_remove(node: NodeState<'_>, id: String) -> Result<(), String> {
+    node.poll_remove(&id)
+}
+
+#[tauri::command]
+fn poll_mark_seen(node: NodeState, id: String) {
+    node.poll_mark_seen(&id);
+}
+
+#[tauri::command]
+async fn share_add_files(node: NodeState<'_>, id: String, paths: Vec<String>) -> Result<usize, String> {
+    node.inner().share_add_files(&id, paths).await
+}
+
+#[tauri::command]
+fn set_avatar(node: NodeState, data_url: String) -> Result<(), String> {
+    node.set_avatar(&data_url)
+}
+
+#[tauri::command]
+fn remove_avatar(node: NodeState) {
+    node.remove_avatar();
 }
 
 // Grup komutları async: giden kutusu tokio görevleri başlatır.
@@ -462,7 +568,11 @@ pub fn run() {
                             &emit_handle,
                             payload["title"].as_str().unwrap_or("FastFiles"),
                             payload["body"].as_str().unwrap_or(""),
-                            serde_json::json!({ "view": "transfers", "transferId": payload["transferId"] }),
+                            if payload["target"].is_object() {
+                                payload["target"].clone()
+                            } else {
+                                serde_json::json!({ "view": "transfers", "transferId": payload["transferId"] })
+                            },
                         );
                     }
                     _ => {}
@@ -474,6 +584,7 @@ pub fn run() {
             tauri::async_runtime::block_on(node.start_server(DEFAULT_PORT))?;
             tauri::async_runtime::spawn(discovery::run(node.clone()));
             tauri::async_runtime::spawn(node.clone().run_manual_pinger());
+            tauri::async_runtime::spawn(node.clone().run_share_loop());
             app.manage(UpdateGate::default());
             spawn_auto_updater(handle.clone(), node.clone());
 
@@ -558,6 +669,23 @@ pub fn run() {
             group_edit,
             group_leave,
             group_send,
+            set_avatar,
+            share_list,
+            share_files,
+            share_create,
+            share_edit,
+            share_set_password,
+            share_unlock,
+            share_leave,
+            share_delete,
+            poll_list,
+            poll_create,
+            poll_vote,
+            poll_close,
+            poll_remove,
+            poll_mark_seen,
+            share_add_files,
+            remove_avatar,
             update_state,
             import_update,
             install_update,

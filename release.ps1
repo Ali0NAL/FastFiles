@@ -50,6 +50,18 @@ finally {
     Pop-Location
 }
 
+# Paketi bu bilgisayardaki FastFiles'ın gelen kutusuna koy: uygulama imzayı doğrulayıp içe alır,
+# kendini günceller ve paketi ağdaki herkese dağıtır. Elle sürüklemeye gerek kalmaz.
+$appData = Join-Path $env:APPDATA "io.twinup.fastfiles"
+if (Test-Path $appData) {
+    $inbox = Join-Path $appData "updates\inbox"
+    New-Item -ItemType Directory -Force $inbox | Out-Null
+    Copy-Item $pkg $inbox -Force
+    Write-Host ""
+    Write-Host "Paket FastFiles'a verildi; birkaç saniye içinde ağa dağıtılmaya başlar." -ForegroundColor Green
+    Write-Host "(FastFiles 1.3.1 ve sonrası gelen kutusunu okur.)"
+}
+
 Write-Host ""
 Write-Host "Hazır:" -ForegroundColor Green
 Write-Host "  Elle kurulum      : release\FastFiles_${version}_x64-setup.exe"

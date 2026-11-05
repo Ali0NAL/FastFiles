@@ -22,6 +22,12 @@ const state = {
   history: new Map(),    // parmak izi → mesaj dizisi (açılınca yüklenir)
   openChat: null,        // açık sohbetin parmak izi
   tab: 'transfers',
+  avatars: new Map(),    // parmak izi → data URL
+  shares: [],            // ortak klasör özetleri
+  openShare: null,       // açık ortak klasör kimliği
+  shareFiles: [],
+  polls: [],             // oylamalar
+  openPoll: null,        // açık oylama kimliği
 };
 
 // ───────────────────────────── Yardımcılar ─────────────────────────────
@@ -56,6 +62,11 @@ function hue(id) {
   return (h >>> 0) % 360;
 }
 const grad = (id) => { const h = hue(id); return `linear-gradient(135deg, hsl(${h} 72% 62%), hsl(${(h + 35) % 360} 70% 50%))`; };
+/** Profil resmi varsa resim, yoksa baş harfler (avatar kutusunun içi). */
+const face = (fp, name) => {
+  const url = state.avatars.get(fp);
+  return url ? `<img src="${esc(url)}" alt="" draggable="false">` : esc(initials(name));
+};
 const fpShort = (fp) => (fp || '').slice(0, 16).toUpperCase().match(/.{4}/g)?.join(' ') ?? '';
 
 const ic = {
@@ -132,6 +143,8 @@ document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   if (modalKind && modalKind !== 'incoming' && modalKind !== 'welcome') closeModal();
   else if (!modalKind && chatOpen()) closeChat();
+  else if (!modalKind && shareOpen()) closeShare();
+  else if (!modalKind && pollOpen()) closePoll();
 });
 
 // ───────────────────────────── Üst çubuk ─────────────────────────────
@@ -143,6 +156,10 @@ function renderMe() {
   $('#me-ip').textContent = ip;
   $('#empty-ip').textContent = ip || '—';
   $('#me').title = `Bu bilgisayar · ${state.ips.join(', ')} · port ${state.device?.port ?? ''}`;
+  const av = $('#me-avatar');
+  const fp = state.device?.fingerprint;
+  av.style.background = grad(fp);
+  av.innerHTML = face(fp, state.settings.deviceName);
 }
 
 // ───────────────────────────── Cihazlar ─────────────────────────────
@@ -168,7 +185,7 @@ function renderPeers() {
       el.dataset.id = p.id;
       setTimeout(() => el.classList.remove('enter'), 400);
     }
-    const sig = JSON.stringify([p.name, p.ip, p.os, p.version, p.trusted, p.blocked, p.manualAddr, unreadOf(p.fingerprint)]);
+    const sig = JSON.stringify([p.name, p.ip, p.os, p.version, p.trusted, p.blocked, p.manualAddr, unreadOf(p.fingerprint), state.avatars.get(p.fingerprint)?.length || 0]);
     if (el.dataset.sig !== sig) {
       el.dataset.sig = sig;
       el.innerHTML = peerInner(p);
@@ -185,7 +202,7 @@ function peerInner(p) {
           title="${p.trusted ? 'Güveni kaldır (her gönderimde sorulsun)' : 'Güvenilir yap (gönderdikleri sormadan kabul edilsin)'}">${ic.shield}</button>
         ${p.manualAddr ? `<button class="icon-btn sm" data-act="forget" title="Listeden kaldır">${ic.trash}</button>` : ''}
       </div>
-      <div class="avatar" style="background:${grad(p.fingerprint)}">${esc(initials(p.name))}<span class="os">${osIcon(p.os)}</span></div>
+      <div class="avatar" style="background:${grad(p.fingerprint)}">${face(p.fingerprint, p.name)}<span class="os">${osIcon(p.os)}</span></div>
       <div class="name" title="${esc(p.name)}">${esc(p.name)}</div>
       <div class="addr">${esc(p.ip)}${p.version ? ` · v${esc(p.version)}` : ''}</div>
       <div class="badges">
@@ -276,7 +293,7 @@ function showBatch(initialPaths = [], preselected = []) {
       ? peers.map((p) => `
         <label class="recip ${selected.has(p.id) ? 'on' : ''}" data-id="${esc(p.id)}">
           <input type="checkbox" ${selected.has(p.id) ? 'checked' : ''} />
-          <span class="avatar" style="background:${grad(p.fingerprint)}">${esc(initials(p.name))}</span>
+          <span class="avatar" style="background:${grad(p.fingerprint)}">${face(p.fingerprint, p.name)}</span>
           <span class="r-name">${esc(p.name)}</span><span class="muted small">${esc(p.ip)}</span>
         </label>`).join('')
       : '<span class="muted small">Ağda gönderilebilecek cihaz yok</span>';
@@ -534,7 +551,7 @@ function showNextIncoming() {
   const more = req.fileCount - req.files.length;
   const m = openModal('incoming', `
     <div class="incoming-head">
-      <div class="avatar" style="background:${grad(d.fingerprint)}">${esc(initials(d.name))}</div>
+      <div class="avatar" style="background:${grad(d.fingerprint)}">${face(d.fingerprint, d.name)}</div>
       <div>
         <h3>${esc(d.name)}</h3>
         <div class="muted small">${esc(req.ip)} · Kimlik <span class="fp">${esc(fpShort(d.fingerprint))}</span></div>
@@ -570,6 +587,23 @@ function showSettings() {
   const m = openModal('settings', `
     <h3>Ayarlar</h3>
     <p class="lead">Bu bilgisayarın ağda nasıl görüneceği ve gelen dosyaların nereye kaydedileceği.</p>
+    <div class="field">
+      <label>Profil resmi</label>
+      <div class="avatar-edit">
+        <div class="avatar" id="s-avatar" style="background:${grad(state.device?.fingerprint)}">${face(state.device?.fingerprint, s.deviceName)}</div>
+        <div class="row">
+          <button class="btn ghost small" id="s-avatar-pick">Kendi resmini seç</button>
+          <button class="btn ghost small" id="s-avatar-remove" ${state.avatars.has(state.device?.fingerprint) ? '' : 'hidden'}>Kaldır</button>
+        </div>
+        <input type="file" id="s-avatar-file" accept="image/*" hidden />
+      </div>
+      ${(window.FF_PRESET_AVATARS || []).length ? `
+      <div class="preset-grid" id="s-presets">
+        ${window.FF_PRESET_AVATARS.map((p) => `
+          <button class="preset" data-file="${esc(p.file)}" title="${esc(p.title)}"><img src="avatars/${esc(p.file)}" alt="${esc(p.title)}" loading="lazy" draggable="false"></button>`).join('')}
+      </div>` : ''}
+      <span class="help">Hazır avatarlardan birine tıklayın ya da kendi resminizi seçin. Diğerleri sizi bu resimle görür.</span>
+    </div>
     <div class="field">
       <label for="s-name">Cihaz adı</label>
       <input class="input" id="s-name" maxlength="40" value="${esc(s.deviceName)}" autofocus />
@@ -637,6 +671,37 @@ function showSettings() {
     state.settings = await call('set_trusted', { fingerprint: b.dataset.fp, name: b.dataset.name, trusted: false });
     b.closest('.t').remove();
   }));
+  const fileInput = m.querySelector('#s-avatar-file');
+  const applyAvatar = async (makeUrl) => {
+    try {
+      const url = await makeUrl();
+      await call('set_avatar', { dataUrl: url });
+      state.avatars.set(state.device.fingerprint, url);
+      m.querySelector('#s-avatar').innerHTML = face(state.device.fingerprint, state.settings.deviceName);
+      m.querySelector('#s-avatar-remove').hidden = false;
+      renderMe();
+      toast('Profil resmi güncellendi', { type: 'success' });
+    } catch (e) {
+      toast(String(e?.message || e), { type: 'error' });
+    }
+  };
+  m.querySelector('#s-avatar-pick').onclick = () => fileInput.click();
+  fileInput.onchange = () => {
+    const file = fileInput.files?.[0];
+    fileInput.value = '';
+    if (file) applyAvatar(() => squareImage(file, 192));
+  };
+  m.querySelector('#s-presets')?.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-file]');
+    if (b) applyAvatar(() => presetToDataUrl(b.dataset.file, 160));
+  });
+  m.querySelector('#s-avatar-remove').onclick = async () => {
+    await call('remove_avatar');
+    state.avatars.delete(state.device.fingerprint);
+    m.querySelector('#s-avatar').innerHTML = face(state.device.fingerprint, state.settings.deviceName);
+    m.querySelector('#s-avatar-remove').hidden = true;
+    renderMe();
+  };
   m.querySelector('#s-import').onclick = async () => {
     const file = await api.pick({ multiple: false, directory: false, title: 'FastFiles güncelleme paketi', filters: [{ name: 'FastFiles güncellemesi', extensions: ['ffupdate'] }] });
     if (!file) return;
@@ -707,6 +772,8 @@ function setTab(tab) {
   document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
   $('#tab-transfers').hidden = tab !== 'transfers';
   $('#tab-chats').hidden = tab !== 'chats';
+  $('#tab-shares').hidden = tab !== 'shares';
+  $('#tab-polls').hidden = tab !== 'polls';
   updateTransfersChrome();
 }
 document.querySelectorAll('.tab').forEach((b) => (b.onclick = () => setTab(b.dataset.tab)));
@@ -739,7 +806,7 @@ function renderConvs() {
     const last = `${who}${lastText}`;
     const avatar = g
       ? `<div class="avatar group" style="background:${grad(c.fingerprint)}">${ic.users}</div>`
-      : `<div class="avatar" style="background:${grad(c.fingerprint)}">${esc(initials(c.name))}</div>`;
+      : `<div class="avatar" style="background:${grad(c.fingerprint)}">${face(c.fingerprint, c.name)}</div>`;
     const extra = g ? (c.left ? '<span class="c-count">· ayrıldınız</span>' : `<span class="c-count">· ${g.members.length} kişi</span>`) : '';
     return `
       <div class="conv ${c.unread ? 'unread' : ''} ${c.left ? 'left' : ''}" data-fp="${esc(c.fingerprint)}">
@@ -764,6 +831,11 @@ async function openChat(fp, name) {
     state.chats.set(fp, { fingerprint: fp, name: name || peerByFp(fp)?.name || 'Cihaz', unread: 0, last: null });
   }
   state.openChat = fp;
+  // Ortak klasör / oylama ekranı açıksa kapat (aynı paneli kullanırlar).
+  state.openShare = null;
+  $('#share-view').hidden = true;
+  state.openPoll = null;
+  $('#poll-view').hidden = true;
   $('#chat-view').hidden = false;
   $('#composer').value = '';
   autoGrow();
@@ -833,7 +905,7 @@ function renderChatHead() {
   const blocked = isBlocked(fp);
   const av = $('#chat-avatar');
   av.style.background = grad(fp);
-  av.textContent = initials(name);
+  av.innerHTML = face(fp, name);
   $('#chat-name').textContent = name;
   const st = $('#chat-status');
   st.className = `chat-status${peer && !blocked ? ' on' : ''}`;
@@ -1024,7 +1096,7 @@ function personRow(p, checked) {
   return `
     <label class="recip ${checked ? 'on' : ''}" data-fp="${esc(p.fingerprint)}">
       <input type="checkbox" ${checked ? 'checked' : ''} />
-      <span class="avatar" style="background:${grad(p.fingerprint)}">${esc(initials(p.name))}</span>
+      <span class="avatar" style="background:${grad(p.fingerprint)}">${face(p.fingerprint, p.name)}</span>
       <span class="r-name">${esc(p.name)}</span>
       ${p.online ? '<span class="online-dot" title="Çevrimiçi"></span>' : '<span class="off">çevrimdışı</span>'}
     </label>`;
@@ -1110,7 +1182,7 @@ function showGroupMembers() {
       const online = me || !!peerByFp(mem.fingerprint);
       return `
         <div class="member ${removing.has(mem.fingerprint) ? 'removing' : ''}">
-          <span class="avatar" style="background:${grad(mem.fingerprint)}">${esc(initials(mem.name))}</span>
+          <span class="avatar" style="background:${grad(mem.fingerprint)}">${face(mem.fingerprint, mem.name)}</span>
           <span class="m-name">${esc(mem.name)}${me ? ' <span class="muted small">(siz)</span>' : ''}
             ${mem.fingerprint === g.admin ? '<span class="badge admin">Yönetici</span>' : ''}</span>
           ${online ? '<span class="online-dot" title="Çevrimiçi"></span>' : '<span class="muted small">çevrimdışı</span>'}
@@ -1183,6 +1255,11 @@ function onNotificationClick(target = {}) {
   if (modalKind && modalKind !== 'incoming') closeModal();
   if (target.view === 'chat' && target.key) {
     openChat(target.key);
+  } else if (target.view === 'polls') {
+    if (chatOpen()) closeChat();
+    if (shareOpen()) closeShare();
+    if (target.id && state.polls.some((p) => p.id === target.id)) openPoll(target.id);
+    else setTab('polls');
   } else if (target.view === 'transfers') {
     if (chatOpen()) closeChat();
     setTab('transfers');
@@ -1259,6 +1336,659 @@ async function importUpdate(path) {
   } catch { /* toast gösterildi */ }
 }
 
+// ───────────────────────────── Profil resmi ─────────────────────────────
+
+/** Yüklenmiş resmi ortadan kare kırpar, küçültür ve JPEG data URL'sine çevirir (≤ ~90 KB). */
+function imageToSquare(img, size) {
+  const s = Math.min(img.naturalWidth, img.naturalHeight);
+  if (!s) throw new Error('Resim boş görünüyor');
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, size, size);
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, (img.naturalWidth - s) / 2, (img.naturalHeight - s) / 2, s, s, 0, 0, size, size);
+  for (const q of [0.88, 0.75, 0.6, 0.45]) {
+    const url = canvas.toDataURL('image/jpeg', q);
+    if (url.length * 0.75 < 90 * 1024) return url;
+  }
+  throw new Error('Resim küçültülemedi');
+}
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('Bu resim biçimi desteklenmiyor. JPEG, PNG, WebP, GIF veya BMP kullanın.'));
+    img.src = src;
+  });
+}
+
+/** Seçilen dosyayı profil resmine çevirir. Dosya data: URL olarak okunur
+ *  (uygulamanın güvenlik politikası blob: adreslerinden resim yüklemeye izin vermez). */
+async function squareImage(file, size) {
+  if (file.size > 25 * 1024 * 1024) throw new Error('Resim çok büyük (en fazla 25 MB)');
+  const dataUrl = await new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(new Error('Dosya okunamadı'));
+    r.readAsDataURL(file);
+  });
+  return imageToSquare(await loadImage(dataUrl), size);
+}
+
+/** Hazır avatar (uygulamayla gelen resim) → profil resmi. */
+async function presetToDataUrl(file, size) {
+  return imageToSquare(await loadImage(`avatars/${file}`), size);
+}
+
+// ───────────────────────────── Ortak klasörler ─────────────────────────────
+
+const folderIcon = '<svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+const lockIcon = '<svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>';
+const shareById = (id) => state.shares.find((s) => s.id === id);
+const shareOpen = () => !!state.openShare && !$('#share-view').hidden;
+/** Dosya bırakılınca eklenecek ortak klasör (açık ve kilidi açıksa). */
+const shareDropTarget = () => {
+  const s = shareOpen() && shareById(state.openShare);
+  return s && s.canAccess && !s.left ? s : null;
+};
+
+function shareStatus(s) {
+  if (s.deleted) return 'Klasör sahibi tarafından kapatıldı';
+  if (s.left) return 'Bu klasörden ayrıldınız';
+  if (!s.canAccess) return 'Şifreli · kilidi açılmadı';
+  const sync = s.syncing ? ` · <span class="sync-tag">${s.syncing} dosya eşitleniyor</span>` : '';
+  return `${s.members.length} kişi · ${s.fileCount} dosya · ${fmtBytes(s.totalSize)}${sync}`;
+}
+
+function renderShares() {
+  const list = state.shares;
+  $('#shares-empty').hidden = list.length > 0;
+  $('#shares').hidden = list.length === 0;
+  $('#shares').innerHTML = list.map((s) => `
+    <div class="conv ${s.left ? 'left' : ''}" data-share="${esc(s.id)}">
+      <div class="avatar folder" style="background:${grad(s.id)}">${s.protected && !s.canAccess ? lockIcon : folderIcon}</div>
+      <div class="c-name"><span>${esc(s.name)}</span>${s.protected ? `<span class="c-count" title="Şifreli">${lockIcon.replace('<svg', '<svg style="width:12px;height:12px"')}</span>` : ''}</div>
+      <div class="c-time"></div>
+      <div class="c-last">${shareStatus(s)}</div>
+      <div></div>
+    </div>`).join('');
+}
+$('#shares').addEventListener('click', (e) => {
+  const el = e.target.closest('[data-share]');
+  if (el) openShare(el.dataset.share);
+});
+
+function onShares(list) {
+  state.shares = list;
+  renderShares();
+  if (state.openShare) {
+    if (!shareById(state.openShare)) closeShare();
+    else renderShareHead();
+  }
+}
+
+function openShare(id) {
+  // Sohbet / oylama açıksa kapat (aynı paneli kullanırlar).
+  state.openChat = null;
+  $('#chat-view').hidden = true;
+  state.openPoll = null;
+  $('#poll-view').hidden = true;
+  state.openShare = id;
+  state.shareFiles = [];
+  $('#share-search').value = '';
+  $('#share-view').hidden = false;
+  renderShareHead();
+  loadShareFiles();
+}
+
+function closeShare() {
+  state.openShare = null;
+  $('#share-view').hidden = true;
+  setTab('shares');
+}
+$('#share-back').onclick = closeShare;
+
+function renderShareHead() {
+  const s = shareById(state.openShare);
+  if (!s) return;
+  const icon = $('#share-icon');
+  icon.style.background = grad(s.id);
+  icon.innerHTML = s.protected && !s.canAccess ? lockIcon : folderIcon;
+  $('#share-name').textContent = s.name;
+  $('#share-status').innerHTML = s.canAccess && !s.left
+    ? `${s.members.length} kişi · ${s.fileCount} dosya${s.syncing ? ` · <span class="sync-tag">${s.syncing} eşitleniyor</span>` : ''}`
+    : shareStatus(s);
+  const locked = !s.canAccess && !s.left && !s.deleted;
+  $('#share-locked').hidden = !locked;
+  $('#share-body').hidden = locked;
+  const admin = s.admin === myFp();
+  $('#share-leave').hidden = false;
+  $('#share-leave').title = admin && !s.left ? 'Klasörü herkes için sil' : 'Klasörü sil';
+  const canAdd = s.canAccess && !s.left;
+  $('#share-add-files').disabled = !canAdd;
+  $('#share-add-folder').disabled = !canAdd;
+  $('#share-note').textContent = canAdd
+    ? 'Dosyaları buraya sürükleyip bırakabilir veya Gezgin\'de klasöre kopyalayabilirsiniz.'
+    : s.left ? 'Bu klasör artık eşitlenmiyor; dosyalar bilgisayarınızda kalır.' : '';
+}
+
+async function loadShareFiles() {
+  const id = state.openShare;
+  const s = shareById(id);
+  if (!s || (!s.canAccess && !s.left)) {
+    state.shareFiles = [];
+    renderShareFiles();
+    return;
+  }
+  const files = await api.invoke('share_files', { id }).catch(() => []);
+  if (state.openShare !== id) return;
+  state.shareFiles = files;
+  renderShareFiles();
+}
+
+function renderShareFiles() {
+  const q = $('#share-search').value.trim().toLocaleLowerCase('tr-TR');
+  const files = q ? state.shareFiles.filter((f) => f.path.toLocaleLowerCase('tr-TR').includes(q)) : state.shareFiles;
+  const box = $('#share-files');
+  if (!files.length) {
+    box.innerHTML = `<div class="empty small-empty"><p>${q ? 'Eşleşen dosya yok.' : 'Klasör boş. Eklediğiniz dosyalar üyelerin bilgisayarına otomatik kopyalanır.'}</p></div>`;
+    return;
+  }
+  box.innerHTML = files.slice(0, 500).map((f) => {
+    const slash = f.path.lastIndexOf('/');
+    const dir = slash >= 0 ? f.path.slice(0, slash + 1) : '';
+    const name = f.path.slice(slash + 1);
+    return `
+      <div class="sfile" data-path="${esc(f.fullPath)}" title="${esc(f.path)} — açmak için tıklayın">
+        <div class="ficon">${ic.file}</div>
+        <div>
+          <div class="fname"><span class="fdir">${esc(dir)}</span>${esc(name)}</div>
+          <div class="fmeta">${esc(f.authorName)} · ${esc(shortTime(f.mtime))} · ${fmtBytes(f.size)}</div>
+        </div>
+        <button class="icon-btn sm fact" data-reveal="${esc(f.fullPath)}" title="Klasörde göster">${ic.reveal}</button>
+      </div>`;
+  }).join('') + (files.length > 500 ? `<div class="more muted small" style="padding:8px">+ ${files.length - 500} dosya daha (aramayı daraltın)</div>` : '');
+}
+$('#share-search').addEventListener('input', renderShareFiles);
+$('#share-files').addEventListener('click', (e) => {
+  const reveal = e.target.closest('[data-reveal]');
+  if (reveal) return call('reveal_path', { path: reveal.dataset.reveal });
+  const row = e.target.closest('[data-path]');
+  if (row) call('open_path', { path: row.dataset.path });
+});
+$('#share-open').onclick = () => { const s = shareById(state.openShare); if (s) call('open_path', { path: s.dir }); };
+
+async function addToShare(id, paths) {
+  if (!paths?.length) return;
+  try {
+    const n = await call('share_add_files', { id, paths });
+    toast(`${n} dosya ortak klasöre eklendi; üyelere gönderiliyor`, { type: 'success' });
+    if (state.openShare === id) loadShareFiles();
+  } catch { /* toast gösterildi */ }
+}
+const pickIntoShare = async (directory) => {
+  const id = state.openShare;
+  const sel = await api.pick({ multiple: true, directory, title: directory ? 'Ortak klasöre eklenecek klasörler' : 'Ortak klasöre eklenecek dosyalar' });
+  if (sel) addToShare(id, Array.isArray(sel) ? sel : [sel]);
+};
+$('#share-add-files').onclick = () => pickIntoShare(false);
+$('#share-add-folder').onclick = () => pickIntoShare(true);
+
+async function unlockShare() {
+  const id = state.openShare;
+  const pass = $('#share-pass').value;
+  if (!pass) return $('#share-pass').focus();
+  $('#share-unlock').disabled = true;
+  $('#share-err').textContent = '';
+  try {
+    await api.invoke('share_unlock', { id, password: pass });
+    $('#share-pass').value = '';
+    toast('Kilit açıldı. Dosyalar eşitleniyor…', { type: 'success' });
+  } catch (e) {
+    $('#share-err').textContent = String(e);
+  } finally {
+    $('#share-unlock').disabled = false;
+  }
+}
+$('#share-unlock').onclick = unlockShare;
+$('#share-pass').addEventListener('keydown', (e) => e.key === 'Enter' && unlockShare());
+
+$('#share-leave').onclick = () => {
+  const s = shareById(state.openShare);
+  if (!s) return;
+  const admin = s.admin === myFp() && !s.left && !s.deleted;
+  const active = !s.left && !s.deleted;
+  const m = openModal('share-delete', `
+    <h3>“${esc(s.name)}” silinsin mi?</h3>
+    <p class="lead">${admin
+      ? 'Klasörün sahibi sizsiniz. Silerseniz klasör <b>tüm üyeler için kapanır</b> ve eşitleme durur; çevrimdışı olanlara açıldıklarında bildirilir. Diğer üyelerin bilgisayarındaki kopyalar silinmez.'
+      : active
+        ? 'Klasörden ayrılırsınız ve listenizden kaldırılır. Diğer üyeler kullanmaya devam eder.'
+        : 'Klasör listenizden kaldırılır.'}</p>
+    <label class="check"><input type="checkbox" id="sd-files" />
+      <span>Bu bilgisayardaki dosyaları da sil<br><span class="muted small path">${esc(s.dir)}</span></span></label>
+    <div class="err" id="sd-err"></div>
+    <div class="foot">
+      <button class="btn ghost" data-close>Vazgeç</button>
+      <button class="btn danger" id="sd-go">${admin ? 'Herkes için sil' : 'Sil'}</button>
+    </div>`);
+  m.querySelector('[data-close]').onclick = closeModal;
+  m.querySelector('#sd-go').onclick = async () => {
+    const deleteFiles = m.querySelector('#sd-files').checked;
+    try {
+      await api.invoke('share_delete', { id: s.id, deleteFiles });
+      state.shares = state.shares.filter((x) => x.id !== s.id);
+      closeModal();
+      closeShare();
+      renderShares();
+      toast(deleteFiles ? 'Klasör ve dosyaları silindi' : 'Klasör silindi; dosyalar bilgisayarınızda duruyor', { type: 'success' });
+    } catch (e) {
+      m.querySelector('#sd-err').textContent = String(e);
+    }
+  };
+};
+
+function passwordFields(prefix) {
+  return `
+    <div class="row">
+      <input class="input" type="password" id="${prefix}-p1" placeholder="Şifre (en az 4 karakter)" autocomplete="new-password" />
+      <input class="input" type="password" id="${prefix}-p2" placeholder="Şifre (tekrar)" autocomplete="new-password" />
+    </div>`;
+}
+
+function readPassword(m, prefix) {
+  const p1 = m.querySelector(`#${prefix}-p1`).value;
+  const p2 = m.querySelector(`#${prefix}-p2`).value;
+  if (!p1 && !p2) return { password: null };
+  if (p1 !== p2) return { error: 'Şifreler aynı değil' };
+  if (p1.length < 4) return { error: 'Şifre en az 4 karakter olmalı' };
+  return { password: p1 };
+}
+
+function showShareCreate() {
+  const selected = new Set();
+  const m = openModal('share-new', `
+    <h3>Yeni ortak klasör</h3>
+    <p class="lead">Bu klasöre eklenen dosyalar, seçtiğiniz kişilerin bilgisayarına otomatik kopyalanır ve güncel tutulur. Eklemediğiniz kişiler klasörü göremez.</p>
+    <div class="field">
+      <label for="sh-name">Klasör adı</label>
+      <input class="input" id="sh-name" maxlength="40" placeholder="ör. Proje Dosyaları" autofocus />
+    </div>
+    <div class="field">
+      <label>Üyeler</label>
+      <div class="recips" id="sh-people"></div>
+    </div>
+    <div class="field">
+      <label class="check" style="padding:0"><input type="checkbox" id="sh-protect" /> <span>Şifre koy (isteğe bağlı)</span></label>
+      <div id="sh-pass" hidden>${passwordFields('sh')}
+        <span class="help">Üyeler şifreyi bir kez girer; girmeyenlere dosya gönderilmez. Şifre yalnızca sizin bilgisayarınızda (özet olarak) saklanır.</span>
+      </div>
+      <div class="err" id="sh-err"></div>
+    </div>
+    <div class="foot">
+      <button class="btn ghost" data-close>Vazgeç</button>
+      <button class="btn" id="sh-create" disabled>Klasörü oluştur</button>
+    </div>`);
+  const people = candidatePeople();
+  const render = () => {
+    m.querySelector('#sh-people').innerHTML = people.length
+      ? people.map((p) => personRow(p, selected.has(p.fingerprint))).join('')
+      : '<span class="muted small">Eklenecek kimse yok. Klasörü şimdi oluşturup üyeleri sonra ekleyebilirsiniz.</span>';
+    m.querySelector('#sh-create').disabled = !m.querySelector('#sh-name').value.trim();
+  };
+  m.querySelector('#sh-people').addEventListener('change', (e) => {
+    const fp = e.target.closest('.recip')?.dataset.fp;
+    if (!fp) return;
+    e.target.checked ? selected.add(fp) : selected.delete(fp);
+    render();
+  });
+  m.querySelector('#sh-name').addEventListener('input', render);
+  m.querySelector('#sh-protect').onchange = (e) => { m.querySelector('#sh-pass').hidden = !e.target.checked; };
+  m.querySelector('[data-close]').onclick = closeModal;
+  m.querySelector('#sh-create').onclick = async () => {
+    let password = null;
+    if (m.querySelector('#sh-protect').checked) {
+      const r = readPassword(m, 'sh');
+      if (r.error || !r.password) { m.querySelector('#sh-err').textContent = r.error || 'Şifre girin'; return; }
+      password = r.password;
+    }
+    try {
+      const s = await api.invoke('share_create', { name: m.querySelector('#sh-name').value, members: [...selected], password });
+      if (!shareById(s.id)) state.shares = [...state.shares, s];
+      closeModal();
+      setTab('shares');
+      renderShares();
+      openShare(s.id);
+    } catch (e) {
+      m.querySelector('#sh-err').textContent = String(e);
+    }
+  };
+  render();
+}
+$('#btn-new-share').onclick = showShareCreate;
+
+function showShareSettings() {
+  const s = shareById(state.openShare);
+  if (!s) return;
+  const isAdmin = s.admin === myFp() && !s.left && !s.deleted;
+  const removing = new Set();
+  const adding = new Set();
+  const m = openModal('share-settings', `
+    <h3>${esc(s.name)}</h3>
+    <p class="lead">${isAdmin ? 'Klasörün sahibi sizsiniz: adı, üyeleri ve şifreyi yönetebilirsiniz.' : 'Klasörü yalnızca oluşturan kişi düzenleyebilir.'}</p>
+    ${isAdmin ? `<div class="field"><label for="ss-name">Klasör adı</label><input class="input" id="ss-name" maxlength="40" value="${esc(s.name)}" /></div>` : ''}
+    <div class="field">
+      <label>Üyeler (${s.members.length})</label>
+      <div class="member-list" id="ss-list"></div>
+    </div>
+    ${isAdmin ? '<div class="field"><label>Üye ekle</label><div class="recips" id="ss-add"></div></div>' : ''}
+    ${isAdmin ? `<div class="field">
+      <label>Şifre ${s.protected ? '<span class="badge trusted">açık</span>' : ''}</label>
+      ${passwordFields('ss')}
+      <span class="help">${s.protected ? 'Yeni şifre yazarsanız değişir. Kilidi açmış üyeler erişmeye devam eder.' : 'Şifre koyarsanız, şu anki üyeler erişmeye devam eder; yeni üyeler şifreyi girmelidir.'}</span>
+      ${s.protected ? '<button class="link-btn" id="ss-nopass" style="margin-top:6px">Şifreyi kaldır</button>' : ''}
+    </div>` : ''}
+    <div class="muted small">Yerel klasör: <span class="path">${esc(s.dir)}</span></div>
+    <div class="err" id="ss-err"></div>
+    <div class="foot">
+      <button class="btn ghost" data-close>${isAdmin ? 'Vazgeç' : 'Kapat'}</button>
+      ${isAdmin ? '<button class="btn" id="ss-save">Kaydet</button>' : ''}
+    </div>`);
+  const render = () => {
+    m.querySelector('#ss-list').innerHTML = s.members.map((mem) => {
+      const me = mem.fingerprint === myFp();
+      const online = me || !!peerByFp(mem.fingerprint);
+      return `
+        <div class="member ${removing.has(mem.fingerprint) ? 'removing' : ''}">
+          <span class="avatar" style="background:${grad(mem.fingerprint)}">${face(mem.fingerprint, mem.name)}</span>
+          <span class="m-name">${esc(mem.name)}${me ? ' <span class="muted small">(siz)</span>' : ''}
+            ${mem.fingerprint === s.admin ? '<span class="badge admin">Sahip</span>' : ''}</span>
+          ${online ? '<span class="online-dot" title="Çevrimiçi"></span>' : '<span class="muted small">çevrimdışı</span>'}
+          ${isAdmin && !me ? `<button class="icon-btn sm" data-rm="${esc(mem.fingerprint)}" title="${removing.has(mem.fingerprint) ? 'Geri al' : 'Klasörden çıkar'}">${ic.x}</button>` : ''}
+        </div>`;
+    }).join('');
+    if (isAdmin) {
+      const people = candidatePeople(new Set(s.members.map((x) => x.fingerprint)));
+      m.querySelector('#ss-add').innerHTML = people.length
+        ? people.map((p) => personRow(p, adding.has(p.fingerprint))).join('')
+        : '<span class="muted small">Eklenebilecek başka kimse yok.</span>';
+    }
+  };
+  m.querySelector('#ss-list').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-rm]');
+    if (!b) return;
+    removing.has(b.dataset.rm) ? removing.delete(b.dataset.rm) : removing.add(b.dataset.rm);
+    render();
+  });
+  m.querySelector('#ss-add')?.addEventListener('change', (e) => {
+    const fp = e.target.closest('.recip')?.dataset.fp;
+    if (!fp) return;
+    e.target.checked ? adding.add(fp) : adding.delete(fp);
+    render();
+  });
+  m.querySelector('[data-close]').onclick = closeModal;
+  m.querySelector('#ss-nopass')?.addEventListener('click', async () => {
+    if (!(await confirmDialog('Şifre kaldırılsın mı?', 'Klasördeki tüm üyeler şifre girmeden erişebilir.', 'Kaldır', true))) return;
+    await call('share_set_password', { id: s.id, password: null });
+    toast('Şifre kaldırıldı', { type: 'success' });
+  });
+  m.querySelector('#ss-save')?.addEventListener('click', async () => {
+    const pw = readPassword(m, 'ss');
+    if (pw.error) { m.querySelector('#ss-err').textContent = pw.error; return; }
+    try {
+      await api.invoke('share_edit', { id: s.id, name: m.querySelector('#ss-name').value, add: [...adding], remove: [...removing] });
+      if (pw.password) await api.invoke('share_set_password', { id: s.id, password: pw.password });
+      closeModal();
+      toast('Klasör güncellendi', { type: 'success' });
+    } catch (e) {
+      m.querySelector('#ss-err').textContent = String(e);
+    }
+  });
+  render();
+}
+$('#share-members').onclick = showShareSettings;
+
+// ───────────────────────────── Oylamalar ─────────────────────────────
+
+const pollIcon = '<svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>';
+const pollById = (id) => state.polls.find((p) => p.id === id);
+const pollOpen = () => !!state.openPoll && !$('#poll-view').hidden;
+/** Oy bekleyen (açık, katılımcısı olduğum, henüz oy vermediğim) oylama mı? */
+const needsMyVote = (p) => p.canVote && p.myVote == null;
+
+function pollWinners(p) {
+  const max = Math.max(0, ...p.counts);
+  return max > 0 ? p.options.map((o, i) => (p.counts[i] === max ? i : -1)).filter((i) => i >= 0) : [];
+}
+
+function pollSummary(p) {
+  const total = p.voters.length;
+  if (p.closed) {
+    const w = pollWinners(p);
+    if (!w.length) return 'Sonuçlandı · oy kullanılmadı';
+    return w.length === 1 ? `Sonuçlandı · Kazanan: ${p.options[w[0]]}` : `Sonuçlandı · Berabere: ${w.map((i) => p.options[i]).join(', ')}`;
+  }
+  return `${p.voted.length}/${total} kişi oy kullandı`;
+}
+
+function renderPolls() {
+  const list = state.polls;
+  $('#polls-empty').hidden = list.length > 0;
+  $('#polls').hidden = list.length === 0;
+  $('#polls').innerHTML = list.map((p) => `
+    <div class="conv ${needsMyVote(p) ? 'unread' : ''} ${p.closed ? 'left' : ''}" data-poll="${esc(p.id)}">
+      <div class="avatar folder" style="background:${grad(p.id)}">${pollIcon}</div>
+      <div class="c-name"><span>${esc(p.question)}</span></div>
+      <div class="c-time">${esc(shortTime(p.createdAt))}</div>
+      <div class="c-last">${esc(p.isOwner ? 'Siz' : p.ownerName)} · ${esc(pollSummary(p))}</div>
+      <div>${needsMyVote(p) ? '<span class="badge vote">Oy verin</span>' : ''}</div>
+    </div>`).join('');
+  const waiting = list.filter(needsMyVote).length;
+  $('#poll-badge').hidden = waiting === 0;
+  $('#poll-badge').textContent = waiting;
+}
+$('#polls').addEventListener('click', (e) => {
+  const el = e.target.closest('[data-poll]');
+  if (el) openPoll(el.dataset.poll);
+});
+
+function onPolls(list) {
+  const before = new Map(state.polls.map((p) => [p.id, p]));
+  state.polls = list;
+  renderPolls();
+  // Uygulama öndeyken de haber ver: yeni oylama / sonuçlanan oylama.
+  for (const p of list) {
+    const old = before.get(p.id);
+    if (!old && !p.isOwner && !p.closed) {
+      toast(`${p.ownerName} oylama başlattı: ${p.question}`, { action: 'Oy ver', timeout: 8000, onAction: () => openPoll(p.id) });
+    } else if (old && !old.closed && p.closed && !p.isOwner) {
+      toast(`Oylama sonuçlandı: ${p.question}`, { action: 'Gör', timeout: 8000, onAction: () => openPoll(p.id) });
+    }
+  }
+  if (state.openPoll) {
+    if (!pollById(state.openPoll)) closePoll();
+    else renderPoll();
+  }
+}
+
+function openPoll(id) {
+  state.openChat = null;
+  $('#chat-view').hidden = true;
+  state.openShare = null;
+  $('#share-view').hidden = true;
+  state.openPoll = id;
+  setTab('polls');
+  $('#poll-view').hidden = false;
+  renderPoll();
+  const p = pollById(id);
+  if (p && !p.seen) api.invoke('poll_mark_seen', { id }).catch(() => {});
+}
+
+function closePoll() {
+  state.openPoll = null;
+  $('#poll-view').hidden = true;
+  setTab('polls');
+}
+$('#poll-back').onclick = closePoll;
+
+function renderPoll() {
+  const p = pollById(state.openPoll);
+  if (!p) return;
+  $('#poll-icon').style.background = grad(p.id);
+  $('#poll-status').textContent = p.closed ? 'Sonuçlandı' : `${p.voted.length}/${p.voters.length} oy kullanıldı`;
+  $('#poll-question').textContent = p.question;
+  $('#poll-meta').innerHTML = `
+    <span class="avatar" style="background:${grad(p.owner)}">${face(p.owner, p.ownerName)}</span>
+    ${esc(p.isOwner ? 'Siz' : p.ownerName)} açtı · ${esc(shortTime(p.createdAt))}
+    ${p.anonymous ? ' · <span title="Kimin neye oy verdiği görünmez">gizli oylama</span>' : ''}`;
+  const total = p.counts.reduce((a, b) => a + b, 0);
+  const winners = p.closed ? pollWinners(p) : [];
+  const nameOf = (fp) => p.voters.find((v) => v.fingerprint === fp)?.name || '?';
+  $('#poll-options').innerHTML = p.options.map((o, i) => {
+    const count = p.counts[i] || 0;
+    const pct = total ? Math.round((count / total) * 100) : 0;
+    const names = p.anonymous ? [] : p.ballots.filter((b) => b.option === i).map((b) => nameOf(b.fingerprint));
+    return `
+      <button class="popt ${p.myVote === i ? 'mine' : ''} ${winners.includes(i) ? 'winner' : ''}" data-opt="${i}" ${p.canVote ? '' : 'disabled'}>
+        <span class="fill" style="width:${pct}%"></span>
+        <span class="radio"></span>
+        <span class="otext">${esc(o)}</span>
+        <span class="ocount">${count} oy · %${pct}</span>
+        ${names.length ? `<span class="onames">${esc(names.join(', '))}</span>` : ''}
+      </button>`;
+  }).join('');
+  const chips = p.voters.map((v) => `
+    <span class="chip ${p.voted.includes(v.fingerprint) ? 'done' : ''}" title="${p.voted.includes(v.fingerprint) ? 'Oy kullandı' : 'Henüz oy kullanmadı'}">
+      <span class="avatar" style="background:${grad(v.fingerprint)}">${face(v.fingerprint, v.name)}</span>${esc(v.fingerprint === myFp() ? 'Siz' : v.name)}${p.voted.includes(v.fingerprint) ? ' ✓' : ''}
+    </span>`).join('');
+  $('#poll-voters').innerHTML = `Katılımcılar <div class="chips">${chips}</div>`;
+  let note = '';
+  if (p.canVote) note = p.votePending ? 'Oyunuz iletiliyor… (oylamayı açan kişi çevrimiçi olunca ulaşır)' : p.myVote == null ? 'Bir seçeneğe tıklayarak oy verin.' : 'Oy verdiniz. Kapanana kadar değiştirebilirsiniz.';
+  else if (!p.closed) note = 'Bu oylamada oy kullanmıyorsunuz; sonucu takip edebilirsiniz.';
+  else note = 'Oylama sonuçlandı.';
+  $('#poll-foot').innerHTML = `<span>${esc(note)}</span><span class="spacer"></span>
+    ${p.isOwner && !p.closed ? '<button class="btn small" id="poll-close">Oylamayı bitir</button>' : ''}`;
+  $('#poll-close')?.addEventListener('click', async () => {
+    if (!(await confirmDialog('Oylama bitirilsin mi?', 'Artık oy verilemez; sonuç tüm katılımcılara gönderilir.', 'Bitir'))) return;
+    await call('poll_close', { id: p.id });
+  });
+  $('#poll-remove').title = p.isOwner && !p.closed ? 'Oylamayı bitir ve listeden kaldır' : 'Listeden kaldır';
+}
+
+$('#poll-options').addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-opt]');
+  const p = pollById(state.openPoll);
+  if (!b || !p || !p.canVote) return;
+  const option = Number(b.dataset.opt);
+  if (p.myVote === option) return;
+  await call('poll_vote', { id: p.id, option }).catch(() => {});
+});
+
+$('#poll-remove').onclick = async () => {
+  const p = pollById(state.openPoll);
+  if (!p) return;
+  const ok = await confirmDialog(
+    'Oylama listeden kaldırılsın mı?',
+    p.isOwner && !p.closed ? 'Oylama açık; kaldırırsanız önce bitirilir ve sonuç katılımcılara gönderilir.' : 'Yalnızca sizin listenizden kaldırılır.',
+    'Kaldır', true);
+  if (!ok) return;
+  await call('poll_remove', { id: p.id });
+  closePoll();
+};
+
+function showPollCreate() {
+  const selected = new Set();
+  let options = ['', ''];
+  const m = openModal('poll-new', `
+    <h3>Yeni oylama</h3>
+    <p class="lead">Eklediğiniz kişilere bildirim gider. Sonucu tüm katılımcılar canlı olarak görür.</p>
+    <div class="field">
+      <label for="pl-q">Soru</label>
+      <input class="input" id="pl-q" maxlength="200" placeholder="ör. Cuma öğle yemeği nerede?" autofocus />
+    </div>
+    <div class="field">
+      <label>Seçenekler</label>
+      <div id="pl-opts"></div>
+      <button class="link-btn" id="pl-add">+ Seçenek ekle</button>
+    </div>
+    <div class="field">
+      <div class="label-row"><label>Oy verecek kişiler</label><button class="link-btn" id="pl-all"></button></div>
+      <div class="recips" id="pl-people"></div>
+    </div>
+    <label class="check"><input type="checkbox" id="pl-me" checked /> <span>Ben de oy kullanacağım</span></label>
+    <label class="check"><input type="checkbox" id="pl-anon" /> <span>Gizli oylama <span class="muted small">(kimin neye oy verdiği görünmez, yalnızca sayılar)</span></span></label>
+    <div class="err" id="pl-err"></div>
+    <div class="foot">
+      <button class="btn ghost" data-close>Vazgeç</button>
+      <button class="btn" id="pl-create">Oylamayı başlat</button>
+    </div>`);
+  const people = candidatePeople();
+  const renderOpts = () => {
+    m.querySelector('#pl-opts').innerHTML = options.map((o, i) => `
+      <div class="opt-row">
+        <input class="input" data-i="${i}" maxlength="80" placeholder="Seçenek ${i + 1}" value="${esc(o)}" />
+        ${options.length > 2 ? `<button class="icon-btn sm" data-del="${i}" title="Seçeneği sil">${ic.x}</button>` : ''}
+      </div>`).join('');
+    m.querySelector('#pl-add').hidden = options.length >= 10;
+  };
+  const renderPeople = () => {
+    m.querySelector('#pl-people').innerHTML = people.length
+      ? people.map((p) => personRow(p, selected.has(p.fingerprint))).join('')
+      : '<span class="muted small">Eklenecek kimse yok. Ağda başka bir FastFiles görünmeli.</span>';
+    m.querySelector('#pl-all').textContent = people.length && selected.size === people.length ? 'Hiçbirini seçme' : 'Tümünü seç';
+  };
+  m.querySelector('#pl-opts').addEventListener('input', (e) => {
+    const i = e.target.dataset.i;
+    if (i != null) options[Number(i)] = e.target.value;
+  });
+  m.querySelector('#pl-opts').addEventListener('click', (e) => {
+    const d = e.target.closest('[data-del]');
+    if (d) { options.splice(Number(d.dataset.del), 1); renderOpts(); }
+  });
+  m.querySelector('#pl-add').onclick = () => {
+    options.push('');
+    renderOpts();
+    m.querySelector(`#pl-opts [data-i="${options.length - 1}"]`).focus();
+  };
+  m.querySelector('#pl-people').addEventListener('change', (e) => {
+    const fp = e.target.closest('.recip')?.dataset.fp;
+    if (!fp) return;
+    e.target.checked ? selected.add(fp) : selected.delete(fp);
+    renderPeople();
+  });
+  m.querySelector('#pl-all').onclick = () => {
+    if (selected.size === people.length) selected.clear(); else people.forEach((p) => selected.add(p.fingerprint));
+    renderPeople();
+  };
+  m.querySelector('[data-close]').onclick = closeModal;
+  m.querySelector('#pl-create').onclick = async () => {
+    const err = m.querySelector('#pl-err');
+    const question = m.querySelector('#pl-q').value.trim();
+    const opts = options.map((o) => o.trim()).filter(Boolean);
+    if (!question) { err.textContent = 'Soruyu yazın'; return; }
+    if (opts.length < 2) { err.textContent = 'En az iki seçenek yazın'; return; }
+    if (!selected.size) { err.textContent = 'Oy verecek en az bir kişi seçin'; return; }
+    try {
+      const p = await api.invoke('poll_create', {
+        question, options: opts, voters: [...selected],
+        includeMe: m.querySelector('#pl-me').checked, anonymous: m.querySelector('#pl-anon').checked,
+      });
+      if (!pollById(p.id)) state.polls = [p, ...state.polls];
+      closeModal();
+      renderPolls();
+      openPoll(p.id);
+    } catch (e) {
+      err.textContent = String(e);
+    }
+  };
+  renderOpts();
+  renderPeople();
+}
+$('#btn-new-poll').onclick = showPollCreate;
+
 // ───────────────────────────── Sürükle-bırak ─────────────────────────────
 
 function peerIdAt(pos) {
@@ -1296,6 +2026,7 @@ api.onDragDrop((event) => {
     if (p.paths) state.dragPaths = p.paths;
     document.body.classList.add('dragging');
     if (batch) $('#drop-msg').textContent = 'Listeye eklemek için bırakın';
+    else if (shareDropTarget()) $('#drop-msg').textContent = `“${shareDropTarget().name}” klasörüne eklemek için bırakın`;
     else updateDragTarget(p.position);
   } else if (p.type === 'leave') {
     endDrag();
@@ -1309,6 +2040,8 @@ api.onDragDrop((event) => {
     if (paths.length === 1 && /\.ffupdate$/i.test(paths[0])) return importUpdate(paths[0]);
     // "Toplu gönder" penceresi açıksa bırakılanlar listeye eklenir.
     if (batch) return batch.add(paths);
+    // Açık (ve kilidi açık) ortak klasör varsa dosyalar oraya eklenir.
+    if (shareDropTarget()) return addToShare(shareDropTarget().id, paths);
     if (modalKind) closeModal();
     const peer = state.peers.find((x) => x.id === id) || (state.peers.length === 1 ? state.peers[0] : null);
     if (peer) sendPaths(peer, paths);
@@ -1332,6 +2065,11 @@ async function init() {
   const snap = await refreshSnapshot();
   state.chats = new Map((snap.conversations || []).map((c) => [c.fingerprint, c]));
   state.update = snap.update;
+  state.avatars = new Map(Object.entries(snap.avatars || {}));
+  state.shares = snap.shares || [];
+  renderShares();
+  state.polls = snap.polls || [];
+  renderPolls();
   renderUpdateBar();
   renderMe();
   renderPeers();
@@ -1346,6 +2084,17 @@ async function init() {
     batch?.render();
   });
   api.listen('chat', (e) => onChat(e.payload));
+  api.listen('avatar', (e) => {
+    const { fingerprint, url } = e.payload;
+    if (url) state.avatars.set(fingerprint, url); else state.avatars.delete(fingerprint);
+    renderMe();
+    renderPeers();
+    renderConvs();
+    renderChatHead();
+  });
+  api.listen('shares', (e) => onShares(e.payload));
+  api.listen('polls', (e) => onPolls(e.payload));
+  api.listen('share-files', (e) => { if (state.openShare === e.payload.id) loadShareFiles(); });
   api.listen('conversation', (e) => onConversation(e.payload));
   api.listen('notification-click', (e) => onNotificationClick(e.payload));
   api.listen('update-ready', async () => {
@@ -1426,6 +2175,57 @@ function createPreviewApi() {
   ];
   snap.conversations.unshift({ fingerprint: gkey, name: 'Proje Ekibi', unread: 1, last: history[gkey].at(-1), group, left: false });
 
+  // Örnek profil resimleri (önizleme için tuvalde çizilir).
+  const mockPhoto = (h1, h2) => {
+    const c = document.createElement('canvas');
+    c.width = c.height = 96;
+    const x = c.getContext('2d');
+    const g = x.createLinearGradient(0, 0, 96, 96);
+    g.addColorStop(0, `hsl(${h1} 70% 60%)`);
+    g.addColorStop(1, `hsl(${h2} 70% 40%)`);
+    x.fillStyle = g; x.fillRect(0, 0, 96, 96);
+    x.fillStyle = 'rgba(255,255,255,.85)';
+    x.beginPath(); x.arc(48, 38, 17, 0, Math.PI * 2); x.fill();
+    x.beginPath(); x.ellipse(48, 92, 32, 26, 0, 0, Math.PI * 2); x.fill();
+    return c.toDataURL('image/jpeg', 0.9);
+  };
+  snap.avatars = { [fp2]: mockPhoto(20, 340), [me]: mockPhoto(200, 260) };
+
+  // Örnek ortak klasörler: biri bizim (açık), biri Ahmet'in (şifreli, kilidi açılmamış).
+  const shareFilesMock = {
+    sh1: [
+      { path: 'Sunum/Final_v4.pptx', size: 18.2e6, mtime: now - 4 * 60e3, author: fp2, authorName: 'Elif (Tasarım)' },
+      { path: 'Bütçe 2026.xlsx', size: 410e3, mtime: now - 50 * 60e3, author: me, authorName: 'Siz' },
+      { path: 'Görseller/logo.png', size: 1.3e6, mtime: now - 3 * 3600e3, author: fp1, authorName: 'Ahmet' },
+      { path: 'Görseller/arka-plan.jpg', size: 4.8e6, mtime: now - 26 * 3600e3, author: fp2, authorName: 'Elif (Tasarım)' },
+      { path: 'Notlar.txt', size: 3.1e3, mtime: now - 4 * 86400e3, author: me, authorName: 'Siz' },
+    ].map((f) => ({ ...f, fullPath: `C:\\Ortak\\${f.path}` })),
+  };
+  snap.shares = [
+    { id: 'sh1', name: 'Proje Dosyaları', admin: me, members: [{ fingerprint: me, name: 'Nur' }, { fingerprint: fp1, name: 'Ahmet' }, { fingerprint: fp2, name: 'Elif (Tasarım)' }],
+      protected: false, canAccess: true, left: false, deleted: false, dir: 'C:\\Users\\Nur\\Downloads\\FastFiles\\Ortak\\Proje Dosyaları', fileCount: 5, totalSize: 24.7e6, syncing: 2 },
+    { id: 'sh2', name: 'Muhasebe', admin: fp1, members: [{ fingerprint: fp1, name: 'Ahmet' }, { fingerprint: me, name: 'Nur' }],
+      protected: true, canAccess: false, left: false, deleted: false, dir: 'C:\\Users\\Nur\\Downloads\\FastFiles\\Ortak\\Muhasebe', fileCount: 0, totalSize: 0, syncing: 0 },
+  ];
+
+  // Örnek oylamalar: biri bizim (açık), biri Ahmet'in (oyumuz bekleniyor), biri sonuçlanmış.
+  const voters = [{ fingerprint: me, name: 'Nur' }, { fingerprint: fp1, name: 'Ahmet' }, { fingerprint: fp2, name: 'Elif (Tasarım)' }, { fingerprint: fpM, name: 'Mehmet (İzinde)' }];
+  snap.polls = [
+    { id: 'pl2', owner: fp1, ownerName: 'Ahmet', question: 'Ekip yemeği hangi gün olsun?', options: ['Perşembe', 'Cuma', 'Gelecek hafta'],
+      voters, anonymous: false, closed: false, rev: 3, createdAt: now - 15 * 60e3, counts: [1, 1, 0], voted: [fp1, fp2],
+      ballots: [{ fingerprint: fp1, option: 0 }, { fingerprint: fp2, option: 1 }], myVote: null, votePending: false, canVote: true, isOwner: false, seen: false },
+    { id: 'pl1', owner: me, ownerName: 'Nur', question: 'Yeni logo için hangi renk?', options: ['Mor', 'Turkuaz', 'Turuncu'],
+      voters, anonymous: true, closed: false, rev: 5, createdAt: now - 2 * 3600e3, counts: [2, 1, 0], voted: [me, fp1, fp2],
+      ballots: [], myVote: 0, votePending: false, canVote: true, isOwner: true, seen: true },
+    { id: 'pl0', owner: fp2, ownerName: 'Elif (Tasarım)', question: 'Ofis müziği açık mı kalsın?', options: ['Evet', 'Hayır'],
+      voters: voters.slice(0, 3), anonymous: false, closed: true, rev: 9, createdAt: now - 3 * 86400e3, counts: [2, 1], voted: [me, fp1, fp2],
+      ballots: [{ fingerprint: me, option: 0 }, { fingerprint: fp1, option: 1 }, { fingerprint: fp2, option: 0 }], myVote: 0, votePending: false, canVote: false, isOwner: false, seen: true },
+  ];
+  const tallyMock = (p) => {
+    p.counts = p.options.map((_, i) => p.ballots.filter((b) => b.option === i).length);
+    p.voted = p.ballots.map((b) => b.fingerprint);
+  };
+
   snap.update = location.hash.includes('update')
     ? { current: '1.2.0', ready: '1.2.1', serving: '1.2.1' }
     : { current: '1.2.0', ready: null, serving: null };
@@ -1437,6 +2237,9 @@ function createPreviewApi() {
   setTimeout(() => {
     if (location.hash.includes('chat')) document.querySelector('.peer[data-id="p2"] [data-act="chat"]')?.click();
     if (location.hash.includes('group')) openChat(gkey);
+    if (location.hash.includes('share')) { setTab('shares'); openShare('sh1'); }
+    if (location.hash.includes('locked')) { setTab('shares'); openShare('sh2'); }
+    if (location.hash.includes('poll')) openPoll(location.hash.includes('poll-closed') ? 'pl0' : 'pl2');
     if (location.hash.includes('batch')) {
       showBatch(['C:\\Projeler\\Sunum_v4.pptx', 'C:\\Projeler\\Marka Kiti', 'D:\\Render\\final_cut.mp4'], ['p1', 'p2']);
     }
@@ -1450,6 +2253,50 @@ function createPreviewApi() {
     invoke: async (cmd, args = {}) => {
       if (cmd === 'get_snapshot') return location.hash.includes('empty') ? { ...snap, peers: [], transfers: [], conversations: [] } : snap;
       if (cmd === 'chat_history') return structuredClone(history[args.fingerprint] || []);
+      if (cmd === 'share_files') return structuredClone(shareFilesMock[args.id] || []);
+      if (cmd === 'share_unlock') {
+        if (args.password !== '1234') throw 'Şifre yanlış';
+        const s = snap.shares.find((x) => x.id === args.id);
+        s.canAccess = true;
+        setTimeout(() => emit('shares', structuredClone(snap.shares)), 50);
+        return null;
+      }
+      if (cmd === 'share_create') {
+        const s = { id: `sh${Date.now()}`, name: args.name.trim(), admin: me, members: [{ fingerprint: me, name: 'Nur' }],
+          protected: !!args.password, canAccess: true, left: false, deleted: false, dir: `C:\\Ortak\\${args.name}`, fileCount: 0, totalSize: 0, syncing: 0 };
+        snap.shares.push(s);
+        setTimeout(() => emit('shares', structuredClone(snap.shares)), 50);
+        return s;
+      }
+      if (cmd === 'set_avatar') return null;
+      if (cmd === 'poll_vote') {
+        const p = snap.polls.find((x) => x.id === args.id);
+        p.ballots = p.ballots.filter((b) => b.fingerprint !== me).concat([{ fingerprint: me, option: args.option }]);
+        tallyMock(p);
+        p.myVote = args.option;
+        if (p.anonymous) p.ballots = p.ballots; // önizleme: gizli oylamada da yerel sayım
+        setTimeout(() => emit('polls', structuredClone(snap.polls)), 30);
+        return null;
+      }
+      if (cmd === 'poll_close') {
+        const p = snap.polls.find((x) => x.id === args.id);
+        p.closed = true; p.canVote = false;
+        setTimeout(() => emit('polls', structuredClone(snap.polls)), 30);
+        return null;
+      }
+      if (cmd === 'poll_create') {
+        const p = { id: `pl${Date.now()}`, owner: me, ownerName: 'Nur', question: args.question, options: args.options,
+          voters: [...(args.includeMe ? [{ fingerprint: me, name: 'Nur' }] : []), ...args.voters.map((f) => ({ fingerprint: f, name: snap.peers.find((x) => x.fingerprint === f)?.name || 'Kişi' }))],
+          anonymous: args.anonymous, closed: false, rev: 1, createdAt: Date.now(), counts: args.options.map(() => 0), voted: [], ballots: [],
+          myVote: null, votePending: false, canVote: args.includeMe, isOwner: true, seen: true };
+        snap.polls.unshift(p);
+        return structuredClone(p);
+      }
+      if (cmd === 'poll_remove') {
+        snap.polls = snap.polls.filter((x) => x.id !== args.id);
+        setTimeout(() => emit('polls', structuredClone(snap.polls)), 30);
+        return null;
+      }
       if (cmd === 'send_paths') return args.peerIds;
       if (cmd === 'chat_send') {
         const peer = snap.peers.find((p) => p.id === args.peerId);

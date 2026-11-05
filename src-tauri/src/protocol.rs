@@ -30,6 +30,9 @@ pub struct DeviceInfo {
     /// Bu cihazın dağıtabildiği imzalı güncelleme paketinin sürümü (yoksa boş).
     #[serde(default)]
     pub pkg: String,
+    /// Profil resminin kısa özeti (yoksa boş).
+    #[serde(default)]
+    pub avatar: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +74,26 @@ pub enum Message {
     /// Üye gruptan ayrılıyor (yöneticiye gönderilir).
     GroupLeave { device: DeviceInfo, group_id: String },
     GroupAck,
+    /// Profil resmi isteği. Yanıt: AvatarData (base64) ya da AvatarNone.
+    AvatarRequest,
+    AvatarData { data: String },
+    AvatarNone,
+    /// Ortak klasör bilgisi (yalnızca yöneticiden kabul edilir). Yanıt: GroupAck / ChatReject.
+    ShareUpdate { device: DeviceInfo, share: crate::node::share::ShareInfo },
+    /// Dosya listesi alışverişi: karşı taraf kendi listesiyle yanıt verir.
+    ShareManifest { device: DeviceInfo, share_id: String, entries: Vec<crate::node::share::ShareEntry> },
+    /// Dosya isteği. Yanıt: ShareFileHeader + ham baytlar ya da ChatReject.
+    ShareFetch { device: DeviceInfo, share_id: String, path: String },
+    ShareFileHeader { entry: crate::node::share::ShareEntry },
+    /// Şifreli klasörün kilidini açma (yöneticiye, TLS içinde).
+    ShareUnlock { device: DeviceInfo, share_id: String, password: String },
+    ShareUnlockResult { ok: bool, message: String },
+    ShareLeave { device: DeviceInfo, share_id: String },
+    /// Oylama (yalnızca sahibinden kabul edilir). Yanıt: PollAck / ChatReject.
+    PollUpdate { device: DeviceInfo, poll: crate::node::poll::Poll, owner_name: String },
+    /// Oy (yalnızca oylamanın sahibine gönderilir). Yanıt: PollAck / ChatReject.
+    PollVote { device: DeviceInfo, poll_id: String, option: u32 },
+    PollAck,
     /// Güncelleme paketi isteği. Yanıt: UpdateOffer + ham paket baytları ya da UpdateNone.
     UpdateRequest,
     UpdateOffer { header: crate::update::PackageHeader },

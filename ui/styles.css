@@ -175,7 +175,7 @@ a { color: var(--accent); }
 .chat-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); }
 .chat-who { flex: 1; min-width: 0; }
 .chat-name { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.chat-status { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 5px; }
+.chat-status { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 5px; white-space: nowrap; overflow: hidden; }
 .chat-status.on { color: var(--success); }
 #chat-block.on { color: var(--danger); }
 .messages { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 3px; user-select: text; }
@@ -231,6 +231,84 @@ a { color: var(--accent); }
 .recip .off { font-size: 11.5px; color: var(--muted); }
 @keyframes flash { 0%, 100% { box-shadow: none; } 30% { box-shadow: 0 0 0 3px var(--accent); } }
 .transfer.flash { animation: flash 1.4s ease-out 2; }
+
+/* ─── Profil resimleri ─── */
+.avatar { overflow: hidden; }
+.avatar > img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; display: block; }
+.peer .avatar { overflow: visible; }
+.peer .avatar > img { position: absolute; inset: 0; }
+.avatar.xs { width: 22px; height: 22px; font-size: 10px; color: #fff; font-weight: 700; display: grid; place-items: center; border-radius: 50%; }
+.avatar-edit { display: flex; align-items: center; gap: 14px; }
+.avatar-edit .avatar { width: 64px; height: 64px; font-size: 22px; }
+.preset-grid { display: grid; grid-template-columns: repeat(10, 1fr); gap: 6px; margin-top: 10px; }
+.preset {
+  padding: 0; border: 2px solid transparent; border-radius: 50%; background: var(--surface-2);
+  aspect-ratio: 1; overflow: hidden; cursor: pointer; transition: transform .1s, border-color .1s;
+}
+.preset img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.preset:hover { border-color: var(--accent); transform: scale(1.08); }
+
+/* ─── Ortak klasörler ─── */
+.avatar.folder { border-radius: 10px; }
+.avatar.folder svg { width: 18px; height: 18px; color: #fff; }
+.share-body { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.share-tools { display: flex; gap: 6px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.share-tools .input { padding: 6px 10px; font-size: 13px; }
+.share-files { flex: 1; overflow-y: auto; padding: 6px 8px; }
+.sfile {
+  display: grid; grid-template-columns: 30px 1fr auto; gap: 0 10px; align-items: center;
+  padding: 7px 8px; border-radius: 10px; cursor: pointer;
+}
+.sfile:hover { background: var(--surface-2); }
+.sfile .ficon { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent); }
+.sfile .ficon svg { width: 15px; height: 15px; }
+.sfile .fname { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sfile .fdir { color: var(--muted); font-weight: 500; }
+.sfile .fmeta { color: var(--muted); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sfile .fact { opacity: 0; }
+.sfile:hover .fact { opacity: 1; }
+.share-locked { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; gap: 8px; padding: 24px; }
+.share-locked p { color: var(--muted); margin: 0 0 8px; font-size: 13px; }
+.share-locked .row { width: 100%; }
+.share-locked .err { min-height: 18px; }
+.sync-tag { font-size: 11px; font-weight: 600; color: var(--accent); }
+body.dragging #share-view:not([hidden]) .share-files { outline: 2px dashed var(--accent); outline-offset: -6px; border-radius: 12px; }
+
+/* ─── Oylamalar ─── */
+.tabs .tab { padding: 5px 9px; }
+.poll-body { flex: 1; overflow-y: auto; padding: 16px 16px 8px; }
+.poll-question { font-size: 17px; line-height: 1.35; margin-bottom: 4px; user-select: text; overflow-wrap: anywhere; }
+.poll-meta { color: var(--muted); font-size: 12.5px; margin-bottom: 14px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.poll-meta .avatar { width: 20px; height: 20px; font-size: 9px; }
+.poll-options { display: flex; flex-direction: column; gap: 8px; }
+.popt {
+  position: relative; overflow: hidden; text-align: left; font: inherit; color: var(--text);
+  border: 1.5px solid var(--border); border-radius: 12px; background: var(--surface-2);
+  padding: 10px 12px; display: grid; grid-template-columns: 20px 1fr auto; gap: 2px 10px; align-items: center;
+}
+.popt:not(:disabled) { cursor: pointer; }
+.popt:not(:disabled):hover { border-color: var(--accent); }
+.popt.mine { border-color: var(--accent); }
+.popt.winner { border-color: var(--success); }
+.popt .fill { position: absolute; inset: 0 auto 0 0; background: var(--accent-soft); z-index: 0; transition: width .3s ease; }
+.popt.winner .fill { background: var(--success-soft); }
+.popt > :not(.fill) { position: relative; z-index: 1; }
+.popt .radio { width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--muted); display: grid; place-items: center; }
+.popt.mine .radio { border-color: var(--accent); }
+.popt.mine .radio::after { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+.popt .otext { font-weight: 600; overflow-wrap: anywhere; }
+.popt .ocount { font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.popt .onames { grid-column: 2 / -1; font-size: 11.5px; color: var(--muted); }
+.poll-voters { margin-top: 14px; font-size: 12px; color: var(--muted); }
+.poll-voters .chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.chip { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px 2px 2px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); font-size: 11.5px; color: var(--text); }
+.chip .avatar { width: 18px; height: 18px; font-size: 8px; }
+.chip.done { border-color: color-mix(in srgb, var(--success) 45%, var(--border)); }
+.poll-foot { padding: 10px 14px 14px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); }
+.poll-foot .spacer { flex: 1; }
+.badge.vote { background: var(--accent); color: #fff; }
+.opt-row { display: flex; gap: 6px; margin-bottom: 6px; }
+.opt-row .input { flex: 1; }
 
 /* ─── Kart üzerindeki mesaj butonu ─── */
 .peer .actions .chat-btn { flex: 0 0 auto; width: 38px; padding: 0; position: relative; }
