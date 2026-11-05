@@ -11,9 +11,16 @@ Aynı ağa (Wi-Fi veya ethernet) bağlı bilgisayarlar birbirini otomatik bulur.
 - **Onay penceresi.** Gelen her gönderim için kimden geldiği, dosya listesi ve toplam boyut gösterilir. Kabul veya red seçilir.
 - **Güvenilir cihazlar.** "Bir daha sorma" işaretlenen cihazlardan gelen dosyalar otomatik kabul edilir.
 - **Uçtan uca şifreleme.** Bağlantı karşılıklı TLS 1.3 ile kurulur. Her cihazın kendi sertifikası vardır ve kimlik, sertifika parmak iziyle doğrulanır.
-- **Hız.** Dosyalar sarmalanmadan, 1 MB'lık bloklar halinde akıtılır. Gigabit ethernette hattın sınırına (~110 MB/sn) kadar çıkar.
+- **Hız.** Disk ve ağ birbirini beklemez: dosyalar ayrı bir iş parçacığında okunur, özetlenir ve sıkıştırılır. Alıcıda büyük dosyalar ayrı bir yazıcıya, küçük dosyalar (≤256 KB) 8 paralel yazıcıya gider. Ağ sınırı olmadan (aynı bilgisayarda) tek dosyada ~900 MB/sn ölçüldü; gigabit ethernette hat sınırı (~110 MB/sn), 2,5/10 GbE'de disk sınırı belirleyicidir.
+- **Akıllı sıkıştırma.** Metin, log, CSV, kaynak kod gibi dosyalar blok blok zstd ile sıkıştırılarak gider. Zip, video, fotoğraf, Office belgeleri gibi zaten sıkıştırılmış biçimler ve sıkışmadığı görülen dosyalar olduğu gibi gider. Ayarlardan kapatılabilir.
+- **Duraklat / devam ettir.** Süren bir gönderim duraklatılabilir. Alıcıdaki yarım dosyalar korunur; devam ettirince (uygulama kapatılıp açılsa bile) kaldığı yerden sürer.
+- **Hız sınırı.** Ayarlardan bu bilgisayarın toplam gönderim hızı sınırlanabilir (ör. 10 MB/sn), böylece büyük gönderimler ofis ağını tıkamaz.
 - **Canlı ilerleme.** Yüzde, hız ve kalan süre görünür. Aktarım her iki taraftan da iptal edilebilir.
-- **Güvenli kayıt.** Aynı isimde dosya varsa üzerine yazılmaz, `dosya (1).txt` olarak kaydedilir. Yarım kalan dosyalar silinir. `../` gibi zararlı yollar reddedilir.
+- **Kaldığı yerden devam.** Bağlantı koparsa (Wi-Fi gitti, kablo çıktı, bilgisayar uyudu) gönderen birkaç saniye arayla kendiliğinden yeniden bağlanır. Alıcı tekrar onay sormaz, aktarım kaldığı yerden sürer. İlerleme olduğu sürece denemeye devam eder; olmazsa aktarım "başarısız" olur ve "Tekrar dene" ile yine kaldığı yerden sürdürülebilir. Yarım dosyalar alıcıda 3 gün saklanır. Gönderen iptal ederse hemen silinir.
+- **Bütünlük doğrulaması.** Her dosyanın BLAKE3 özeti aktarım sırasında iki tarafta da hesaplanır ve karşılaştırılır. Diskte bozulan ya da iki deneme arasında değişen dosya kabul edilmez, yeniden gönderilir.
+- **Aktarım geçmişi.** Biten gönderim ve alımlar (son 300) uygulama kapansa da saklanır. Alınanlar "Klasörde göster", gönderilenler "Tekrar gönder" ile açılır veya yeniden gönderilir. Kayıtlar tek tek ya da topluca silinebilir.
+- **Panoyu gönder.** Cihaz kartındaki pano düğmesi veya ana ekranda **Ctrl+V**, panodakini gönderir: Gezgin'de kopyalanan dosyalar ve ekran görüntüsü dosya olarak (`Ekran görüntüsü <tarih>.png`), kısa metin mesaj olarak, 4000 karakterden uzun metin `.txt` olarak gider. Sohbette ekran görüntüsü yapıştırmak da onu o kişiye gönderir. Mesajların yanındaki düğmeyle metin tek tıkla kopyalanır.
+- **Güvenli kayıt.** Aynı isimde dosya varsa üzerine yazılmaz, `dosya (1).txt` olarak kaydedilir. Yarım dosyalar `.ffpart` uzantısıyla tutulur ve özet doğrulanmadan asıl adını almaz. `../` gibi zararlı yollar reddedilir.
 - **Sistem tepsisi.** Pencere kapatılsa da arka planda çalışmaya ve dosya almaya devam eder.
 - **IP ile ekleme.** Otomatik keşfin ulaşmadığı ağlar için cihaz adresiyle eklenebilir.
 - **Toplu gönderme.** "Toplu gönder" ile aynı dosya ve klasörler birden fazla kişiye tek seferde gönderilir. Dosyaları kartların dışındaki boş alana bırakmak da bu pencereyi açar. Her alıcı ayrıca onaylar.
@@ -107,6 +114,9 @@ FastFiles/
         ├── node.rs        Çekirdek: cihaz listesi, gönderme/alma, aktarım durumu (+ uçtan uca testler)
         ├── discovery.rs   UDP ile cihaz keşfi
         ├── protocol.rs    Mesaj formatı, güvenli yol kontrolü
+        ├── pipeline.rs    Disk tarafı: okuyucu, paralel yazıcılar, blok çerçevesi, zstd
+        ├── resume.rs      Yarıda kalan alımların kaydı (kaldığı yerden devam)
+        ├── clipboard.rs   "Panoyu gönder": dosya / ekran görüntüsü / metin
         ├── tls.rs         Sertifika parmak izi ile karşılıklı TLS
         └── config.rs      Cihaz kimliği ve ayarlar
 ```
@@ -115,8 +125,16 @@ FastFiles/
 
 1. Her cihaz 2,5 saniyede bir `{id, ad, port, parmak izi}` içeren bir UDP paketi yayınlar. 10 saniye duyulmayan cihaz listeden düşer.
 2. Gönderen, alıcıya TLS ile bağlanır. Alıcının sertifika parmak izi duyurulanla eşleşmezse bağlantı reddedilir.
-3. Gönderen bir `Offer` (dosya listesi ve boyutlar) yollar. Alıcı kullanıcıya sorar ve `Accept` ya da `Decline` döner.
+3. Gönderen bir `Offer` (dosya listesi, boyutlar, değişiklik zamanları ve desteklediği özellikler) yollar. Alıcı kullanıcıya sorar ve `Accept` ya da `Decline` döner.
 4. Kabul edilirse dosyaların ham byte'ları sırayla akıtılır. Alıcı her dosyayı önce `.ffpart` uzantısıyla yazar, tamamlanınca yeniden adlandırır, en sonda `Done` gönderir.
+
+**Protokol v2 (`ff2` özelliği).** İki taraf da destekliyorsa:
+
+- Alıcı `Accept` içinde her dosya için elindeki bayt sayısını (`offsets`) bildirir. Gönderen yalnızca kalan kısmı akıtır. Alıcıda tamamlanmış dosyalar hiç gönderilmez.
+- Veri en fazla 1 MB'lık bloklar halinde gider: `u32` başlık (üst bit = zstd ile sıkıştırılmış, kalan 31 bit = uzunluk) + veri. Her dosyanın blokları bitince **tüm dosyanın** 32 baytlık BLAKE3 özeti gelir. Alıcı sıkıştırılmış bloğu en fazla dosyanın kalan boyutu kadar açar; "sıkıştırma bombası" belleği şişiremez.
+- Alıcı her kabulü `resume.json`'a yazar. Kayıtta gönderenin parmak izi, aktarım kimliği ve dosya listesinin özeti bulunur. Aynı parmak izinden aynı aktarım aynı dosya listesiyle tekrar gelirse onay sorulmaz. Başka bir cihaz bu kaydı kullanamaz.
+- Gönderen iptal ederse alıcıya ayrı bir bağlantıyla `Abort` gönderir ve alıcı yarım dosyaları siler. Duraklatırsa `PauseNotice` gönderir; yarım dosyalar korunur.
+- Eski sürümler bu alanları yok sayar ve aktarım eski yöntemle sürer.
 
 ## Geliştirme
 
@@ -137,6 +155,14 @@ Testleri çalıştırmak için (iki sanal cihaz arasında gerçek TLS aktarımı
 ```bash
 cargo test
 ```
+
+Hız ölçümleri (aynı bilgisayarda iki sanal cihaz; sürüm derlemesiyle):
+
+```bash
+cargo test --release bench_ -- --ignored --nocapture --test-threads=1
+```
+
+> Not: Çok sayıda küçük dosyada Windows Defender her yeni dosyayı taradığı için alıcıdaki hız genellikle tarama hızıyla sınırlıdır (bu makinede ~550 dosya/sn). Tarama önbellekteyken ölçülen yazılım hızı ~2.000 dosya/sn'dir.
 
 Kurulum dosyası üretmek için. Çıktı `src-tauri/target/release/bundle/nsis/` altına yazılır:
 
