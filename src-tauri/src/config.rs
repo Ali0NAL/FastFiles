@@ -72,6 +72,10 @@ pub struct Settings {
     pub onboarded: bool,
     /// En son çalışan sürüm ("güncellendi" bildirimi için).
     pub last_version: String,
+    /// Uygun dosyalar gönderilirken zstd ile sıkıştırılsın mı (metin, log, kaynak kod...).
+    pub compress: bool,
+    /// Toplam gönderim hızı sınırı (MB/sn). 0 = sınırsız.
+    pub speed_limit_mb: u32,
 }
 
 impl Default for Settings {
@@ -85,6 +89,8 @@ impl Default for Settings {
             manual_peers: Vec::new(),
             onboarded: false,
             last_version: String::new(),
+            compress: true,
+            speed_limit_mb: 0,
         }
     }
 }

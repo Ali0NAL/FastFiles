@@ -3,6 +3,7 @@ mod clipboard;
 mod config;
 mod discovery;
 mod node;
+mod pipeline;
 mod protocol;
 mod resume;
 mod tls;
@@ -54,6 +55,8 @@ fn update_settings(
     download_dir: Option<String>,
     close_to_tray: Option<bool>,
     onboarded: Option<bool>,
+    compress: Option<bool>,
+    speed_limit_mb: Option<u32>,
 ) -> Result<Settings, String> {
     if let Some(name) = &device_name {
         if name.trim().is_empty() {
@@ -75,6 +78,12 @@ fn update_settings(
         }
         if let Some(v) = onboarded {
             s.onboarded = v;
+        }
+        if let Some(v) = compress {
+            s.compress = v;
+        }
+        if let Some(v) = speed_limit_mb {
+            s.speed_limit_mb = v.min(10_000);
         }
     }))
 }
@@ -159,6 +168,12 @@ fn cancel_transfer(node: NodeState, id: String) {
 #[tauri::command]
 fn clear_finished(node: NodeState) -> Vec<Transfer> {
     node.clear_finished()
+}
+
+/// Gönderimi duraklatır; `retry_transfer` ile kaldığı yerden devam eder.
+#[tauri::command]
+fn pause_transfer(node: NodeState, id: String) -> Result<(), String> {
+    node.pause_transfer(&id)
 }
 
 #[tauri::command]
@@ -565,6 +580,7 @@ pub fn run() {
             clear_finished,
             remove_transfer,
             retry_transfer,
+            pause_transfer,
             send_clipboard,
             add_manual_peer,
             forget_manual_peer,

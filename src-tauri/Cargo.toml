@@ -34,6 +34,8 @@ hex = "0.4"
 walkdir = "2"
 # Dosya bütünlüğü doğrulaması (aktarım sırasında akış halinde hesaplanır).
 blake3 = "1"
+# Sıkıştırılabilir dosyalarda blok blok sıkıştırma (metin, log, CSV, kaynak kod...).
+zstd = "0.13"
 # "Panoyu gönder": metin, ekran görüntüsü ve kopyalanan dosyalar.
 arboard = "3"
 png = "0.18"

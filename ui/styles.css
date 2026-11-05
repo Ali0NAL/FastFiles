@@ -389,7 +389,9 @@ body.dragging .peer.drop-target .drop-label { display: grid; }
 .transfer .status .sp { white-space: nowrap; flex-shrink: 0; }
 .transfer.done .status .st { color: var(--success); font-weight: 600; }
 .transfer.failed .status .st, .transfer.declined .status .st { color: var(--danger); font-weight: 600; }
-.transfer.cancelled .status .st { color: var(--warn); font-weight: 600; }
+.transfer.cancelled .status .st, .transfer.paused .status .st { color: var(--warn); font-weight: 600; }
+.transfer.paused .bar i { background: var(--warn); opacity: .7; }
+select.input { cursor: pointer; }
 .transfer.done .bar, .transfer.failed .bar, .transfer.declined .bar, .transfer.cancelled .bar { display: none; }
 
 /* ─── Sürükleme katmanı ─── */
@@ -436,7 +438,7 @@ body.dragging .drop-overlay { display: block; }
 .row .input { flex: 1; }
 .path { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
 .check { display: flex; align-items: center; gap: 10px; cursor: pointer; padding: 6px 0; }
-.check input { width: 17px; height: 17px; accent-color: var(--accent); margin: 0; }
+.check input { width: 17px; height: 17px; accent-color: var(--accent); margin: 0; flex-shrink: 0; }
 .err { color: var(--danger); font-size: 13px; min-height: 18px; margin-top: 6px; }
 .sep { border: 0; border-top: 1px solid var(--border); margin: 18px 0; }
 .fp { font-family: ui-monospace, Consolas, monospace; font-size: 12px; letter-spacing: .5px; color: var(--muted); }

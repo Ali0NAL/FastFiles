@@ -8,6 +8,7 @@ mod group;
 
 use crate::chat::{ChatMessage, ChatStore, ConversationSummary, MsgStatus};
 use crate::config::{fingerprint, Identity, Settings, TrustedDevice};
+use crate::pipeline;
 use crate::protocol::*;
 use crate::resume::{files_signature, ResumeEntry, ResumeStore};
 use crate::tls;
@@ -29,7 +30,6 @@ use tokio_util::sync::CancellationToken;
 
 pub type Emitter = Arc<dyn Fn(&str, Value) + Send + Sync>;
 
-const CHUNK: usize = 1024 * 1024;
 const PEER_TTL: Duration = Duration::from_secs(10);
 const DECISION_TIMEOUT: Duration = Duration::from_secs(120);
 const EMIT_INTERVAL: Duration = Duration::from_millis(150);
@@ -79,6 +79,8 @@ pub enum Status {
     Declined,
     Cancelled,
     Failed,
+    /// Gönderen duraklattı; devam ettirilince kaldığı yerden sürer.
+    Paused,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +116,9 @@ pub struct Transfer {
     /// Kaldığı yerden devam edildi mi (arayüzde bilgi olarak gösterilir).
     #[serde(default)]
     pub resumed: bool,
+    /// Karşı taraf kaldığı yerden devamı destekliyor: duraklatılabilir.
+    #[serde(default)]
+    pub resumable: bool,
     #[serde(skip)]
     last_emit: Option<Instant>,
     #[serde(skip)]
@@ -149,6 +154,7 @@ impl Transfer {
             finished_at: None,
             sources: Vec::new(),
             resumed: false,
+            resumable: false,
             last_emit: None,
             sample: None,
         }
@@ -205,6 +211,10 @@ pub struct Node {
     interrupts: Mutex<HashMap<String, CancellationToken>>,
     resume: Mutex<ResumeStore>,
     clip_dir: PathBuf,
+    /// Duraklatılması istenen gönderimler.
+    pauses: Mutex<HashSet<String>>,
+    /// Gönderim hız sınırı için jeton kovası: (son güncelleme, jeton).
+    bucket: Mutex<(Instant, f64)>,
     pending: Mutex<HashMap<String, oneshot::Sender<Decision>>>,
     emit: Emitter,
     acceptor: TlsAcceptor,
@@ -252,6 +262,8 @@ impl Node {
             interrupts: Mutex::new(HashMap::new()),
             resume: Mutex::new(resume),
             clip_dir: config_dir.join("clipboard"),
+            bucket: Mutex::new((Instant::now(), 0.0)),
+            pauses: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
             emit,
             acceptor,
@@ -814,9 +826,27 @@ impl Node {
     }
 
     pub fn cancel_transfer(&self, id: &str) {
+        self.pauses.lock().unwrap().remove(id);
         if let Some(tok) = self.cancels.lock().unwrap().get(id) {
             tok.cancel();
         }
+    }
+
+    /// Gönderimi duraklatır: bağlantı kapanır, alıcıdaki yarım dosyalar korunur.
+    /// Devam ettirmek için `retry_transfer`.
+    pub fn pause_transfer(&self, id: &str) -> Result<(), String> {
+        let t = self.transfers.lock().unwrap().get(id).cloned().ok_or("Aktarım bulunamadı")?;
+        if t.direction != Direction::Send || t.is_finished() {
+            return Err("Bu aktarım duraklatılamaz".into());
+        }
+        if !t.resumable {
+            return Err("Alıcının FastFiles sürümü duraklatmayı desteklemiyor".into());
+        }
+        self.pauses.lock().unwrap().insert(id.to_string());
+        if let Some(tok) = self.cancels.lock().unwrap().get(id) {
+            tok.cancel();
+        }
+        Ok(())
     }
 
     pub fn clear_finished(&self) -> Vec<Transfer> {
@@ -918,13 +948,20 @@ impl Node {
                 device.name = sanitize_name(&device.name);
                 let offer = IncomingOffer {
                     transfer_id,
-                    resume: features.iter().any(|f| f == FEATURE_RESUME),
+                    resume: features.iter().any(|f| f == FEATURE_V2),
                     files,
                     total,
                 };
                 self.receive(rd, wr, addr.ip(), device, offer).await
             }
             Message::UpdateRequest => self.serve_update(&mut wr).await,
+            Message::PauseNotice { device, transfer_id } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                self.pause_receive(&client_fp, &transfer_id).await;
+                write_msg(&mut wr, &Message::AbortAck).await.map_err(|e| e.to_string())
+            }
             Message::Abort { device, transfer_id } => {
                 if device.fingerprint != client_fp {
                     return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
@@ -1139,7 +1176,7 @@ impl Node {
         }
 
         let accept = if resume {
-            Message::Accept { features: vec![FEATURE_RESUME.into()], offsets: offsets.clone() }
+            Message::Accept { features: vec![FEATURE_V2.into()], offsets: offsets.clone() }
         } else {
             Message::Accept { features: vec![], offsets: vec![] }
         };
@@ -1171,71 +1208,58 @@ impl Node {
             self.notify(&format!("{} dosya gönderiyor", device.name), &summary, Some(&id));
         }
 
-        // ── Veri akışı ──
+        // ── Veri akışı: ağ bu görevde okunur, disk yazımı ayrı iş parçacıklarında yapılır ──
         const LOST: &str = "Gönderen iptal etti veya bağlantı koptu";
-        let mut current_part: Option<PathBuf> = None;
+        let sink = pipeline::DiskSink::new();
+        let sink_handle = sink.handle();
+        let mut rd = tokio::io::BufReader::with_capacity(256 * 1024, rd);
         let result = {
             let work = async {
-                let mut buf = vec![0u8; CHUNK];
+                let mut dec = zstd::bulk::Decompressor::new().map_err(|e| e.to_string())?;
                 for (i, ((parts, size), target)) in sanitized.iter().zip(&targets).enumerate() {
                     let offset = offsets[i];
                     if resume && *size > 0 && offset >= *size {
                         continue; // önceki denemede tamamlanmış
                     }
-                    if let Some(parent) = target.parent() {
-                        tokio::fs::create_dir_all(parent)
-                            .await
-                            .map_err(|e| format!("Klasör oluşturulamadı: {e}"))?;
+                    if let Some(e) = sink.error() {
+                        return Err(e);
                     }
-                    let part = part_path(target);
-                    current_part = Some(part.clone());
-                    self.set_current_file(&id, &parts.join("/"));
-
-                    let mut hasher = prefix_hashers.remove(&i).unwrap_or_default();
-                    let file = if offset > 0 {
-                        open_at(&part, offset).await
-                    } else {
-                        tokio::fs::File::create(&part).await
-                    }
-                    .map_err(|e| format!("Dosya oluşturulamadı ({}): {e}", target.display()))?;
-                    let mut w = BufWriter::with_capacity(CHUNK, file);
-                    let mut remaining = *size - offset;
+                    let name = parts.join("/");
+                    self.set_current_file(&id, &name);
+                    let remaining = *size - offset;
+                    let t = pipeline::Target {
+                        name,
+                        part: part_path(target),
+                        target: target.clone(),
+                        offset,
+                        prefix: resume.then(|| prefix_hashers.remove(&i).unwrap_or_default()),
+                    };
                     // Gönderen, devam eden dosyanın baştaki kısmını önce okuyup özetler;
                     // ilk baytı beklerken bu süre de hesaba katılır (≥ 40 MB/sn varsayımı).
-                    let mut wait = STALL_TIMEOUT + Duration::from_secs(offset / (40 * 1024 * 1024));
-                    while remaining > 0 {
-                        let want = remaining.min(CHUNK as u64) as usize;
-                        let n = match timeout(wait, rd.read(&mut buf[..want])).await {
-                            Ok(Ok(n)) if n > 0 => n,
-                            _ => return Err(LOST.to_string()),
-                        };
-                        wait = STALL_TIMEOUT;
-                        if resume {
-                            hasher.update(&buf[..n]);
+                    let first_wait = STALL_TIMEOUT + Duration::from_secs(offset / (40 * 1024 * 1024));
+                    let body_err = |e: pipeline::BodyError| match e {
+                        pipeline::BodyError::Lost => LOST.to_string(),
+                        pipeline::BodyError::Protocol(e) => e,
+                    };
+                    let mut body = pipeline::Body::new(remaining, resume, first_wait, STALL_TIMEOUT);
+                    if offset == 0 && remaining <= pipeline::SMALL_FILE {
+                        // Küçük dosya: bellekte toplanır, paralel yazıcılardan birine verilir.
+                        let mut data = Vec::with_capacity(remaining as usize);
+                        while let Some(c) = body.next(&mut rd, &mut dec).await.map_err(body_err)? {
+                            self.add_progress(&id, c.len() as u64);
+                            data.extend_from_slice(&c);
                         }
-                        w.write_all(&buf[..n]).await.map_err(|e| format!("Diske yazılamadı: {e}"))?;
-                        remaining -= n as u64;
-                        self.add_progress(&id, n as u64);
+                        let expected = body.hash(&mut rd).await.map_err(body_err)?;
+                        sink.small(t, data, expected).await?;
+                    } else {
+                        sink.open_big(t).await?;
+                        while let Some(c) = body.next(&mut rd, &mut dec).await.map_err(body_err)? {
+                            self.add_progress(&id, c.len() as u64);
+                            sink.big_data(c).await?;
+                        }
+                        let expected = body.hash(&mut rd).await.map_err(body_err)?;
+                        sink.finish_big(expected).await?;
                     }
-                    w.flush().await.map_err(|e| format!("Diske yazılamadı: {e}"))?;
-                    // Windows'ta açık dosya yeniden adlandırılamaz; tutamacı kesin olarak kapat.
-                    drop(w.into_inner().into_std().await);
-                    if resume {
-                        let mut expected = [0u8; HASH_LEN];
-                        match timeout(wait, rd.read_exact(&mut expected)).await {
-                            Ok(Ok(_)) => {}
-                            _ => return Err(LOST.to_string()),
-                        }
-                        if hasher.finalize().as_bytes() != &expected {
-                            remove_with_retry(&part).await;
-                            current_part = None;
-                            return Err(format!("{} bozuk geldi (doğrulama başarısız)", parts.join("/")));
-                        }
-                    }
-                    tokio::fs::rename(&part, target)
-                        .await
-                        .map_err(|e| format!("Dosya kaydedilemedi: {e}"))?;
-                    current_part = None;
                 }
                 Ok::<(), String>(())
             };
@@ -1245,10 +1269,21 @@ impl Node {
                 _ = interrupt.cancelled() => Err(RecvError::Interrupted),
             }
         };
+        // Diske yazımların bitmesini bekle (başarıda doğrulama hataları da burada çıkar).
+        let result = match result {
+            Ok(()) => sink.finish().await.map(|_| ()).map_err(RecvError::Failed),
+            Err(e) => {
+                if !matches!(e, RecvError::Interrupted) {
+                    sink_handle.abort();
+                }
+                sink.close().await;
+                Err(e)
+            }
+        };
 
-        // Kopan bağlantıda yarım dosya saklanır (devam için); diğer hatalarda silinir.
+        // Kopan bağlantıda yarım dosyalar saklanır (devam için); diğer hatalarda silinir.
         if matches!(result, Err(RecvError::Cancelled) | Err(RecvError::Failed(_))) {
-            if let Some(p) = current_part.take() {
+            for p in sink_handle.in_flight() {
                 remove_with_retry(&p).await;
             }
         }
@@ -1303,6 +1338,20 @@ impl Node {
     }
 
     /// Gönderen, yarıda kalan aktarımı iptal etti: yarım dosyalar ve devam kaydı silinir.
+    /// Gönderen duraklattı: yarım dosyalar ve devam kaydı korunur, kayıt "duraklatıldı" olur.
+    async fn pause_receive(&self, fp: &str, transfer_id: &str) {
+        let entry = self.resume.lock().unwrap().find_by_id(fp, transfer_id);
+        let Some(entry) = entry else { return };
+        self.interrupt_receive(&entry.local_id).await;
+        self.update_transfer(&entry.local_id, |t| {
+            if t.status == Status::Failed {
+                t.status = Status::Paused;
+                t.error = Some("Gönderen duraklattı · devam ettirdiğinde kaldığı yerden sürecek".into());
+            }
+        });
+        self.save_history();
+    }
+
     async fn abort_receive(&self, fp: &str, transfer_id: &str) {
         let entry = self.resume.lock().unwrap().find_by_id(fp, transfer_id);
         let Some(entry) = entry else { return };
@@ -1312,7 +1361,7 @@ impl Node {
             remove_with_retry(&p).await;
         }
         self.update_transfer(&entry.local_id, |t| {
-            if t.status == Status::Failed {
+            if matches!(t.status, Status::Failed | Status::Paused) {
                 t.status = Status::Cancelled;
                 t.error = Some("Gönderen iptal etti".into());
             }
@@ -1627,11 +1676,15 @@ impl Node {
                     };
                     node.finish_transfer(&tid, Status::Declined, msg)
                 }
+                Ok(SendOutcome::Cancelled) if node.pauses.lock().unwrap().remove(&tid) => {
+                    node.finish_transfer(&tid, Status::Paused, None);
+                    node.send_notice(&peer, Message::PauseNotice { device: node.device_info(), transfer_id: tid.clone() }).await;
+                }
                 Ok(SendOutcome::Cancelled) => {
                     node.finish_transfer(&tid, Status::Cancelled, None);
                     // Alıcıda bekleyen yarım dosyalar boşuna yer kaplamasın.
                     if resumable {
-                        node.send_abort(&peer, &tid).await;
+                        node.send_notice(&peer, Message::Abort { device: node.device_info(), transfer_id: tid.clone() }).await;
                     }
                 }
                 Ok(SendOutcome::PeerCancelled) => node.finish_transfer(
@@ -1645,9 +1698,28 @@ impl Node {
         id
     }
 
-    async fn send_abort(&self, peer: &Peer, transfer_id: &str) {
+    /// Ayarlardaki hız sınırını tüm gönderimler için ortak uygular.
+    async fn throttle(&self, n: usize) {
+        let limit = self.settings.lock().unwrap().speed_limit_mb as f64 * 1024.0 * 1024.0;
+        if limit <= 0.0 {
+            return;
+        }
+        let wait = {
+            let mut b = self.bucket.lock().unwrap();
+            let now = Instant::now();
+            // En fazla çeyrek saniyelik birikim: duraklamadan sonra ani patlama olmasın.
+            let tokens = (b.1 + now.duration_since(b.0).as_secs_f64() * limit).min(limit / 4.0) - n as f64;
+            *b = (now, tokens);
+            if tokens < 0.0 { Duration::from_secs_f64(-tokens / limit) } else { Duration::ZERO }
+        };
+        if !wait.is_zero() {
+            sleep(wait).await;
+        }
+    }
+
+    /// Alıcıya kısa bir bildirim (iptal/duraklatma) gönderir.
+    async fn send_notice(&self, peer: &Peer, msg: Message) {
         let Ok(mut s) = self.connect(&self.candidates(peer), Some(peer.fingerprint.clone())).await else { return };
-        let msg = Message::Abort { device: self.device_info(), transfer_id: transfer_id.to_string() };
         if write_msg(&mut s, &msg).await.is_ok() {
             let _ = timeout(Duration::from_secs(10), read_msg(&mut s)).await;
         }
@@ -1705,7 +1777,7 @@ impl Node {
             device: self.device_info(),
             files,
             total,
-            features: vec![FEATURE_RESUME.into()],
+            features: vec![FEATURE_V2.into()],
         };
         write_msg(&mut wr, &offer).await.map_err(|e| lost(format!("Teklif gönderilemedi: {e}")))?;
 
@@ -1721,7 +1793,7 @@ impl Node {
             Message::Decline { reason } => return Ok(SendOutcome::Declined(reason)),
             _ => return Err("Beklenmeyen yanıt".to_string().into()),
         };
-        let resume = features.iter().any(|f| f == FEATURE_RESUME);
+        let resume = features.iter().any(|f| f == FEATURE_V2);
         let offsets = if resume {
             if offsets.len() != entries.len() || offsets.iter().zip(entries.iter()).any(|(o, e)| *o > e.1.size) {
                 return Err("Alıcı geçersiz devam noktası bildirdi".to_string().into());
@@ -1739,59 +1811,50 @@ impl Node {
             t.done = already;
             t.error = None;
             t.resumed |= already > 0;
+            t.resumable = resume;
         });
 
+        // Diskten okuma, özet ve sıkıştırma ayrı iş parçacığında; bu görev yalnızca ağa yazar.
+        let jobs: Vec<pipeline::ReadJob> = entries
+            .iter()
+            .zip(&offsets)
+            .filter(|((_, e), o)| !(resume && e.size > 0 && **o >= e.size)) // alıcıda zaten tamam
+            .map(|((src, e), o)| pipeline::ReadJob { src: src.clone(), name: e.path.clone(), size: e.size, offset: *o })
+            .collect();
+        let names: Vec<String> = jobs.iter().map(|j| j.name.clone()).collect();
+        let mode = pipeline::Mode { v2: resume, compress: self.settings().compress };
+        let mut pieces = pipeline::spawn_reader(jobs, mode);
+
         let writer = async {
-            let mut buf = vec![0u8; CHUNK];
-            for ((src, entry), &offset) in entries.iter().zip(&offsets) {
-                if resume && entry.size > 0 && offset >= entry.size {
-                    continue; // alıcıda zaten tamam
-                }
-                self.set_current_file(id, &entry.path);
-                let changed = || SendError::from(format!("{} gönderim sırasında değişti", entry.path));
-                let mut f = tokio::fs::File::open(src)
-                    .await
-                    .map_err(|e| SendError::from(format!("{} açılamadı: {e}", entry.path)))?;
-                let mut hasher = blake3::Hasher::new();
-                // Alıcıda bulunan baştaki kısım gönderilmez ama tüm dosyanın özeti için okunur.
-                let mut skip = offset;
-                while skip > 0 {
-                    let want = skip.min(CHUNK as u64) as usize;
-                    let n = f.read(&mut buf[..want]).await.map_err(|e| SendError::from(format!("{} okunamadı: {e}", entry.path)))?;
-                    if n == 0 {
-                        return Err(changed());
+            // Küçük dosyaların baytları tek tek paket olmasın: tampon dolunca ya da okuyucu
+            // beklerken (kanal boşken) ağa boşaltılır.
+            let mut out = tokio::io::BufWriter::with_capacity(512 * 1024, &mut wr);
+            let stalled = || lost("Bağlantı koptu".into());
+            loop {
+                let piece = match pieces.try_recv() {
+                    Ok(p) => p,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                        timeout(STALL_TIMEOUT, out.flush()).await.map_err(|_| stalled())?.map_err(|_| stalled())?;
+                        match pieces.recv().await {
+                            Some(p) => p,
+                            None => break,
+                        }
                     }
-                    hasher.update(&buf[..n]);
-                    skip -= n as u64;
-                }
-                let mut remaining = entry.size - offset;
-                while remaining > 0 {
-                    let want = remaining.min(CHUNK as u64) as usize;
-                    let n = f.read(&mut buf[..want]).await.map_err(|e| SendError::from(format!("{} okunamadı: {e}", entry.path)))?;
-                    if n == 0 {
-                        return Err(changed());
-                    }
-                    if resume {
-                        hasher.update(&buf[..n]);
-                    }
-                    match timeout(STALL_TIMEOUT, wr.write_all(&buf[..n])).await {
-                        Ok(Ok(())) => {}
-                        _ => return Err(lost("Bağlantı koptu".into())),
-                    }
-                    remaining -= n as u64;
-                    self.add_progress(id, n as u64);
-                }
-                if resume {
-                    match timeout(STALL_TIMEOUT, wr.write_all(hasher.finalize().as_bytes())).await {
-                        Ok(Ok(())) => {}
-                        _ => return Err(lost("Bağlantı koptu".into())),
+                };
+                match piece.map_err(SendError::from)? {
+                    pipeline::Piece::File(i) => self.set_current_file(id, &names[i]),
+                    pipeline::Piece::Bytes { data, progress } => {
+                        timeout(STALL_TIMEOUT, out.write_all(&data)).await.map_err(|_| stalled())?.map_err(|_| stalled())?;
+                        if progress > 0 {
+                            self.add_progress(id, progress);
+                        }
+                        self.throttle(data.len()).await;
                     }
                 }
             }
-            match timeout(STALL_TIMEOUT, wr.flush()).await {
-                Ok(Ok(())) => Ok(()),
-                _ => Err(lost("Bağlantı koptu".into())),
-            }
+            timeout(STALL_TIMEOUT, out.flush()).await.map_err(|_| stalled())?.map_err(|_| stalled())?;
+            Ok::<(), SendError>(())
         };
         let reader = read_msg(&mut rd);
         tokio::pin!(writer);
@@ -1932,14 +1995,6 @@ async fn hash_prefix(path: PathBuf, len: u64) -> std::io::Result<blake3::Hasher>
     })
     .await
     .map_err(std::io::Error::other)?
-}
-
-/// Yarım dosyayı `offset` noktasından yazmaya devam etmek için açar (fazlası kesilir).
-async fn open_at(path: &Path, offset: u64) -> std::io::Result<tokio::fs::File> {
-    let mut f = tokio::fs::OpenOptions::new().write(true).open(path).await?;
-    f.set_len(offset).await?;
-    f.seek(std::io::SeekFrom::Start(offset)).await?;
-    Ok(f)
 }
 
 /// Karşı taraf habersiz kaybolursa (kablo çekildi, uyku) bağlantının kopukluğu fark edilsin.
@@ -2290,6 +2345,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pause_and_resume_continues_where_it_left_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        introduce(&alice, &bob);
+        bob.set_trusted(&alice.identity.fingerprint, "alice", true);
+        // Hız sınırı: aktarım duraklatılmadan bitmesin.
+        alice.update_settings(|s| s.speed_limit_mb = 40);
+        let src = tmp.path().join("yedek.bin");
+        let data = pattern(24 * 1024 * 1024, 11);
+        std::fs::write(&src, &data).unwrap();
+
+        let id = alice.send_one(&bob.identity.id, vec![src.to_string_lossy().into()]).await.unwrap();
+        wait_until(|| alice.transfers().iter().any(|t| t.id == id && t.resumable && t.done > 2 * 1024 * 1024)).await;
+        alice.pause_transfer(&id).unwrap();
+        assert_eq!(wait_finished(&alice, &id).await.status, Status::Paused);
+        wait_until(|| bob.transfers().iter().any(|t| t.status == Status::Paused)).await;
+        let dl = PathBuf::from(bob.settings().download_dir);
+        assert!(dl.join("yedek.bin.ffpart").exists(), "duraklatınca yarım dosya korunmalı");
+        assert!(alice.pause_transfer(&id).is_err(), "biten aktarım tekrar duraklatılamaz");
+
+        alice.update_settings(|s| s.speed_limit_mb = 0);
+        assert_eq!(alice.retry_transfer(&id).await.unwrap(), id, "devam aynı kayıtla sürmeli");
+        let t = wait_finished(&alice, &id).await;
+        assert_eq!(t.status, Status::Done, "{:?}", t.error);
+        assert!(t.resumed);
+        assert!(std::fs::read(dl.join("yedek.bin")).unwrap() == data);
+    }
+
+    #[tokio::test]
+    async fn speed_limit_is_respected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        introduce(&alice, &bob);
+        bob.set_trusted(&alice.identity.fingerprint, "alice", true);
+        alice.update_settings(|s| s.speed_limit_mb = 8);
+        let src = tmp.path().join("x.bin");
+        // Sıkıştırılamayan veri: sınır ağdan geçen bayta uygulanır.
+        std::fs::write(&src, noise(12 * 1024 * 1024, 5)).unwrap();
+        let start = Instant::now();
+        let id = alice.send_one(&bob.identity.id, vec![src.to_string_lossy().into()]).await.unwrap();
+        assert_eq!(wait_finished(&alice, &id).await.status, Status::Done);
+        // 12 MB / 8 MB/sn ≈ 1,5 sn (çeyrek saniyelik ilk birikim düşülür).
+        let secs = start.elapsed().as_secs_f64();
+        assert!(secs > 1.1, "hız sınırı uygulanmadı: {secs:.2} sn");
+    }
+
+    #[tokio::test]
     async fn corrupted_partial_file_is_detected_and_resent() {
         let tmp = tempfile::tempdir().unwrap();
         let alice = make_node(tmp.path(), "alice").await;
@@ -2379,6 +2483,134 @@ mod tests {
         let bob_rid = bob.transfers()[0].id.clone();
         assert!(bob.retry_transfer(&bob_rid).await.is_err());
         assert_eq!(alice.remove_transfer(&id).len(), 1);
+    }
+
+    /// Hız ölçümü (localhost: ağ sınırı yok, CPU/disk/dosya başına ek yükü gösterir).
+    /// Çalıştırmak için: `cargo test --release bench_ -- --ignored --nocapture --test-threads=1`
+    async fn bench_run(name: &str, prepare: impl FnOnce(&Path) -> Vec<String>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        introduce(&alice, &bob);
+        bob.set_trusted(&alice.identity.fingerprint, "alice", true);
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let paths = prepare(&src);
+        // Yeni oluşturulan kaynak dosyaları virüs tarayıcısı arka planda tarar; ölçümü bozmasın.
+        if let Ok(w) = std::env::var("FF_BENCH_SETTLE") {
+            sleep(Duration::from_secs(w.parse().unwrap_or(0))).await;
+        }
+        let start = Instant::now();
+        let id = alice.send_paths(&[bob.identity.id.clone()], paths).await.unwrap().remove(0);
+        let mut t;
+        loop {
+            t = alice.transfers().into_iter().find(|t| t.id == id).unwrap();
+            if t.is_finished() {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        let secs = start.elapsed().as_secs_f64();
+        assert_eq!(t.status, Status::Done, "{:?}", t.error);
+        println!(
+            "[bench] {name}: {} dosya, {} → {:.2} sn, {:.0} MB/sn, {:.0} dosya/sn",
+            t.file_count,
+            fmt_bytes(t.total),
+            secs,
+            t.total as f64 / secs / 1e6,
+            t.file_count as f64 / secs
+        );
+    }
+
+    fn noise(len: usize, mut x: u64) -> Vec<u8> {
+        let mut v = Vec::with_capacity(len);
+        while v.len() < len {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        v.truncate(len);
+        v
+    }
+
+    /// Diskin dosya oluşturma tavanı: tek iş parçacığı ve paralel.
+    #[test]
+    #[ignore]
+    fn bench_disk_create_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let direct = std::env::var("FF_DIRECT").is_ok();
+        for threads in [1usize, 8] {
+            let dir = tmp.path().join(format!("t{threads}"));
+            for d in 0..200 {
+                std::fs::create_dir_all(dir.join(format!("d{d}"))).unwrap();
+            }
+            let start = Instant::now();
+            std::thread::scope(|s| {
+                for t in 0..threads {
+                    let dir = &dir;
+                    s.spawn(move || {
+                        for i in (t..20_000).step_by(threads) {
+                            let target = dir.join(format!("d{}", i % 200)).join(format!("f{i}.txt"));
+                            let data = noise(4096, i as u64 + 1); // benzersiz içerik
+                            if direct {
+                                std::fs::write(&target, &data).unwrap();
+                            } else {
+                                let part = target.with_extension("txt.ffpart");
+                                std::fs::write(&part, &data).unwrap();
+                                std::fs::rename(&part, &target).unwrap();
+                            }
+                        }
+                    });
+                }
+            });
+            println!("[bench] disk tavanı, {threads} iş parçacığı: {:.0} dosya/sn", 20_000.0 / start.elapsed().as_secs_f64());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn bench_big_file() {
+        bench_run("tek büyük dosya", |dir| {
+            let p = dir.join("buyuk.bin");
+            std::fs::write(&p, noise(1024 * 1024 * 1024, 42)).unwrap();
+            vec![p.to_string_lossy().into()]
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn bench_small_files() {
+        bench_run("çok küçük dosya", |dir| {
+            let root = dir.join("proje");
+            for i in 0..20_000u64 {
+                let d = root.join(format!("d{}", i % 200));
+                std::fs::create_dir_all(&d).unwrap();
+                // FF_BENCH_SAME: aynı içerik (virüs tarayıcısı önbellekten geçer → saf yazılım hızı).
+                let seed = if std::env::var("FF_BENCH_SAME").is_ok() { 1 } else { i + 1 };
+                std::fs::write(d.join(format!("f{i}.txt")), noise(4096, seed)).unwrap();
+            }
+            vec![root.to_string_lossy().into()]
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn bench_text_file() {
+        bench_run("sıkıştırılabilir metin", |dir| {
+            let p = dir.join("log.txt");
+            let mut s = String::new();
+            let mut i = 0u64;
+            while s.len() < 512 * 1024 * 1024 {
+                s.push_str(&format!("2026-11-05 14:{:02}:{:02} INFO istek={} kullanici=ahmet durum=200 sure={}ms\n", i % 60, i % 59, i, i % 977));
+                i += 1;
+            }
+            std::fs::write(&p, s).unwrap();
+            vec![p.to_string_lossy().into()]
+        })
+        .await;
     }
 
     #[test]

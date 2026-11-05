@@ -76,6 +76,8 @@ const ic = {
   ban: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m5.6 5.6 12.8 12.8"/></svg>',
   clock: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
   checks: '<svg viewBox="0 0 24 24"><path d="m3 12 5 5L18 7M13 16l1 1L22 9"/></svg>',
+  pause: '<svg viewBox="0 0 24 24"><path d="M9 6v12M15 6v12"/></svg>',
+  play: '<svg viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5z"/></svg>',
   retry: '<svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>',
   clip: '<svg viewBox="0 0 24 24"><rect x="6" y="4" width="12" height="17" rx="2"/><path d="M9 4.5V3h6v1.5M9 10h6M9 14h4"/></svg>',
   copy: '<svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>',
@@ -473,6 +475,8 @@ function statusText(t) {
       const label = t.direction === 'send' ? 'Gönderildi' : 'Alındı';
       return [`${label}${t.resumed ? ' · kaldığı yerden devam edildi' : ''}`, `${whenLabel(t.finishedAt || Date.now())}${avg}`];
     }
+    case 'paused':
+      return [t.error || 'Duraklatıldı · devam ettirince kaldığı yerden sürer', `%${pct} · ${fmtBytes(t.done)} / ${fmtBytes(t.total)}`];
     case 'declined': return [t.error || 'Reddedildi', whenLabel(t.finishedAt)];
     case 'cancelled': return [t.error || 'İptal edildi', whenLabel(t.finishedAt)];
     default: return [t.error || 'Başarısız oldu', whenLabel(t.finishedAt)];
@@ -490,13 +494,18 @@ function whenLabel(ms) {
 
 function transferActions(t) {
   if (t.status === 'waiting' || t.status === 'active') {
-    return `<button class="icon-btn sm" data-act="cancel" title="İptal et">${ic.x}</button>`;
+    const pause = t.direction === 'send' && t.resumable
+      ? `<button class="icon-btn sm" data-act="pause" title="Duraklat (alıcıdaki yarım dosyalar korunur)">${ic.pause}</button>` : '';
+    return `${pause}<button class="icon-btn sm" data-act="cancel" title="İptal et">${ic.x}</button>`;
   }
   let html = '';
+  if (t.status === 'paused' && t.direction === 'send') {
+    html += `<button class="icon-btn sm" data-act="retry" title="Devam ettir">${ic.play}</button>`;
+  }
   if (t.status === 'done' && t.direction === 'receive' && t.savePath) {
     html += `<button class="icon-btn sm" data-act="reveal" title="Klasörde göster">${ic.reveal}</button>`;
   }
-  if (t.direction === 'send' && t.sources?.length) {
+  if (t.direction === 'send' && t.sources?.length && t.status !== 'paused') {
     const title = t.status === 'done' ? 'Tekrar gönder'
       : t.status === 'failed' ? 'Tekrar dene (alıcıda yarım kaldıysa kaldığı yerden devam eder)' : 'Tekrar dene';
     html += `<button class="icon-btn sm" data-act="retry" title="${title}">${ic.retry}</button>`;
@@ -576,6 +585,7 @@ $('#transfers').addEventListener('click', (e) => {
   if (btn.dataset.act === 'cancel') call('cancel_transfer', { id: t.id });
   if (btn.dataset.act === 'reveal') call('reveal_path', { path: t.savePath });
   if (btn.dataset.act === 'retry') call('retry_transfer', { id: t.id }).catch(() => {});
+  if (btn.dataset.act === 'pause') call('pause_transfer', { id: t.id }).catch(() => {});
   if (btn.dataset.act === 'remove') call('remove_transfer', { id: t.id }).then(setTransfers).catch(() => {});
 });
 
@@ -673,6 +683,11 @@ function showNextIncoming() {
 
 // ───────────────────────────── Ayarlar ─────────────────────────────
 
+function limitOptions(current) {
+  const values = [...new Set([0, 2, 5, 10, 25, 50, 100, current])].sort((a, b) => a - b);
+  return values.map((v) => `<option value="${v}" ${v === current ? 'selected' : ''}>${v ? `${v} MB/sn` : 'Sınırsız'}</option>`).join('');
+}
+
 function showSettings() {
   const s = state.settings;
   const m = openModal('settings', `
@@ -692,6 +707,14 @@ function showSettings() {
     </div>
     <label class="check"><input type="checkbox" id="s-tray" ${s.closeToTray ? 'checked' : ''} />
       <span>Pencere kapatılınca sistem tepsisinde çalışmaya devam et<br><span class="muted small">Kapalıyken de dosya alabilmek için önerilir.</span></span></label>
+    <hr class="sep" />
+    <div class="field">
+      <label for="s-limit">Gönderim hız sınırı</label>
+      <select class="input" id="s-limit">${limitOptions(s.speedLimitMb || 0)}</select>
+      <span class="help">Büyük gönderimler ofis ağını tıkamasın diye bu bilgisayarın toplam gönderim hızını sınırlar. Alım hızı etkilenmez.</span>
+    </div>
+    <label class="check"><input type="checkbox" id="s-compress" ${s.compress !== false ? 'checked' : ''} />
+      <span>Uygun dosyaları sıkıştırarak gönder<br><span class="muted small">Metin, log, CSV, kaynak kod gibi dosyalar özellikle Wi-Fi'da birkaç kat hızlı gider. Zip, video, fotoğraf gibi zaten sıkıştırılmış dosyalar olduğu gibi gider. Karşı tarafta FastFiles'ın güncel sürümü olmalı.</span></span></label>
     <hr class="sep" />
     <div class="field">
       <label>Güvenilir cihazlar</label>
@@ -762,6 +785,8 @@ function showSettings() {
         deviceName: m.querySelector('#s-name').value,
         downloadDir: m.querySelector('#s-dir').value,
         closeToTray: m.querySelector('#s-tray').checked,
+        compress: m.querySelector('#s-compress').checked,
+        speedLimitMb: Number(m.querySelector('#s-limit').value),
       });
       renderMe();
       closeModal();
@@ -1513,7 +1538,8 @@ function createPreviewApi() {
     ],
     transfers: [
       { id: 't3', direction: 'send', peerId: 'p3', peerName: 'Render-Sunucu', title: '3 öğe', fileCount: 3, total: 5e6, done: 0, speed: 0, status: 'waiting', createdAt: now - 3000 },
-      { id: 't1', direction: 'send', peerId: 'p1', peerName: 'Ahmet', title: 'Proje_Final', fileCount: 128, total: 2.4e9, done: 1.62e9, speed: 98e6, status: 'active', createdAt: now - 20000, currentFile: 'Proje_Final/assets/scene.fbx' },
+      { id: 't1', direction: 'send', peerId: 'p1', peerName: 'Ahmet', title: 'Proje_Final', fileCount: 128, total: 2.4e9, done: 1.62e9, speed: 98e6, status: 'active', resumable: true, createdAt: now - 20000, currentFile: 'Proje_Final/assets/scene.fbx' },
+      { id: 't8', direction: 'send', peerId: 'p2', peerName: 'Elif (Tasarım)', title: 'Çekim_RAW', fileCount: 412, total: 38e9, done: 9.1e9, speed: 0, status: 'paused', resumable: true, createdAt: now - 40000, finishedAt: now - 30000, sources: ['E:\\Çekim_RAW'] },
       { id: 't2', direction: 'receive', peerId: 'p2', peerName: 'Elif (Tasarım)', title: 'logo-v3.psd', fileCount: 1, total: 84e6, done: 84e6, speed: 0, status: 'done', createdAt: now - 90000, finishedAt: now - 88000, savePath: 'C:\\x' },
       { id: 't4', direction: 'send', peerId: 'p2', peerName: 'Elif (Tasarım)', title: 'sunum.pptx', fileCount: 1, total: 12e6, done: 0, speed: 0, status: 'declined', createdAt: now - 300000, finishedAt: now - 290000, sources: ['C:\\x\\sunum.pptx'] },
       { id: 't5', direction: 'send', peerId: 'p1', peerName: 'Ahmet', title: 'Render_4K.mov', fileCount: 1, total: 18e9, done: 11.2e9, speed: 0, status: 'waiting', error: 'Bağlantı koptu · yeniden bağlanılıyor (2/6)', createdAt: now - 600000, sources: ['D:\\Render_4K.mov'] },
@@ -1627,6 +1653,7 @@ function createPreviewApi() {
       if (cmd === 'clear_finished') return snap.transfers.filter((t) => ['waiting', 'active'].includes(t.status));
       if (cmd === 'remove_transfer') return (snap.transfers = snap.transfers.filter((t) => t.id !== args.id));
       if (cmd === 'retry_transfer') return args.id;
+      if (cmd === 'pause_transfer') return null;
       if (cmd === 'send_clipboard') return { kind: 'image', count: args.peerIds.length };
       return snap.settings;
     },

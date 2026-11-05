@@ -4,12 +4,12 @@
 //! Gönderim kabul edildikten sonra dosyaların ham byte'ları, teklifte (Offer)
 //! bildirilen sırayla ve boyutlarla, hiçbir sarmalama olmadan akıtılır.
 //!
-//! **Kaldığı yerden devam + doğrulama (`resume-b3`).** Gönderen bu özelliği teklifte
-//! (`features`) duyurur; alıcı da destekliyorsa `Accept`'te geri yollar ve her dosya
-//! için bir başlangıç noktası (`offsets`) bildirir. Bu durumda:
-//! - Gönderen her dosyanın yalnızca `offsets[i]`'den sonraki baytlarını akıtır, ardından
-//!   **tüm dosyanın** 32 baytlık BLAKE3 özetini ham olarak ekler.
-//! - `size > 0 && offsets[i] >= size` olan dosya alıcıda zaten tamamdır: ne bayt ne özet gönderilir.
+//! **Protokol v2 (`FEATURE_V2`).** Gönderen bu özelliği teklifte (`features`) duyurur; alıcı da
+//! destekliyorsa `Accept`'te geri yollar ve her dosya için bir başlangıç noktası (`offsets`) bildirir:
+//! - Gönderen her dosyanın yalnızca `offsets[i]`'den sonraki kısmını çerçeveli bloklar halinde
+//!   (isteğe bağlı zstd sıkıştırmayla, bkz. `pipeline.rs`) akıtır, ardından **tüm dosyanın**
+//!   32 baytlık BLAKE3 özetini ekler.
+//! - `size > 0 && offsets[i] >= size` olan dosya alıcıda zaten tamamdır: ne veri ne özet gönderilir.
 //!
 //! Özelliği bilmeyen eski sürümler alanları yok sayar ve eski protokolle devam eder.
 
@@ -22,10 +22,8 @@ pub const DEFAULT_PORT: u16 = 53317;
 /// Cihaz keşfi için kullanılan UDP portu.
 pub const DISCOVERY_PORT: u16 = 53318;
 pub const PROTOCOL_VERSION: u32 = 1;
-/// Kaldığı yerden devam + dosya başına BLAKE3 doğrulaması.
-pub const FEATURE_RESUME: &str = "resume-b3";
-/// BLAKE3 özetinin bayt uzunluğu.
-pub const HASH_LEN: usize = 32;
+/// Kaldığı yerden devam + dosya başına BLAKE3 doğrulaması + çerçeveli (sıkıştırılabilir) bloklar.
+pub const FEATURE_V2: &str = "ff2";
 
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 
@@ -68,7 +66,7 @@ pub enum Message {
         device: DeviceInfo,
         files: Vec<FileEntry>,
         total: u64,
-        /// Gönderenin desteklediği protokol özellikleri (ör. `FEATURE_RESUME`).
+        /// Gönderenin desteklediği protokol özellikleri (ör. `FEATURE_V2`).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         features: Vec<String>,
     },
@@ -77,7 +75,7 @@ pub enum Message {
         /// Alıcının bu aktarımda kullanacağı özellikler (gönderenin teklif ettiklerinden).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         features: Vec<String>,
-        /// `FEATURE_RESUME`: her dosya için alıcıda zaten bulunan bayt sayısı.
+        /// `FEATURE_V2`: her dosya için alıcıda zaten bulunan bayt sayısı.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         offsets: Vec<u64>,
     },
@@ -107,6 +105,8 @@ pub enum Message {
     /// dosyaları silsin. Yanıt: AbortAck.
     Abort { device: DeviceInfo, transfer_id: String },
     AbortAck,
+    /// Gönderen aktarımı duraklattı (yarım dosyalar korunur). Yanıt: AbortAck.
+    PauseNotice { device: DeviceInfo, transfer_id: String },
 }
 
 pub const MAX_CHAT_CHARS: usize = 4000;
@@ -258,8 +258,8 @@ mod tests {
             Message::Offer { features, .. } => assert!(features.is_empty()),
             _ => panic!("offer beklenirdi"),
         }
-        let resumed = Message::Accept { features: vec![FEATURE_RESUME.into()], offsets: vec![0, 5] };
+        let resumed = Message::Accept { features: vec![FEATURE_V2.into()], offsets: vec![0, 5] };
         let json = serde_json::to_string(&resumed).unwrap();
-        assert!(json.contains("resume-b3") && json.contains("[0,5]"));
+        assert!(json.contains("ff2") && json.contains("[0,5]"));
     }
 }
