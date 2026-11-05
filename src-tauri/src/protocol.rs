@@ -72,6 +72,10 @@ pub enum Message {
         /// Gönderenin desteklediği protokol özellikleri (ör. `FEATURE_V2`).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         features: Vec<String>,
+        /// Dosya bir grup sohbetine gönderildiyse grubun kimliği. Alıcı bunu kendi grup
+        /// bilgisiyle doğrular (ikisi de üye olmalı); doğrulanmazsa birebir sohbette gösterir.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group_id: Option<String>,
     },
     /// Alanlar boşsa `{"type":"accept"}` olarak gider; eski sürümler de anlar.
     Accept {

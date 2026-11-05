@@ -41,6 +41,33 @@ pub struct ChatMessage {
     /// "Ahmet gruba eklendi" gibi bilgi satırı.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub system: bool,
+    /// Dosya balonu: bu mesaj bir (veya grupta birden fazla) dosya aktarımını temsil eder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<FileRef>,
+}
+
+/// Sohbetteki dosya balonu. Durum ve ilerleme bağlı aktarım kayıtlarından okunur.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileRef {
+    pub title: String,
+    pub count: u32,
+    pub total: u64,
+    /// Bu balona bağlı yerel aktarımlar (grupta üye başına bir tane).
+    #[serde(default)]
+    pub transfers: Vec<FileTransferRef>,
+    /// (Gönderen, grup) çevrimdışı üyelere sonra göndermek için kaynak yollar.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTransferRef {
+    /// Karşı cihazın parmak izi.
+    pub to: String,
+    /// Yerel aktarım kimliği.
+    pub id: String,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -127,6 +154,8 @@ pub enum OutboxItem {
     GroupSync { key: String, to: String, group: GroupInfo },
     /// Grup mesajı → henüz almamış üye
     Message { key: String, to: String, group_id: String, msg: ChatMessage },
+    /// Grup dosyası → henüz gönderilmemiş üye (aktarım başlatılır)
+    File { key: String, to: String, group_id: String, msg: ChatMessage },
     /// Üye → yönetici: ayrılıyorum
     Leave { key: String, to: String, group_id: String },
 }
@@ -169,12 +198,30 @@ impl ChatStore {
 
     /// Mesajı ekler; (okunmamış sayısı) döndürür.
     pub fn push(&mut self, fingerprint: &str, name: &str, msg: ChatMessage) -> u32 {
+        self.push_inner(fingerprint, name, msg, true)
+    }
+
+    /// Okunmamış sayısını artırmadan ekler (dosya balonları: aktarım zaten bildirim gösterir).
+    pub fn push_quiet(&mut self, fingerprint: &str, name: &str, msg: ChatMessage) -> u32 {
+        self.push_inner(fingerprint, name, msg, false)
+    }
+
+    /// Bir mesajı değiştirir ve kaydeder.
+    pub fn update_message(&mut self, key: &str, id: &str, f: impl FnOnce(&mut ChatMessage)) -> Option<ChatMessage> {
+        let m = self.convs.get_mut(key)?.messages.iter_mut().find(|m| m.id == id)?;
+        f(m);
+        let out = m.clone();
+        self.save();
+        Some(out)
+    }
+
+    fn push_inner(&mut self, fingerprint: &str, name: &str, msg: ChatMessage, count_unread: bool) -> u32 {
         let conv = self.convs.entry(fingerprint.to_string()).or_insert_with(|| Conversation {
             fingerprint: fingerprint.to_string(),
             ..Default::default()
         });
         conv.name = name.to_string();
-        if !msg.outgoing {
+        if !msg.outgoing && count_unread {
             conv.unread += 1;
         }
         conv.messages.push(msg);
@@ -304,6 +351,10 @@ impl ChatStore {
                     continue;
                 }
                 for to in &m.pending {
+                    if m.file.is_some() {
+                        items.push(OutboxItem::File { key: conv.fingerprint.clone(), to: to.clone(), group_id: group.id.clone(), msg: m.clone() });
+                        continue;
+                    }
                     items.push(OutboxItem::Message {
                         key: conv.fingerprint.clone(),
                         to: to.clone(),

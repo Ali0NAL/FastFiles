@@ -11,7 +11,7 @@
 //! - Engellenen cihazlar, hız sınırı, uzunluk sınırı ve metin temizliği birebir sohbetteki gibidir.
 
 use super::*;
-use crate::chat::{group_key, Conversation, GroupInfo, GroupMember, OutboxItem};
+use crate::chat::{group_key, Conversation, FileRef, FileTransferRef, GroupInfo, GroupMember, OutboxItem};
 
 /// Başarısız teslimattan sonra aynı alıcıyı yeniden denemeden önce beklenecek süre.
 const OUTBOX_BACKOFF: Duration = Duration::from_secs(20);
@@ -275,6 +275,43 @@ impl Node {
         Ok(msg)
     }
 
+    /// Gruba dosya/klasör gönderir: çevrimiçi üyelere hemen, çevrimdışı olanlara geri
+    /// geldiklerinde (en fazla 3 gün) ayrı ayrı aktarım başlar. Her üye kendi ekranında onaylar.
+    pub async fn group_send_files(self: &Arc<Self>, key: &str, paths: Vec<String>) -> Result<ChatMessage, String> {
+        let me = self.my_fp();
+        let (g, left) = self.group_of(key).ok_or("Grup bulunamadı")?;
+        if left || g.deleted || !g.has(&me) {
+            return Err("Bu grubun üyesi değilsiniz".into());
+        }
+        let others: Vec<String> = g.members.iter().map(|m| m.fingerprint.clone()).filter(|f| *f != me).collect();
+        if others.is_empty() {
+            return Err("Grupta başka üye yok".into());
+        }
+        let (entries, title) = scan_sources(&paths).await?;
+        let file = FileRef {
+            title: title.clone(),
+            count: entries.len() as u32,
+            total: entries.iter().map(|e| e.1.size).sum(),
+            transfers: Vec::new(),
+            sources: paths,
+        };
+        let msg = ChatMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            outgoing: true,
+            text: format!("📎 {title}"),
+            at: now_ms(),
+            status: MsgStatus::Sending,
+            recipients: others.len() as u32,
+            pending: others,
+            file: Some(file),
+            ..Default::default()
+        };
+        self.chats.lock().unwrap().push(key, &g.name, msg.clone());
+        self.emit_chat_message(key, &msg, false);
+        self.flush_outbox();
+        Ok(msg)
+    }
+
     // ───────────── Giden kutusu ─────────────
 
     /// Bekleyen grup teslimatlarını çevrimiçi üyelere gönderir. Keşif döngüsü bunu birkaç
@@ -302,6 +339,12 @@ impl Node {
                         continue;
                     }
                     (to.clone(), format!("msg:{key}:{to}:{}", msg.id))
+                }
+                OutboxItem::File { key, to, msg, .. } => {
+                    if syncing.contains(&(key.clone(), to.clone())) {
+                        continue;
+                    }
+                    (to.clone(), format!("file:{key}:{to}:{}", msg.id))
                 }
                 OutboxItem::Leave { key, to, .. } => (to.clone(), format!("leave:{key}:{to}")),
             };
@@ -344,7 +387,7 @@ impl Node {
     }
 
     /// Tek bir teslimatı yapar.
-    async fn deliver(&self, item: OutboxItem, peer: &Peer) -> Delivery {
+    async fn deliver(self: &Arc<Self>, item: OutboxItem, peer: &Peer) -> Delivery {
         let device = self.device_info();
         match item {
             OutboxItem::GroupSync { key, to, group } => {
@@ -399,6 +442,36 @@ impl Node {
                 } else {
                     Delivery::RetryLater
                 }
+            }
+            OutboxItem::File { key, to, group_id, msg } => {
+                // Üye çevrimiçi: ona ayrı bir aktarım başlar (onay, devam, doğrulama normal akışta).
+                let Some(file) = msg.file.clone() else { return Delivery::Done };
+                let started = match scan_sources(&file.sources).await {
+                    Ok((entries, title)) => Ok(self.start_send(peer.clone(), entries, title, file.sources.clone(), None, Some(group_id))),
+                    Err(e) => Err(e),
+                };
+                let updated = self.chats.lock().unwrap().update_message(&key, &msg.id, |m| {
+                    match &started {
+                        Ok(tid) => {
+                            m.pending.retain(|f| *f != to);
+                            if let Some(f) = m.file.as_mut() {
+                                f.transfers.push(FileTransferRef { to: to.clone(), id: tid.clone() });
+                            }
+                        }
+                        // Kaynak dosyalar silinmiş/taşınmış: kalan üyelere gönderilemez.
+                        Err(e) => {
+                            m.pending.clear();
+                            m.error = Some(e.clone());
+                        }
+                    }
+                    if m.pending.is_empty() {
+                        m.status = MsgStatus::Sent;
+                    }
+                });
+                if let Some(m) = updated {
+                    self.emit_chat_message(&key, &m, false);
+                }
+                Delivery::Done
             }
             OutboxItem::Leave { key, group_id, .. } => match self.group_request(peer, &Message::GroupLeave { device, group_id }).await {
                 Ok(Message::GroupAck) => {

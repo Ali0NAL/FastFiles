@@ -12,7 +12,7 @@ pub mod share;
 #[path = "poll.rs"]
 pub mod poll;
 
-use crate::chat::{ChatMessage, ChatStore, ConversationSummary, MsgStatus};
+use crate::chat::{ChatMessage, ChatStore, ConversationSummary, FileRef, FileTransferRef, MsgStatus};
 use crate::config::{fingerprint, Identity, Settings, TrustedDevice};
 use crate::pipeline;
 use crate::protocol::*;
@@ -129,6 +129,9 @@ pub struct Transfer {
     /// Karşı taraf kaldığı yerden devamı destekliyor: duraklatılabilir.
     #[serde(default)]
     pub resumable: bool,
+    /// Grup sohbetinden gönderildiyse grubun kimliği.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
     #[serde(skip)]
     last_emit: Option<Instant>,
     #[serde(skip)]
@@ -165,6 +168,7 @@ impl Transfer {
             sources: Vec::new(),
             resumed: false,
             resumable: false,
+            group_id: None,
             last_emit: None,
             sample: None,
         }
@@ -1009,7 +1013,7 @@ impl Node {
                     .await
                     .map_err(|e| e.to_string())
             }
-            Message::Offer { mut device, files, total, transfer_id, features } => {
+            Message::Offer { mut device, files, total, transfer_id, features, group_id } => {
                 if device.fingerprint != client_fp {
                     return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
                 }
@@ -1023,6 +1027,7 @@ impl Node {
                     resume: features.iter().any(|f| f == FEATURE_V2),
                     files,
                     total,
+                    group_id,
                 };
                 self.receive(rd, wr, addr.ip(), device, offer).await
             }
@@ -1140,7 +1145,9 @@ impl Node {
         offer: IncomingOffer,
     ) -> Result<(), String> {
         self.upsert_peer(device.clone(), ip, None);
-        let IncomingOffer { transfer_id, resume, files, total } = offer;
+        let IncomingOffer { transfer_id, resume, files, total, group_id } = offer;
+        // Grup bağlamı yalnızca iki taraf da o grubun üyesiyse geçerlidir.
+        let group = group_id.as_deref().and_then(|gid| self.shared_group(gid, &device.fingerprint));
         let fp = device.fingerprint.clone();
 
         let mut sanitized: Vec<(Vec<String>, u64)> = Vec::with_capacity(files.len());
@@ -1188,6 +1195,7 @@ impl Node {
                     "fileCount": sanitized.len(),
                     "total": total,
                     "files": sanitized.iter().take(8).map(|(p, s)| json!({"path": p.join("/"), "size": s})).collect::<Vec<_>>(),
+                    "group": group.as_ref().map(|(_, name)| name.clone()),
                 }),
             );
             let mut probe = [0u8; 1];
@@ -1326,7 +1334,20 @@ impl Node {
         t.save_path = Some(save_path.to_string_lossy().into_owned());
         t.done = already;
         t.resumed = prior.is_some();
+        t.group_id = group.as_ref().and(group_id.clone());
         self.insert_transfer(t);
+        // Sohbette dosya balonu: grup bağlamı doğrulandıysa grup sohbetinde, değilse birebir.
+        let file = FileRef {
+            title: title.clone(),
+            count: sanitized.len() as u32,
+            total,
+            transfers: vec![FileTransferRef { to: self.identity.fingerprint.clone(), id: id.clone() }],
+            sources: Vec::new(),
+        };
+        match &group {
+            Some((key, name)) => self.store_file_bubble(key, name, &id, false, file, Some((&device.fingerprint, &device.name))),
+            None => self.store_file_bubble(&device.fingerprint, &device.name, &id, false, file, None),
+        }
         // Güvenilir cihazdan sormadan kabul edildiyse kullanıcının haberi olsun.
         if trusted && prior.is_none() {
             self.notify(&format!("{} dosya gönderiyor", device.name), &summary, Some(&id));
@@ -1539,6 +1560,43 @@ impl Node {
         Ok(())
     }
 
+    /// Aktarımı sohbette dosya balonu olarak gösterir (aynı aktarım için bir kez).
+    /// Okunmamış sayısını artırmaz ve bildirim tetiklemez: aktarımın kendi bildirimi var.
+    fn store_file_bubble(&self, key: &str, name: &str, transfer_id: &str, outgoing: bool, file: FileRef, sender: Option<(&str, &str)>) {
+        let msg_id = format!("f-{transfer_id}");
+        let msg = {
+            let mut chats = self.chats.lock().unwrap();
+            if chats.contains(key, &msg_id) {
+                return;
+            }
+            let msg = ChatMessage {
+                id: msg_id,
+                outgoing,
+                text: format!("📎 {}", file.title),
+                at: now_ms(),
+                status: if outgoing { MsgStatus::Sent } else { MsgStatus::Received },
+                sender: sender.map(|s| s.0.to_string()),
+                sender_name: sender.map(|s| s.1.to_string()),
+                file: Some(file),
+                ..Default::default()
+            };
+            chats.push_quiet(key, name, msg.clone());
+            msg
+        };
+        let unread = self.chats.lock().unwrap().conversation_meta(key).map_or(0, |m| m.1);
+        self.emit("chat", json!({ "fingerprint": key, "name": name, "unread": unread, "incoming": false, "message": msg }));
+    }
+
+    /// `group_id` grubunda hem bu cihaz hem `fp` üyeyse (grup sohbet anahtarı, grup adı).
+    fn shared_group(&self, group_id: &str, fp: &str) -> Option<(String, String)> {
+        if !valid_message_id(group_id) {
+            return None;
+        }
+        let key = crate::chat::group_key(group_id);
+        let (g, left) = self.group_of(&key)?;
+        (!left && !g.deleted && g.has(&self.identity.fingerprint) && g.has(fp)).then(|| (key, g.name))
+    }
+
     fn store_chat(&self, fp: &str, name: &str, msg: ChatMessage) {
         let unread = self.chats.lock().unwrap().push(fp, name, msg.clone());
         self.emit(
@@ -1671,7 +1729,7 @@ impl Node {
         let (entries, title) = scan_sources(&paths).await?;
         Ok(peers
             .into_iter()
-            .map(|peer| self.start_send(peer, entries.clone(), title.clone(), paths.clone(), None))
+            .map(|peer| self.start_send(peer, entries.clone(), title.clone(), paths.clone(), None, None))
             .collect())
     }
 
@@ -1685,7 +1743,7 @@ impl Node {
         let peer = self.peer(&t.peer_id).ok_or_else(|| format!("{} şu an çevrimdışı", t.peer_name))?;
         let (entries, title) = scan_sources(&t.sources).await?;
         let reuse = (t.status != Status::Done).then(|| t.id.clone());
-        Ok(self.start_send(peer, entries, title, t.sources.clone(), reuse))
+        Ok(self.start_send(peer, entries, title, t.sources.clone(), reuse, t.group_id.clone()))
     }
 
     /// Panodakini gönderir: kopyalanan dosyalar ve ekran görüntüsü dosya olarak, kısa metin
@@ -1733,9 +1791,22 @@ impl Node {
         title: String,
         sources: Vec<String>,
         reuse_id: Option<String>,
+        group_id: Option<String>,
     ) -> String {
         let total: u64 = entries.iter().map(|e| e.1.size).sum();
         let id = reuse_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // Birebir gönderim o kişiyle sohbette dosya balonu olarak görünür
+        // (grup gönderiminde balon grup sohbetindedir).
+        if group_id.is_none() {
+            let file = FileRef {
+                title: title.clone(),
+                count: entries.len() as u32,
+                total,
+                transfers: vec![FileTransferRef { to: peer.fingerprint.clone(), id: id.clone() }],
+                sources: Vec::new(),
+            };
+            self.store_file_bubble(&peer.fingerprint, &peer.name, &id, true, file, None);
+        }
         let token = CancellationToken::new();
         self.cancels.lock().unwrap().insert(id.clone(), token.clone());
         let mut t = Transfer::new(
@@ -1749,6 +1820,7 @@ impl Node {
             Status::Waiting,
         );
         t.sources = sources;
+        t.group_id = group_id;
         self.insert_transfer(t);
 
         let node = self.clone();
@@ -1896,12 +1968,14 @@ impl Node {
 
         let files: Vec<FileEntry> = entries.iter().map(|e| e.1.clone()).collect();
         let total = files.iter().map(|f| f.size).sum();
+        let group_id = self.transfers.lock().unwrap().get(id).and_then(|t| t.group_id.clone());
         let offer = Message::Offer {
             transfer_id: id.to_string(),
             device: self.device_info(),
             files,
             total,
             features: vec![FEATURE_V2.into()],
+            group_id,
         };
         write_msg(&mut wr, &offer).await.map_err(|e| lost(format!("Teklif gönderilemedi: {e}")))?;
 
@@ -2096,6 +2170,7 @@ struct IncomingOffer {
     resume: bool,
     files: Vec<FileEntry>,
     total: u64,
+    group_id: Option<String>,
 }
 
 /// `dosya.txt` → `dosya.txt.ffpart`
@@ -2564,7 +2639,7 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bob.port());
         let mut s = alice.connect(&[addr], Some(bob.identity.fingerprint.clone())).await.unwrap();
         let files = vec![FileEntry { path: "eski.txt".into(), size: 5, mtime: None }];
-        let offer = Message::Offer { transfer_id: "t-eski".into(), device: alice.device_info(), files, total: 5, features: vec![] };
+        let offer = Message::Offer { transfer_id: "t-eski".into(), device: alice.device_info(), files, total: 5, features: vec![], group_id: None };
         write_msg(&mut s, &offer).await.unwrap();
         match read_msg(&mut s).await.unwrap() {
             Message::Accept { features, offsets } => assert!(features.is_empty() && offsets.is_empty()),
@@ -3108,10 +3183,11 @@ mod tests {
 
         // Engeli kaldırınca "tekrar dene" çalışır.
         bob.set_blocked(&afp, "alice", false);
-        let failed_id = alice.chat_history(&bfp).last().unwrap().id.clone();
+        // (Reddedilen dosya da sohbette balon olarak durur; yeniden denenecek olan metin mesajıdır.)
+        let failed_id = alice.chat_history(&bfp).into_iter().rev().find(|m| m.file.is_none()).unwrap().id;
         alice.chat_retry(&bfp, &failed_id).unwrap();
-        wait_until(|| last_status(&alice, &bfp) == Some(MsgStatus::Sent)).await;
-        assert_eq!(bob.chat_history(&afp).len(), 2);
+        wait_until(|| alice.chat_history(&bfp).iter().any(|m| m.id == failed_id && m.status == MsgStatus::Sent)).await;
+        assert_eq!(bob.chat_history(&afp).iter().filter(|m| m.file.is_none()).count(), 2);
     }
 
     // ───────────── Grup testleri ─────────────
@@ -3207,6 +3283,79 @@ mod tests {
         }
         assert_eq!(group_texts(&carol, &key), vec!["Carol yokken yazıldı"]);
         wait_until(|| alice.chat_history(&key).iter().any(|m| m.outgoing && m.pending.is_empty())).await;
+    }
+
+    fn file_bubbles(node: &Node, key: &str) -> Vec<ChatMessage> {
+        node.chat_history(key).into_iter().filter(|m| m.file.is_some()).collect()
+    }
+
+    #[tokio::test]
+    async fn files_appear_in_chat_and_reach_offline_group_members() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        let carol = make_node(tmp.path(), "carol").await;
+        let mallory = make_node(tmp.path(), "mallory").await;
+        introduce_all(&[&alice, &bob, &carol, &mallory]);
+        for r in [&bob, &carol] {
+            r.set_trusted(&alice.identity.fingerprint, "alice", true);
+        }
+        bob.set_trusted(&mallory.identity.fingerprint, "mallory", true);
+        let (afp, bfp, cfp) = (alice.identity.fingerprint.clone(), bob.identity.fingerprint.clone(), carol.identity.fingerprint.clone());
+
+        // Birebir: gönderim iki tarafta da sohbette dosya balonu; okunmamış sayısı artmaz.
+        let a = tmp.path().join("a.txt");
+        std::fs::write(&a, "a").unwrap();
+        let id = alice.send_one(&bob.identity.id, vec![a.to_string_lossy().into()]).await.unwrap();
+        assert_eq!(wait_finished(&alice, &id).await.status, Status::Done);
+        let out = file_bubbles(&alice, &bfp);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].outgoing);
+        assert_eq!(out[0].file.as_ref().unwrap().transfers[0].id, id);
+        wait_until(|| file_bubbles(&bob, &afp).len() == 1).await;
+        let inc = &file_bubbles(&bob, &afp)[0];
+        assert!(!inc.outgoing && inc.file.as_ref().unwrap().title == "a.txt");
+        assert_eq!(bob.chat_summaries().iter().find(|c| c.fingerprint == afp).unwrap().unread, 0);
+
+        // Grup: Carol çevrimdışıyken gönderilen dosya, Carol geri gelince ona da gider.
+        let key = alice.group_create("Ekip", &[bfp.clone(), cfp.clone()]).unwrap().fingerprint;
+        wait_until(|| bob.chat_summaries().iter().any(|c| c.fingerprint == key)).await;
+        wait_until(|| carol.chat_summaries().iter().any(|c| c.fingerprint == key)).await;
+        alice.remove_peer(&carol.identity.id);
+        let rapor = tmp.path().join("rapor.pdf");
+        std::fs::write(&rapor, vec![9u8; 300_000]).unwrap();
+        let msg = alice.group_send_files(&key, vec![rapor.to_string_lossy().into()]).await.unwrap();
+        assert_eq!(msg.recipients, 2);
+        let got = |n: &Node| PathBuf::from(n.settings().download_dir).join("rapor.pdf").exists();
+        wait_until(|| got(&bob)).await;
+        wait_until(|| file_bubbles(&bob, &key).iter().any(|m| m.sender.as_deref() == Some(afp.as_str()))).await;
+        let pending = || alice.chat_history(&key).into_iter().find(|m| m.id == msg.id).unwrap().pending;
+        assert_eq!(pending(), vec![cfp.clone()], "Carol için beklemeli");
+
+        introduce(&alice, &carol);
+        for _ in 0..60 {
+            alice.flush_outbox();
+            if got(&carol) {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(got(&carol), "Carol geri gelince dosyayı almalıydı");
+        assert!(pending().is_empty());
+        let sent = alice.chat_history(&key).into_iter().find(|m| m.id == msg.id).unwrap();
+        assert_eq!(sent.file.unwrap().transfers.len(), 2);
+        wait_until(|| file_bubbles(&carol, &key).len() == 1).await;
+
+        // Üye olmayan Mallory grup kimliğini taklit etse de dosyası grupta görünmez.
+        let gid = bob.group_of(&key).unwrap().0.id;
+        let m = tmp.path().join("sahte.txt");
+        std::fs::write(&m, "x").unwrap();
+        let (entries, title) = scan_sources(&[m.to_string_lossy().into()]).await.unwrap();
+        let peer = mallory.peer(&bob.identity.id).unwrap();
+        let mid = mallory.start_send(peer, entries, title, vec![], None, Some(gid));
+        assert_eq!(wait_finished(&mallory, &mid).await.status, Status::Done);
+        wait_until(|| file_bubbles(&bob, &mallory.identity.fingerprint).len() == 1).await;
+        assert!(file_bubbles(&bob, &key).iter().all(|m| m.file.as_ref().unwrap().title != "sahte.txt"));
     }
 
     #[tokio::test]

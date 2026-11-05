@@ -6,6 +6,7 @@ mod node;
 mod pipeline;
 mod protocol;
 mod resume;
+mod shell;
 mod tls;
 pub mod update;
 
@@ -63,6 +64,7 @@ fn update_settings(
     onboarded: Option<bool>,
     compress: Option<bool>,
     speed_limit_mb: Option<u32>,
+    shell_menu: Option<bool>,
 ) -> Result<Settings, String> {
     if let Some(name) = &device_name {
         if name.trim().is_empty() {
@@ -91,7 +93,60 @@ fn update_settings(
         if let Some(v) = speed_limit_mb {
             s.speed_limit_mb = v.min(10_000);
         }
+        if let Some(v) = shell_menu {
+            s.shell_menu = v;
+            std::thread::spawn(move || shell::apply(v));
+        }
     }))
+}
+
+// ───────────────────────────── Gezgin'den gönderme ─────────────────────────────
+
+/// Gezgin'den ("FastFiles ile gönder") gelen yollar. Çoklu seçimde Windows komutu her öğe
+/// için ayrı çalıştırır; kısa süre içinde gelenler tek gönderimde toplanır.
+#[derive(Default)]
+struct SendInbox {
+    paths: Mutex<Vec<String>>,
+    generation: std::sync::atomic::AtomicU64,
+}
+
+const SEND_BATCH_WINDOW: Duration = Duration::from_millis(700);
+
+fn queue_send(app: &AppHandle, paths: Vec<String>) {
+    if paths.is_empty() {
+        return;
+    }
+    let Some(inbox) = app.try_state::<SendInbox>() else { return };
+    {
+        let mut list = inbox.paths.lock().unwrap();
+        for p in paths {
+            if !list.contains(&p) {
+                list.push(p);
+            }
+        }
+    }
+    let gen = inbox.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(SEND_BATCH_WINDOW).await;
+        let Some(inbox) = app.try_state::<SendInbox>() else { return };
+        if inbox.generation.load(std::sync::atomic::Ordering::SeqCst) == gen {
+            show_main(&app);
+            let _ = app.emit("send-request", ());
+        }
+    });
+}
+
+/// Arayüz, Gezgin'den gelen yolları alır (ve kuyruğu boşaltır).
+#[tauri::command]
+fn take_pending_send(inbox: State<SendInbox>) -> Vec<String> {
+    std::mem::take(&mut *inbox.paths.lock().unwrap())
+}
+
+/// Grup sohbetine dosya/klasör gönderir.
+#[tauri::command]
+async fn group_send_files(node: NodeState<'_>, key: String, paths: Vec<String>) -> Result<ChatMessage, String> {
+    node.inner().group_send_files(&key, paths).await
 }
 
 #[tauri::command]
@@ -542,7 +597,11 @@ pub fn run() {
     // (Aynı kimlikle iki örnek çalışırsa diğer cihazlarda port sürekli değişir.)
     // FASTFILES_PROFILE ile test amaçlı ayrı "cihaz" başlatmaya izin verilir.
     if std::env::var("FASTFILES_PROFILE").is_err() {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)));
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            show_main(app);
+            // "FastFiles ile gönder": yollar açık olan pencereye iletilir.
+            queue_send(app, shell::parse_send_args(&args, std::path::Path::new(&cwd)));
+        }));
     }
     let app = builder
         .plugin(tauri_plugin_dialog::init())
@@ -636,7 +695,15 @@ pub fn run() {
                     });
                 }
             }
+            // Gezgin menüsü ayara göre eklenir/kaldırılır (kayıt defteri; arayüzü bekletmesin).
+            let shell_menu = node.settings().shell_menu;
+            std::thread::spawn(move || shell::apply(shell_menu));
             app.manage(node);
+            app.manage(SendInbox::default());
+            // Uygulama Gezgin'den "FastFiles ile gönder" ile açıldıysa.
+            let args: Vec<String> = std::env::args().collect();
+            let cwd = std::env::current_dir().unwrap_or_default();
+            queue_send(&handle, shell::parse_send_args(&args, &cwd));
 
             // Güncelleme sonrası tepsiden açıldıysa (--hidden) pencereyi gösterme.
             if !std::env::args().any(|a| a == "--hidden") {
@@ -707,6 +774,8 @@ pub fn run() {
             group_edit,
             group_leave,
             group_send,
+            group_send_files,
+            take_pending_send,
             set_avatar,
             share_list,
             share_files,

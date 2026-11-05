@@ -26,6 +26,9 @@ Aynı ağa (Wi-Fi veya ethernet) bağlı bilgisayarlar birbirini otomatik bulur.
 - **Toplu gönderme.** "Toplu gönder" ile aynı dosya ve klasörler birden fazla kişiye tek seferde gönderilir. Dosyaları kartların dışındaki boş alana bırakmak da bu pencereyi açar. Her alıcı ayrıca onaylar.
 - **Mesajlaşma.** Cihaz kartındaki mesaj butonuyla sohbet açılır. Okunmamış mesajlar rozetle gösterilir. Pencere arkadayken Windows bildirimi gelir ve görev çubuğu yanıp söner.
 - **Grup mesajlaşma.** Mesajlar sekmesinde "Yeni grup" ile grup kurulur. Mesajlar her üyeye şifreli olarak ayrı ayrı gider. **Çevrimdışı üyeler geri geldiklerinde bekleyen mesajları otomatik alır** (en fazla 3 gün). Mesajın kaç kişiye ulaştığı görünür (ör. 2/3). Grubu yalnızca oluşturan kişi (yönetici) yeniden adlandırabilir, üye ekleyip çıkarabilir veya silebilir; yönetici sertifika parmak iziyle tanındığı için bu yetki taklit edilemez. Üyeler istedikleri zaman ayrılabilir.
+- **Sohbette dosyalar.** Bir kişiyle yapılan her gönderim ve alım, o kişinin sohbetinde dosya balonu olarak görünür: ilerleme, durum, "Klasörde göster", "İptal", "Tekrar dene". Sohbetteki ataç düğmesi ya da dosyaları açık sohbetin üzerine sürüklemek o kişiye gönderir.
+- **Gruba dosya gönderme.** Grup sohbetine dosya/klasör eklenince her üyeye ayrı bir aktarım başlar (her üye kendi ekranında onaylar). **Çevrimdışı üyeler geri geldiklerinde dosyayı otomatik alır** (en fazla 3 gün; kaynak dosyalar yerinde durmalı). Balonda kaç kişinin aldığı görünür. Alıcı, dosyayı grup sohbetinde ancak gönderen de kendisi de o grubun üyesiyse gösterir; aksi halde birebir sohbette görünür (grup kimliği taklit edilemez).
+- **Gezgin'den gönder.** Dosya ya da klasöre sağ tık → "FastFiles ile gönder" (Windows 11'de "Diğer seçenekleri göster" altında; çok sayıda dosya için "Gönder" menüsünde de bulunur). Seçilenler "Toplu gönder" penceresine gelir, alıcı seçilir. Menü yalnızca bu kullanıcı için eklenir (yönetici izni gerekmez) ve Ayarlar'dan kaldırılabilir.
 - **Ortak klasörler.** "Klasörler" sekmesinden bir klasör oluşturup kişi eklenir. Klasöre eklenen, düzenlenen veya silinen dosyalar her üyenin bilgisayarındaki kopyaya (`İndirilenler\FastFiles\Ortak\<ad>`) otomatik yansır. Klasörün sahibi isteğe bağlı şifre koyabilir. Ayrıntılar aşağıda.
 - **Oylama.** "Oylama" sekmesinden soru ve seçenekler (2–10) yazılır, oy verecek kişiler seçilir. Seçilenlere bildirim gider. Sonuçlar tüm katılımcılarda canlı güncellenir. Oy, oylama kapanana kadar değiştirilebilir. İsteğe bağlı **gizli oylama** seçilirse kimin neye oy verdiği kimseye gönderilmez, yalnızca sayılar görünür. Oyları yalnızca oylamayı açan kişi toplar ve bitirir. Oylama bilgisi yalnızca açan kişiden kabul edilir (sertifika parmak iziyle doğrulanır). Oy yalnızca katılımcılardan, açık oylamaya ve geçerli bir seçeneğe kabul edilir.
 - **Profil resmi.** Ayarlar'da 20 hazır avatardan biri seçilir (`ui/avatars/`) ya da kendi resminiz yüklenir. Resim kare kırpılıp küçültülür ve diğer cihazlarda kartlarda, sohbetlerde ve üye listelerinde görünür.
@@ -116,6 +119,7 @@ FastFiles/
         ├── protocol.rs    Mesaj formatı, güvenli yol kontrolü
         ├── pipeline.rs    Disk tarafı: okuyucu, paralel yazıcılar, blok çerçevesi, zstd
         ├── resume.rs      Yarıda kalan alımların kaydı (kaldığı yerden devam)
+        ├── shell.rs       Gezgin sağ tık menüsü ve "Gönder" kısayolu
         ├── clipboard.rs   "Panoyu gönder": dosya / ekran görüntüsü / metin
         ├── tls.rs         Sertifika parmak izi ile karşılıklı TLS
         └── config.rs      Cihaz kimliği ve ayarlar
@@ -133,6 +137,7 @@ FastFiles/
 - Alıcı `Accept` içinde her dosya için elindeki bayt sayısını (`offsets`) bildirir. Gönderen yalnızca kalan kısmı akıtır. Alıcıda tamamlanmış dosyalar hiç gönderilmez.
 - Veri en fazla 1 MB'lık bloklar halinde gider: `u32` başlık (üst bit = zstd ile sıkıştırılmış, kalan 31 bit = uzunluk) + veri. Her dosyanın blokları bitince **tüm dosyanın** 32 baytlık BLAKE3 özeti gelir. Alıcı sıkıştırılmış bloğu en fazla dosyanın kalan boyutu kadar açar; "sıkıştırma bombası" belleği şişiremez.
 - Alıcı her kabulü `resume.json`'a yazar. Kayıtta gönderenin parmak izi, aktarım kimliği ve dosya listesinin özeti bulunur. Aynı parmak izinden aynı aktarım aynı dosya listesiyle tekrar gelirse onay sorulmaz. Başka bir cihaz bu kaydı kullanamaz.
+- Gruptan gönderilen teklif `group_id` taşır; alıcı bunu kendi grup bilgisiyle doğrular.
 - Gönderen iptal ederse alıcıya ayrı bir bağlantıyla `Abort` gönderir ve alıcı yarım dosyaları siler. Duraklatırsa `PauseNotice` gönderir; yarım dosyalar korunur.
 - Eski sürümler bu alanları yok sayar ve aktarım eski yöntemle sürer.
 

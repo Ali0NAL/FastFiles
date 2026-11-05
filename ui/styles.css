@@ -194,6 +194,32 @@ a { color: var(--accent); }
 .msg.in .bubble { background: var(--surface-2); border: 1px solid var(--border); border-bottom-left-radius: 5px; }
 .msg.failed .bubble { opacity: .65; }
 .bubble-row { display: flex; align-items: center; gap: 4px; max-width: 100%; }
+/* Sohbetteki dosya balonu */
+.msg.file-msg { min-width: 230px; max-width: 86%; }
+.msg.file-msg .bubble.file-bubble {
+  background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+  padding: 10px 10px 8px; width: 100%; white-space: normal;
+}
+.msg.out.file-msg .bubble.file-bubble { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); background: var(--accent-soft); }
+.fb-row { display: flex; align-items: center; gap: 10px; }
+.fb-icon { width: 34px; height: 34px; flex-shrink: 0; border-radius: 10px; display: grid; place-items: center; background: var(--surface); color: var(--accent); }
+.fb-icon svg { width: 17px; height: 17px; }
+.fb-main { flex: 1; min-width: 0; }
+.fb-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fb-sub { font-size: 12px; color: var(--muted); }
+.fb-bar { height: 4px; border-radius: 999px; background: var(--border); overflow: hidden; margin-top: 8px; }
+.fb-bar i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width .2s linear; }
+.fb-status { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.fb-status .err, .fb-st.failed, .fb-st.declined { color: var(--danger); font-weight: 600; }
+.fb-st.done { color: var(--success); font-weight: 600; }
+.fb-st.cancelled, .fb-st.paused { color: var(--warn); font-weight: 600; }
+.attach-btn {
+  width: 40px; height: 40px; border-radius: 50%; border: 0; cursor: pointer; flex-shrink: 0;
+  display: grid; place-items: center; background: none; color: var(--muted);
+}
+.attach-btn svg { width: 19px; height: 19px; }
+.attach-btn:hover:not(:disabled) { background: var(--surface-2); color: var(--text); }
+.attach-btn:disabled { opacity: .4; cursor: default; }
 .msg.out .bubble-row { flex-direction: row-reverse; }
 .copy-btn {
   flex-shrink: 0; width: 26px; height: 26px; border-radius: 8px; border: 0; background: none; cursor: pointer;

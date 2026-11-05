@@ -76,6 +76,8 @@ pub struct Settings {
     pub compress: bool,
     /// Toplam gönderim hızı sınırı (MB/sn). 0 = sınırsız.
     pub speed_limit_mb: u32,
+    /// Gezgin'de sağ tık → "FastFiles ile gönder" menüsü.
+    pub shell_menu: bool,
 }
 
 impl Default for Settings {
@@ -91,6 +93,7 @@ impl Default for Settings {
             last_version: String::new(),
             compress: true,
             speed_limit_mb: 0,
+            shell_menu: true,
         }
     }
 }

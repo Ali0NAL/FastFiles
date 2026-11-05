@@ -44,6 +44,8 @@ png = "0.18"
 [target.'cfg(windows)'.dependencies]
 # Bildirime tıklanınca uygulamayı açabilmek için (notification eklentisi tıklamayı bildirmiyor).
 tauri-winrt-notification = "0.8.1"
+# Gezgin sağ tık menüsü ("FastFiles ile gönder") için kullanıcı kayıt defteri (HKCU).
+winreg = "0.55"
 
 [dev-dependencies]
 tempfile = "3"

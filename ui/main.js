@@ -87,6 +87,7 @@ const ic = {
   ban: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m5.6 5.6 12.8 12.8"/></svg>',
   clock: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
   checks: '<svg viewBox="0 0 24 24"><path d="m3 12 5 5L18 7M13 16l1 1L22 9"/></svg>',
+  clipAttach: '<svg viewBox="0 0 24 24"><path d="M20 11.5 12.4 19a5 5 0 0 1-7.1-7.1l7.8-7.8a3.3 3.3 0 0 1 4.7 4.7l-7.8 7.8a1.7 1.7 0 0 1-2.4-2.4l7.1-7.1"/></svg>',
   pause: '<svg viewBox="0 0 24 24"><path d="M9 6v12M15 6v12"/></svg>',
   play: '<svg viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5z"/></svg>',
   retry: '<svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>',
@@ -576,6 +577,7 @@ function onTransfer(t) {
   state.transfers.set(t.id, t);
   renderTransfer(t);
   updateTransfersChrome();
+  refreshFileBubbles(t.id);
   if (prev?.status === t.status) return;
   if (t.status === 'done') {
     if (t.direction === 'receive') {
@@ -675,7 +677,7 @@ function showNextIncoming() {
         <div class="muted small">${esc(req.ip)} · Kimlik <span class="fp">${esc(fpShort(d.fingerprint))}</span></div>
       </div>
     </div>
-    <p class="lead">Size <b>${req.fileCount} dosya</b> göndermek istiyor.</p>
+    <p class="lead">${req.group ? `<b>${esc(req.group)}</b> grubuna` : 'Size'} <b>${req.fileCount} dosya</b> göndermek istiyor.</p>
     <div class="summary"><span>${esc(req.title)}</span><span>${fmtBytes(req.total)}</span></div>
     <div class="file-list">${fileRows}${more > 0 ? `<div class="more">+ ${more} dosya daha</div>` : ''}</div>
     <label class="check"><input type="checkbox" id="trust-cb" /> <span>${esc(d.name)} gönderdiğinde bir daha sorma</span></label>
@@ -747,6 +749,8 @@ function showSettings() {
       <select class="input" id="s-limit">${limitOptions(s.speedLimitMb || 0)}</select>
       <span class="help">Büyük gönderimler ofis ağını tıkamasın diye bu bilgisayarın toplam gönderim hızını sınırlar. Alım hızı etkilenmez.</span>
     </div>
+    <label class="check"><input type="checkbox" id="s-shell" ${s.shellMenu !== false ? 'checked' : ''} />
+      <span>Gezgin'de sağ tık menüsüne "FastFiles ile gönder" ekle<br><span class="muted small">Dosya ve klasörlere sağ tıklayıp doğrudan gönderin. Windows 11'de "Diğer seçenekleri göster" altında; çok sayıda dosya için "Gönder" menüsünde de bulunur.</span></span></label>
     <label class="check"><input type="checkbox" id="s-compress" ${s.compress !== false ? 'checked' : ''} />
       <span>Uygun dosyaları sıkıştırarak gönder<br><span class="muted small">Metin, log, CSV, kaynak kod gibi dosyalar özellikle Wi-Fi'da birkaç kat hızlı gider. Zip, video, fotoğraf gibi zaten sıkıştırılmış dosyalar olduğu gibi gider. Karşı tarafta FastFiles'ın güncel sürümü olmalı.</span></span></label>
     <hr class="sep" />
@@ -851,6 +855,7 @@ function showSettings() {
         downloadDir: m.querySelector('#s-dir').value,
         closeToTray: m.querySelector('#s-tray').checked,
         compress: m.querySelector('#s-compress').checked,
+        shellMenu: m.querySelector('#s-shell').checked,
         speedLimitMb: Number(m.querySelector('#s-limit').value),
       });
       renderMe();
@@ -1027,6 +1032,7 @@ function renderChatHead() {
     const canSend = !conv.left && !g.deleted;
     const ta = $('#composer');
     ta.disabled = !canSend;
+    $('#chat-attach').disabled = !canSend;
     ta.placeholder = canSend ? 'Gruba mesaj yazın…' : 'Bu gruba mesaj gönderemezsiniz';
     $('#chat-send').disabled = !canSend || !ta.value.trim();
     updateComposerNote();
@@ -1050,6 +1056,7 @@ function renderChatHead() {
   const canSend = !!peer && !blocked;
   const ta = $('#composer');
   ta.disabled = !canSend;
+  $('#chat-attach').disabled = !canSend;
   ta.placeholder = canSend ? 'Mesaj yazın…' : blocked ? 'Bu cihazı engellediniz' : 'Cihaz çevrimdışı, mesaj gönderilemez';
   $('#chat-send').disabled = !canSend || !ta.value.trim();
   updateComposerNote();
@@ -1068,6 +1075,70 @@ function statusMeta(m) {
     return `· <span class="err" title="${esc(m.error || '')}">Gönderilemedi</span> · <button data-retry="${esc(m.id)}">Tekrar dene</button>`;
   }
   return '';
+}
+
+// Dosya balonu: durum ve ilerleme bağlı aktarım kayıtlarından (state.transfers) okunur.
+function fileBubbleInner(m) {
+  const f = m.file;
+  const ts = (f.transfers || []).map((r) => state.transfers.get(r.id)).filter(Boolean);
+  const icon = f.count > 1 ? ic.folder : ic.file;
+  let status = '';
+  let bar = '';
+  let actions = '';
+  if (m.recipients) {
+    // Grup gönderimi: kaç kişiye ulaştı?
+    const done = ts.filter((t) => t.status === 'done').length;
+    const active = ts.filter((t) => t.status === 'active' || t.status === 'waiting').length;
+    const waiting = m.pending?.length || 0;
+    const parts = [`${done}/${m.recipients} kişi aldı`];
+    if (active) parts.push(`${active} gönderiliyor`);
+    if (waiting) parts.push(`${waiting} kişi çevrimdışı · gelince gönderilecek`);
+    status = m.error ? `<span class="err">${esc(m.error)}</span>` : esc(parts.join(' · '));
+  } else if (ts.length) {
+    const t = ts[0];
+    const pct = t.total > 0 ? Math.floor((t.done / t.total) * 100) : 100;
+    const label = {
+      waiting: t.error || (t.direction === 'send' ? 'Onay bekleniyor…' : 'Hazırlanıyor…'),
+      active: `%${pct}${t.speed > 0 ? ` · ${fmtSpeed(t.speed)}` : ''}`,
+      done: t.direction === 'send' ? 'Gönderildi' : 'Alındı',
+      declined: t.error || 'Reddedildi',
+      cancelled: t.error || 'İptal edildi',
+      paused: 'Duraklatıldı',
+      failed: t.error || 'Başarısız oldu',
+    }[t.status] || '';
+    status = `<span class="fb-st ${esc(t.status)}">${esc(label)}</span>`;
+    if (t.status === 'active' || t.status === 'paused') bar = `<div class="fb-bar"><i style="width:${pct}%"></i></div>`;
+    if (t.status === 'active' || t.status === 'waiting') {
+      actions = `<button class="icon-btn sm" data-fact="cancel" data-tid="${esc(t.id)}" title="İptal et">${ic.x}</button>`;
+    } else if (t.status === 'done' && t.direction === 'receive' && t.savePath) {
+      actions = `<button class="icon-btn sm" data-fact="reveal" data-tid="${esc(t.id)}" title="Klasörde göster">${ic.reveal}</button>`;
+    } else if (t.direction === 'send' && t.sources?.length && ['failed', 'paused', 'declined', 'cancelled'].includes(t.status)) {
+      actions = t.status === 'paused'
+        ? `<button class="icon-btn sm" data-fact="retry" data-tid="${esc(t.id)}" title="Devam ettir">${ic.play}</button>`
+        : `<button class="icon-btn sm" data-fact="retry" data-tid="${esc(t.id)}" title="Tekrar dene">${ic.retry}</button>`;
+    }
+  }
+  return `
+    <div class="fb-row">
+      <span class="fb-icon">${icon}</span>
+      <div class="fb-main">
+        <div class="fb-title" title="${esc(f.title)}">${esc(f.title)}</div>
+        <div class="fb-sub">${f.count} dosya · ${fmtBytes(f.total)}</div>
+      </div>
+      ${actions}
+    </div>
+    ${bar}
+    ${status ? `<div class="fb-status">${status}</div>` : ''}`;
+}
+
+// Açık sohbetteki, bu aktarıma bağlı dosya balonlarını yeniler.
+function refreshFileBubbles(tid) {
+  if (!chatOpen()) return;
+  for (const m of state.history.get(state.openChat) || []) {
+    if (!m.file?.transfers?.some((r) => r.id === tid)) continue;
+    const el = document.querySelector(`.msg[data-id="${CSS.escape(m.id)}"] .file-bubble`);
+    if (el) el.innerHTML = fileBubbleInner(m);
+  }
 }
 
 function renderMessages(forceBottom = false) {
@@ -1100,6 +1171,16 @@ function renderMessages(forceBottom = false) {
     const sender = !m.outgoing && m.senderName && first
       ? `<div class="sender" style="color:hsl(${hue(m.sender)} 65% 55%)">${esc(m.senderName)}</div>`
       : '';
+    if (m.file) {
+      html += `
+      <div class="msg ${dir}${first ? ' first' : ''} file-msg" data-id="${esc(m.id)}">
+        ${sender}
+        <div class="bubble file-bubble">${fileBubbleInner(m)}</div>
+        <div class="meta">${esc(fmtTime(m.at))}</div>
+      </div>`;
+      prev = who;
+      continue;
+    }
     html += `
       <div class="msg ${dir}${first ? ' first' : ''}${m.status === 'failed' ? ' failed' : ''}" data-id="${esc(m.id)}">
         ${sender}
@@ -1112,6 +1193,14 @@ function renderMessages(forceBottom = false) {
   if (forceBottom || nearBottom) box.scrollTop = box.scrollHeight;
 }
 $('#messages').addEventListener('click', async (e) => {
+  const fb = e.target.closest('[data-fact]');
+  if (fb) {
+    const t = state.transfers.get(fb.dataset.tid);
+    if (fb.dataset.fact === 'cancel') call('cancel_transfer', { id: fb.dataset.tid }).catch(() => {});
+    if (fb.dataset.fact === 'retry') call('retry_transfer', { id: fb.dataset.tid }).catch(() => {});
+    if (fb.dataset.fact === 'reveal' && t?.savePath) call('reveal_path', { path: t.savePath }).catch(() => {});
+    return;
+  }
   const b = e.target.closest('[data-retry]');
   if (b && state.openChat) call('chat_retry', { fingerprint: state.openChat, id: b.dataset.retry }).catch(() => {});
   if (e.target.closest('[data-copy]')) {
@@ -1169,6 +1258,28 @@ $('#composer').addEventListener('keydown', (e) => {
   }
 });
 $('#chat-send').onclick = sendChat;
+// Açık sohbete dosya/klasör gönderir: birebir sohbette o kişiye, grupta tüm üyelere
+// (çevrimdışı üyelere geri geldiklerinde).
+async function sendToChat(paths) {
+  const key = state.openChat;
+  if (!key || !paths?.length) return;
+  if (groupOf(key)) {
+    try {
+      await call('group_send_files', { key, paths });
+    } catch { /* toast gösterildi */ }
+    return;
+  }
+  const peer = peerByFp(key);
+  if (!peer) return toast('Bu cihaz çevrimdışı, dosya gönderilemez', { type: 'error' });
+  sendPaths(peer, paths);
+}
+
+$('#chat-attach').onclick = async () => {
+  if ($('#composer').disabled) return;
+  const sel = await api.pick({ multiple: true, directory: false, title: 'Sohbete gönderilecek dosyalar' });
+  if (sel) sendToChat(Array.isArray(sel) ? sel : [sel]);
+};
+
 // Sohbette ekran görüntüsü veya Gezgin'den kopyalanan dosya yapıştırılırsa dosya olarak gönderilir.
 $('#composer').addEventListener('paste', (e) => {
   const types = [...(e.clipboardData?.types || [])];
@@ -1176,7 +1287,7 @@ $('#composer').addEventListener('paste', (e) => {
   const key = state.openChat;
   const peer = key && !groupOf(key) ? peerByFp(key) : null;
   e.preventDefault();
-  if (!peer) return toast('Gruplara dosya gönderilemiyor; bir cihaza gönderin', { type: 'error' });
+  if (!peer) return toast('Gruba yapıştırarak gönderilemiyor; ataç düğmesini ya da sürükle-bırakı kullanın', { type: 'error' });
   sendClipboard([peer.id]);
 });
 
@@ -2168,6 +2279,14 @@ function updateDragTarget(pos) {
   }
 }
 
+// Bırakma noktası açık sohbet panelinin üzerinde mi?
+function chatDropAt(pos) {
+  if (!pos || !chatOpen() || $('#composer').disabled) return false;
+  const r = window.devicePixelRatio || 1;
+  const el = document.elementFromPoint(pos.x / r, pos.y / r);
+  return !!el?.closest('#chat-view');
+}
+
 function endDrag() {
   document.body.classList.remove('dragging');
   document.querySelectorAll('.peer.drop-target').forEach((el) => el.classList.remove('drop-target'));
@@ -2180,6 +2299,7 @@ api.onDragDrop((event) => {
     if (p.paths) state.dragPaths = p.paths;
     document.body.classList.add('dragging');
     if (batch) $('#drop-msg').textContent = 'Listeye eklemek için bırakın';
+    else if (chatDropAt(p.position)) $('#drop-msg').textContent = `Bırak → ${state.chats.get(state.openChat)?.name || 'sohbet'}`;
     else if (shareDropTarget()) $('#drop-msg').textContent = `“${shareDropTarget().name}” klasörüne eklemek için bırakın`;
     else updateDragTarget(p.position);
   } else if (p.type === 'leave') {
@@ -2194,6 +2314,8 @@ api.onDragDrop((event) => {
     if (paths.length === 1 && /\.ffupdate$/i.test(paths[0])) return importUpdate(paths[0]);
     // "Toplu gönder" penceresi açıksa bırakılanlar listeye eklenir.
     if (batch) return batch.add(paths);
+    // Açık sohbetin üzerine bırakıldıysa o sohbete (kişiye ya da gruba) gider.
+    if (!modalKind && chatDropAt(p.position)) return sendToChat(paths);
     // Açık (ve kilidi açık) ortak klasör varsa dosyalar oraya eklenir.
     if (shareDropTarget()) return addToShare(shareDropTarget().id, paths);
     if (modalKind) closeModal();
@@ -2205,6 +2327,19 @@ api.onDragDrop((event) => {
 });
 
 // ───────────────────────────── Başlangıç ─────────────────────────────
+
+async function takePendingSend() {
+  const paths = await api.invoke('take_pending_send').catch(() => []);
+  if (!paths?.length) return;
+  if (modalKind === 'incoming' || modalKind === 'welcome') {
+    // Önce gelen isteğe yanıt verilsin; seçim biraz sonra açılır.
+    return setTimeout(() => showBatch(paths), 1500);
+  }
+  if (batch) return batch.add(paths);
+  const peers = state.peers.filter((p) => !p.blocked);
+  if (!peers.length) return toast('Ağda gönderilecek cihaz yok', { type: 'error' });
+  showBatch(paths, peers.length === 1 ? [peers[0].id] : []);
+}
 
 async function refreshSnapshot() {
   const snap = await api.invoke('get_snapshot');
@@ -2260,6 +2395,9 @@ async function init() {
   api.listen('transfers', (e) => setTransfers(e.payload));
   api.listen('incoming', (e) => onIncoming(e.payload));
   api.listen('incoming-closed', (e) => onIncomingClosed(e.payload));
+  // Gezgin'de sağ tık → "FastFiles ile gönder".
+  api.listen('send-request', () => takePendingSend());
+  takePendingSend();
 
   // IP değişikliklerini (Wi-Fi ↔ ethernet) yakala.
   setInterval(async () => { await refreshSnapshot().catch(() => {}); renderMe(); }, 15000);
@@ -2306,6 +2444,9 @@ function createPreviewApi() {
       { id: 'h4', outgoing: true, text: 'Süper. Akşam toplantıda konuşuruz.', at: now - 24 * 60e3, status: 'sent' },
       { id: 'h5', outgoing: true, text: 'Bir de font klasörünü unutma lütfen', at: now - 2 * 60e3, status: 'failed', error: 'Bağlantı koptu' },
       { id: 'h6', outgoing: false, text: '<b>bu HTML olarak yorumlanmamalı</b> <img src=x onerror=alert(1)>', at: now - 60e3, status: 'received' },
+      { id: 'f-t2', outgoing: false, text: '📎 logo-v3.psd', at: now - 50e3, status: 'received', file: { title: 'logo-v3.psd', count: 1, total: 84e6, transfers: [{ to: 'me', id: 't2' }] } },
+      { id: 'f-t8', outgoing: true, text: '📎 Çekim_RAW', at: now - 40e3, status: 'sent', file: { title: 'Çekim_RAW', count: 412, total: 38e9, transfers: [{ to: 'x', id: 't8' }] } },
+      { id: 'f-t4', outgoing: true, text: '📎 sunum.pptx', at: now - 30e3, status: 'sent', file: { title: 'sunum.pptx', count: 1, total: 12e6, transfers: [{ to: 'x', id: 't4' }] } },
     ],
   };
   snap.conversations = [
@@ -2330,6 +2471,7 @@ function createPreviewApi() {
     { id: 'g4', system: true, text: 'Mehmet (İzinde) gruba eklendi', at: now - 30 * 60e3 },
     { id: 'g5', outgoing: true, text: 'Evet, 18:00 gibi paylaşırım 👍', at: now - 20 * 60e3, status: 'sending', recipients: 3, pending: [fpM] },
     { id: 'g6', outgoing: false, sender: fp1, senderName: 'Ahmet', text: 'Süper, teşekkürler', at: now - 5 * 60e3, status: 'received' },
+    { id: 'g7', outgoing: true, text: '📎 Toplantı notları', at: now - 3 * 60e3, status: 'sending', recipients: 3, pending: [fpM], file: { title: 'Toplantı notları', count: 6, total: 4.2e6, transfers: [{ to: fp1, id: 't2' }, { to: fp2, id: 't3' }] } },
   ];
   snap.conversations.unshift({ fingerprint: gkey, name: 'Proje Ekibi', unread: 1, last: history[gkey].at(-1), group, left: false });
 
@@ -2501,6 +2643,8 @@ function createPreviewApi() {
       if (cmd === 'remove_transfer') return (snap.transfers = snap.transfers.filter((t) => t.id !== args.id));
       if (cmd === 'retry_transfer') return args.id;
       if (cmd === 'pause_transfer') return null;
+      if (cmd === 'take_pending_send') return location.hash.includes('sendto') ? ['C:\\Projeler\\Teklif.docx', 'C:\\Projeler\\Görseller'] : [];
+      if (cmd === 'group_send_files') return null;
       if (cmd === 'send_clipboard') return { kind: 'image', count: args.peerIds.length };
       return snap.settings;
     },
