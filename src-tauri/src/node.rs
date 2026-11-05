@@ -11,6 +11,8 @@ mod avatar;
 pub mod share;
 #[path = "poll.rs"]
 pub mod poll;
+#[path = "game.rs"]
+pub mod game;
 
 use crate::chat::{ChatMessage, ChatStore, ConversationSummary, FileRef, FileTransferRef, MsgStatus};
 use crate::config::{fingerprint, Identity, Settings, TrustedDevice};
@@ -263,6 +265,8 @@ pub struct Node {
     unlock_attempts: Mutex<HashMap<String, VecDeque<Instant>>>,
     polls: Mutex<HashMap<String, poll::PollState>>,
     polls_path: PathBuf,
+    games: Mutex<HashMap<String, game::RoomState>>,
+    games_path: PathBuf,
     pub shutdown: CancellationToken,
 }
 
@@ -341,6 +345,8 @@ impl Node {
             unlock_attempts: Mutex::new(HashMap::new()),
             polls: Mutex::new(HashMap::new()),
             polls_path: config_dir.join("polls.json"),
+            games: Mutex::new(HashMap::new()),
+            games_path: config_dir.join("games.json"),
             shutdown: CancellationToken::new(),
         });
         node.load_cached_package();
@@ -349,6 +355,7 @@ impl Node {
         let _ = std::fs::create_dir_all(&node.shares_dir);
         node.load_shares();
         node.load_polls();
+        node.load_games();
         Ok(node)
     }
 
@@ -1129,6 +1136,20 @@ impl Node {
                     return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
                 }
                 let reply = self.accept_poll_vote(&client_fp, &poll_id, option);
+                write_msg(&mut wr, &reply).await.map_err(|e| e.to_string())
+            }
+            Message::GameUpdate { device, room, host_name } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                let reply = self.accept_game_update(&client_fp, room, &host_name);
+                write_msg(&mut wr, &reply).await.map_err(|e| e.to_string())
+            }
+            Message::GameAction { device, room_id, action } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                let reply = self.accept_game_action(&client_fp, &room_id, action);
                 write_msg(&mut wr, &reply).await.map_err(|e| e.to_string())
             }
             Message::AvatarRequest => {
@@ -4119,6 +4140,134 @@ mod tests {
         bob.share_delete(&s.id, false).unwrap();
         assert!(bob.share_list().is_empty());
         assert!(bob_dir.join("a.txt").exists());
+    }
+
+    // ───────────── Oyun testleri ─────────────
+
+    fn game_of(node: &Node, id: &str) -> Option<game::GameView> {
+        node.game_list().into_iter().find(|g| g.room.id == id)
+    }
+
+    async fn game_ticks(nodes: &[&Arc<Node>], mut cond: impl FnMut() -> bool) {
+        for _ in 0..100 {
+            if cond() {
+                return;
+            }
+            for n in nodes {
+                n.flush_games();
+            }
+            sleep(Duration::from_millis(60)).await;
+        }
+        panic!("oyun zamanında eşitlenmedi");
+    }
+
+    #[tokio::test]
+    async fn chess_invite_play_and_checkmate() {
+        use game::{GameAction, RoomStatus};
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        let mallory = make_node(tmp.path(), "mallory").await;
+        introduce_all(&[&alice, &bob, &mallory]);
+        let all = [&alice, &bob, &mallory];
+        let (afp, bfp, mfp) = (alice.identity.fingerprint.clone(), bob.identity.fingerprint.clone(), mallory.identity.fingerprint.clone());
+        let mv = |m: &str| GameAction::Move { mv: m.into() };
+
+        assert!(alice.game_invite("chess", &[], None).is_err(), "rakip gerekli");
+        assert!(alice.game_invite("chess", &[bfp.clone(), mfp.clone()], None).is_err(), "satranç iki kişilik");
+        // Alice beyaz.
+        let g = alice.game_invite("chess", &[bfp.clone()], Some(0)).unwrap();
+        let id = g.room.id.clone();
+        game_ticks(&all, || game_of(&bob, &id).is_some_and(|v| v.needs_me && v.room.status == RoomStatus::Invited)).await;
+        assert!(game_of(&mallory, &id).is_none(), "davet edilmeyen odayı görmez");
+        assert!(bob.game_act(&id, mv("e7e5")).is_err(), "kabul etmeden hamle olmaz");
+
+        bob.game_act(&id, GameAction::Join).unwrap();
+        game_ticks(&all, || game_of(&alice, &id).is_some_and(|v| v.room.status == RoomStatus::Active && v.my_turn)).await;
+        assert!(alice.game_act(&id, mv("e2e5")).is_err(), "kurala aykırı hamle");
+        assert!(!game_of(&bob, &id).unwrap().my_turn);
+
+        let line = [(&alice, "e2e4"), (&bob, "e7e5"), (&alice, "d1h5"), (&bob, "b8c6"), (&alice, "f1c4"), (&bob, "g8f6")];
+        for (i, (who, m)) in line.iter().enumerate() {
+            game_ticks(&all, || game_of(who, &id).is_some_and(|v| v.my_turn && v.legal.iter().any(|l| l == m))).await;
+            who.game_act(&id, mv(m)).unwrap();
+            game_ticks(&all, || {
+                game_of(&alice, &id).is_some_and(|v| v.room.moves.len() == i + 1) && game_of(&bob, &id).is_some_and(|v| v.room.moves.len() == i + 1)
+            })
+            .await;
+        }
+
+        // Saldırılar: oyuncu olmayan hamle yapamaz; sahip, Bob adına hamle uyduramaz ve geçmişi değiştiremez;
+        // başkası sahipmiş gibi oda gönderemez.
+        assert!(matches!(alice.accept_game_action(&mfp, &id, mv("h5f7")), Message::GameReply { ok: false, .. }));
+        let current = game_of(&bob, &id).unwrap().room;
+        let mut forged = current.clone();
+        forged.moves.extend(["a2a3".to_string(), "a7a6".to_string()]);
+        forged.rev += 1;
+        assert!(matches!(bob.accept_game_update(&afp, forged, "alice"), Message::GameReply { ok: false, .. }));
+        let mut rewritten = current.clone();
+        rewritten.moves[1] = "d7d5".into();
+        rewritten.rev += 1;
+        assert!(matches!(bob.accept_game_update(&afp, rewritten, "alice"), Message::GameReply { ok: false, .. }));
+        let mut resigned = current.clone();
+        resigned.status = RoomStatus::Finished;
+        resigned.result = Some(game::GameResult { winner: Some(afp.clone()), reason: "resign".into(), by: Some(bfp.clone()) });
+        resigned.rev += 1;
+        assert!(matches!(bob.accept_game_update(&afp, resigned, "alice"), Message::GameReply { ok: false, .. }));
+        let mut stolen = current.clone();
+        stolen.rev += 5;
+        assert!(matches!(bob.accept_game_update(&mfp, stolen, "mallory"), Message::GameReply { ok: false, .. }));
+        assert_eq!(game_of(&bob, &id).unwrap().room.moves, current.moves);
+
+        // Alice mat eder.
+        alice.game_act(&id, mv("h5f7")).unwrap();
+        game_ticks(&all, || game_of(&bob, &id).is_some_and(|v| v.room.status == RoomStatus::Finished)).await;
+        let v = game_of(&bob, &id).unwrap();
+        let r = v.room.result.unwrap();
+        assert_eq!((r.winner.as_deref(), r.reason.as_str()), (Some(afp.as_str()), "checkmate"));
+        assert_eq!(v.info["san"].as_array().unwrap().last().unwrap(), "Qxf7#");
+        assert!(bob.game_act(&id, mv("e8e7")).is_err());
+
+        // Listeden kaldırma yalnızca yerel.
+        bob.game_remove(&id).unwrap();
+        assert!(game_of(&bob, &id).is_none());
+        assert!(game_of(&alice, &id).is_some());
+    }
+
+    /// Oyuncu pes eder / beraberlik teklif eder; sahip çevrimdışıyken hamle bekler, gelince iletilir.
+    #[tokio::test]
+    async fn chess_draw_offer_resign_and_decline() {
+        use game::{GameAction, RoomStatus};
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        introduce_all(&[&alice, &bob]);
+        let all = [&alice, &bob];
+        let bfp = bob.identity.fingerprint.clone();
+
+        // Reddedilen davet.
+        let declined = alice.game_invite("chess", &[bfp.clone()], None).unwrap().room.id;
+        game_ticks(&all, || game_of(&bob, &declined).is_some()).await;
+        bob.game_act(&declined, GameAction::Decline).unwrap();
+        game_ticks(&all, || game_of(&alice, &declined).is_some_and(|v| v.room.status == RoomStatus::Declined)).await;
+
+        // Alice siyah: Bob (beyaz) başlar.
+        let id = alice.game_invite("chess", &[bfp.clone()], Some(1)).unwrap().room.id;
+        game_ticks(&all, || game_of(&bob, &id).is_some()).await;
+        bob.game_act(&id, GameAction::Join).unwrap();
+        game_ticks(&all, || game_of(&bob, &id).is_some_and(|v| v.my_turn)).await;
+        assert_eq!(game_of(&bob, &id).unwrap().my_seat, Some(0));
+        bob.game_act(&id, GameAction::Move { mv: "d2d4".into() }).unwrap();
+        bob.game_act(&id, GameAction::OfferDraw).unwrap();
+        game_ticks(&all, || game_of(&alice, &id).is_some_and(|v| v.room.draw_offer.as_deref() == Some(bfp.as_str()) && v.needs_me)).await;
+        // Alice hamle yaparak teklifi reddeder, sonra Bob pes eder.
+        alice.game_act(&id, GameAction::Move { mv: "d7d5".into() }).unwrap();
+        game_ticks(&all, || game_of(&bob, &id).is_some_and(|v| v.my_turn && v.room.draw_offer.is_none())).await;
+        bob.game_act(&id, GameAction::Resign).unwrap();
+        game_ticks(&all, || game_of(&alice, &id).is_some_and(|v| v.room.status == RoomStatus::Finished)).await;
+        let r = game_of(&alice, &id).unwrap().room.result.unwrap();
+        assert_eq!((r.reason.as_str(), r.by.as_deref()), ("resign", Some(bfp.as_str())));
+        game_ticks(&all, || game_of(&bob, &id).is_some_and(|v| v.room.status == RoomStatus::Finished && !v.pending)).await;
     }
 
     // ───────────── Oylama testleri ─────────────

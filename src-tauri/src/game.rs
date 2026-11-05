@@ -1,0 +1,932 @@
+//! Oyun odaları (`node` modülünün alt modülü): davet, kabul/red, hamleler, beraberlik, pes etme.
+//!
+//! Akış: bir kişi oyun ve rakip(ler) seçip davet gönderir; bu kişi odanın **sahibi** olur.
+//! Davet edilenler kabul edince oda açılır ve oyun başlar. Sunucu yoktur: oda sahibi tek
+//! yetkilidir. Her hamle sahibine gider, sahip kurallarla (`crate::games`) doğrular, odayı
+//! günceller ve yeni hâlini tüm oyunculara iletir. Sahibin kendi hamleleri doğrudan uygulanır.
+//! Çevrimdışı olan oyuncuya bekleyen güncelleme/hamle, çevrimiçi olunca otomatik iletilir.
+//!
+//! Güvenlik
+//! - Oda bilgisi yalnızca sahibinden kabul edilir (TLS sertifika parmak izi), `rev` ile sıralanır.
+//! - Oyuncu, sahipten gelen hamle listesini kurallarla baştan oynatıp doğrular; geçmiş yeniden
+//!   yazılamaz (yeni liste eskisinin devamı olmalı) ve oyuncunun kendi sırasındaki hamleler
+//!   ancak oyuncunun gerçekten gönderdiği hamleler olabilir. Sahip, oyuncu adına "kabul etti",
+//!   "pes etti" ya da "beraberliğe razı oldu" diyemez.
+//! - Hamle yalnızca odanın oyuncularından, sırası gelen kişiden ve kurallara uygunsa kabul edilir.
+//! - Aynı kişiden bekleyen davet sayısı sınırlıdır (davet yağmuruna karşı).
+
+use super::*;
+use crate::chat::GroupMember;
+use crate::games;
+
+/// Saklanan en fazla oda (bitenler en eskiden başlayarak silinir).
+const MAX_ROOMS: usize = 200;
+/// Bir kişiden aynı anda bekleyen en fazla davet.
+const MAX_INVITES_PER_HOST: usize = 5;
+/// Gönderilemeyen güncelleme/hamle bu kadar sonra yeniden denenir.
+const GAME_RETRY: Duration = Duration::from_secs(4);
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RoomStatus {
+    /// Davet gönderildi, herkes henüz kabul etmedi.
+    #[default]
+    Invited,
+    Active,
+    Finished,
+    /// Davet edilenlerden biri reddetti.
+    Declined,
+    /// Sahip daveti geri çekti.
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GameResult {
+    /// Kazananın parmak izi (berabere ise boş).
+    #[serde(default)]
+    pub winner: Option<String>,
+    /// "checkmate" | "stalemate" | "repetition" | "fifty" | "material" | "resign" | "agreement"
+    pub reason: String,
+    /// Sonucu doğuran oyuncu (pes eden ya da beraberliği kabul eden).
+    #[serde(default)]
+    pub by: Option<String>,
+}
+
+/// Oyunculara gönderilen oda.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GameRoom {
+    pub id: String,
+    /// Oyun türü (`games::CATALOG`), ör. "chess".
+    pub game: String,
+    /// Oda sahibi (daveti gönderen).
+    pub host: String,
+    /// Oyuncular, koltuk sırasıyla (satrançta 0 = beyaz, 1 = siyah).
+    pub players: Vec<GroupMember>,
+    /// Daveti kabul etmiş olanlar (sahip baştan kabul etmiş sayılır).
+    pub joined: Vec<String>,
+    pub status: RoomStatus,
+    pub moves: Vec<String>,
+    #[serde(default)]
+    pub result: Option<GameResult>,
+    /// Beraberlik teklif eden oyuncu (bekleyen teklif yoksa boş).
+    #[serde(default)]
+    pub draw_offer: Option<String>,
+    pub rev: u64,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+impl GameRoom {
+    fn seat_of(&self, fp: &str) -> Option<usize> {
+        self.players.iter().position(|p| p.fingerprint == fp)
+    }
+    fn name_of(&self, fp: &str) -> String {
+        self.players.iter().find(|p| p.fingerprint == fp).map(|p| p.name.clone()).unwrap_or_else(|| "?".into())
+    }
+}
+
+/// Oyuncunun odadaki hamlesi ya da kararı.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum GameAction {
+    /// Daveti kabul et.
+    Join,
+    /// Daveti reddet (sahip için: daveti geri çek).
+    Decline,
+    Move { mv: String },
+    Resign,
+    OfferDraw,
+    AcceptDraw,
+    DeclineDraw,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct RoomState {
+    room: GameRoom,
+    host_name: String,
+    /// (Sahip) güncel odayı henüz almamış oyuncular
+    #[serde(default)]
+    sync_pending: Vec<String>,
+    /// (Oyuncu) sahibine henüz ulaşmamış hamle/kararlar, sırasıyla
+    #[serde(default)]
+    outbox: Vec<GameAction>,
+    /// (Oyuncu) gönderdiğim hamleler: (yarım hamle sırası, hamle)
+    #[serde(default)]
+    my_moves: Vec<(usize, String)>,
+    /// (Oyuncu) sahibine bildirdiğim kararlar: "join", "resign", "draw"
+    #[serde(default)]
+    claims: Vec<String>,
+    /// Listeden kaldırıldı; bekleyen iletimler bitince tamamen silinir.
+    #[serde(default)]
+    hidden: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameView {
+    #[serde(flatten)]
+    pub room: GameRoom,
+    /// Oyunun görünen adı, ör. "Satranç".
+    pub title: String,
+    pub host_name: String,
+    pub is_host: bool,
+    pub my_seat: Option<usize>,
+    /// Sırası gelen koltuk (oyun sürmüyorsa boş).
+    pub turn: Option<usize>,
+    pub my_turn: bool,
+    /// Sıra bendeyse yapabileceğim hamleler.
+    pub legal: Vec<String>,
+    /// Oyuna özel durum (satrançta FEN, şah, hamle notasyonu).
+    pub info: Value,
+    /// Hamlem/kararım sahibine iletiliyor.
+    pub pending: bool,
+    /// Benden bir şey bekleniyor (davet, hamle, beraberlik teklifi).
+    pub needs_me: bool,
+}
+
+fn reject(reason: &str) -> Message {
+    Message::GameReply { ok: false, reason: reason.into(), room: None, host_name: String::new() }
+}
+
+fn game_title(id: &str) -> &'static str {
+    games::def(id).map(|d| d.name).unwrap_or("Oyun")
+}
+
+fn reason_text(reason: &str) -> &'static str {
+    match reason {
+        "checkmate" => "şah mat",
+        "stalemate" => "pat",
+        "repetition" => "üç kez tekrar",
+        "fifty" => "50 hamle kuralı",
+        "material" => "yetersiz malzeme",
+        "resign" => "pes etme",
+        "agreement" => "anlaşma",
+        _ => "oyun bitti",
+    }
+}
+
+/// Kullanıcıya gösterilecek hata metni.
+fn action_error(reason: &str) -> String {
+    match reason {
+        "not_player" => "Bu oyunda oyuncu değilsiniz",
+        "closed" => "Oyun artık sürmüyor",
+        "not_your_turn" => "Sıra sizde değil",
+        "illegal" => "Kurallara aykırı hamle",
+        "no_offer" => "Bekleyen beraberlik teklifi yok",
+        _ => "Geçersiz işlem",
+    }
+    .into()
+}
+
+/// "Kazandınız (şah mat)" gibi kısa sonuç satırı.
+fn result_line(room: &GameRoom, me: &str) -> String {
+    let Some(r) = &room.result else { return "Oyun bitti".into() };
+    let why = reason_text(&r.reason);
+    if r.reason == "resign" {
+        let by = r.by.as_deref().unwrap_or("");
+        return if by == me { "Pes ettiniz".into() } else { format!("{} pes etti — kazandınız", room.name_of(by)) };
+    }
+    match &r.winner {
+        Some(w) if w == me => format!("Kazandınız ({why})"),
+        Some(w) => format!("{} kazandı ({why})", room.name_of(w)),
+        None => format!("Berabere ({why})"),
+    }
+}
+
+fn finish(room: &mut GameRoom, winner: Option<String>, reason: &str, by: Option<String>) {
+    room.status = RoomStatus::Finished;
+    room.result = Some(GameResult { winner, reason: reason.into(), by });
+    room.draw_offer = None;
+}
+
+/// Odanın kural makinesi (sahipte çalışır; oyuncu da göndermeden önce aynısıyla dener).
+/// `Ok(Some(oda))`: yeni hâl, `Ok(None)`: zaten yapılmış (tekrar gelen istek), `Err`: reddedildi.
+fn apply(room: &GameRoom, sender: &str, action: &GameAction) -> Result<Option<GameRoom>, &'static str> {
+    let seat = room.seat_of(sender).ok_or("not_player")?;
+    let mut r = room.clone();
+    match action {
+        GameAction::Join => match r.status {
+            RoomStatus::Invited if r.joined.iter().any(|f| f == sender) => return Ok(None),
+            RoomStatus::Invited => {
+                r.joined.push(sender.to_string());
+                if r.players.iter().all(|p| r.joined.contains(&p.fingerprint)) {
+                    r.status = RoomStatus::Active;
+                }
+            }
+            RoomStatus::Active if r.joined.iter().any(|f| f == sender) => return Ok(None),
+            _ => return Err("closed"),
+        },
+        GameAction::Decline => match r.status {
+            RoomStatus::Invited => r.status = if sender == r.host { RoomStatus::Cancelled } else { RoomStatus::Declined },
+            RoomStatus::Declined | RoomStatus::Cancelled => return Ok(None),
+            _ => return Err("closed"),
+        },
+        GameAction::Move { mv } => {
+            if r.status != RoomStatus::Active {
+                return Err("closed");
+            }
+            if !games::valid_move_text(mv) {
+                return Err("illegal");
+            }
+            let now = games::evaluate(&r.game, &r.moves).map_err(|_| "invalid")?;
+            if now.turn != Some(seat) {
+                return Err("not_your_turn");
+            }
+            if !now.legal.contains(mv) {
+                return Err("illegal");
+            }
+            r.moves.push(mv.clone());
+            // Hamle yapmak, rakibin bekleyen beraberlik teklifini reddetmek demektir.
+            if r.draw_offer.as_deref().is_some_and(|d| d != sender) {
+                r.draw_offer = None;
+            }
+            let after = games::evaluate(&r.game, &r.moves).map_err(|_| "invalid")?;
+            if let Some(o) = after.outcome {
+                let winner = o.winner.and_then(|s| r.players.get(s)).map(|p| p.fingerprint.clone());
+                finish(&mut r, winner, o.reason, None);
+            }
+        }
+        GameAction::Resign => match r.status {
+            RoomStatus::Active => {
+                // İki kişilik oyunda diğer oyuncu kazanır.
+                let winner = (r.players.len() == 2).then(|| r.players[1 - seat].fingerprint.clone());
+                finish(&mut r, winner, "resign", Some(sender.to_string()));
+            }
+            RoomStatus::Invited => return apply(room, sender, &GameAction::Decline),
+            _ => return Err("closed"),
+        },
+        GameAction::OfferDraw => {
+            if r.status != RoomStatus::Active {
+                return Err("closed");
+            }
+            match r.draw_offer.clone() {
+                Some(d) if d == sender => return Ok(None),
+                // Karşı taraf zaten teklif etmişse bu bir kabuldür.
+                Some(_) => finish(&mut r, None, "agreement", Some(sender.to_string())),
+                None => r.draw_offer = Some(sender.to_string()),
+            }
+        }
+        GameAction::AcceptDraw => {
+            if r.status != RoomStatus::Active {
+                return Err("closed");
+            }
+            match r.draw_offer.as_deref() {
+                Some(d) if d != sender => finish(&mut r, None, "agreement", Some(sender.to_string())),
+                _ => return Err("no_offer"),
+            }
+        }
+        GameAction::DeclineDraw => {
+            if r.status != RoomStatus::Active || !r.draw_offer.as_deref().is_some_and(|d| d != sender) {
+                return Ok(None);
+            }
+            r.draw_offer = None;
+        }
+    }
+    Ok(Some(r))
+}
+
+/// Ağdan gelen odayı doğrular ve temizler.
+fn clean_room(mut r: GameRoom) -> Option<GameRoom> {
+    if !valid_message_id(&r.id) || !valid_fingerprint(&r.host) {
+        return None;
+    }
+    let def = games::def(&r.game)?;
+    let mut seen = HashSet::new();
+    r.players = r
+        .players
+        .into_iter()
+        .filter(|p| valid_fingerprint(&p.fingerprint) && seen.insert(p.fingerprint.clone()))
+        .map(|p| GroupMember { name: sanitize_name(&p.name), fingerprint: p.fingerprint })
+        .collect();
+    if r.players.len() < def.min_players || r.players.len() > def.max_players || r.seat_of(&r.host).is_none() {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    let players: HashSet<String> = r.players.iter().map(|p| p.fingerprint.clone()).collect();
+    r.joined.retain(|f| players.contains(f) && seen.insert(f.clone()));
+    if r.moves.len() > games::MAX_MOVES || !r.moves.iter().all(|m| games::valid_move_text(m)) {
+        return None;
+    }
+    if r.draw_offer.as_ref().is_some_and(|d| !players.contains(d)) {
+        r.draw_offer = None;
+    }
+    if let Some(res) = &mut r.result {
+        res.reason = sanitize_text(&res.reason, 24);
+        if res.winner.as_ref().is_some_and(|w| !players.contains(w)) || res.by.as_ref().is_some_and(|b| !players.contains(b)) {
+            return None;
+        }
+    }
+    Some(r)
+}
+
+impl Node {
+    pub(super) fn load_games(&self) {
+        let list: Vec<RoomState> = std::fs::read(&self.games_path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let mut map = self.games.lock().unwrap();
+        for st in list {
+            map.insert(st.room.id.clone(), st);
+        }
+    }
+
+    fn save_games(&self, map: &HashMap<String, RoomState>) {
+        let list: Vec<&RoomState> = map.values().collect();
+        if let Ok(json) = serde_json::to_vec(&list) {
+            let tmp = self.games_path.with_extension("json.tmp");
+            if std::fs::write(&tmp, json).is_ok() {
+                let _ = std::fs::rename(&tmp, &self.games_path);
+            }
+        }
+    }
+
+    fn game_view(&self, st: &RoomState) -> GameView {
+        let me = &self.identity.fingerprint;
+        let room = &st.room;
+        let seat = room.seat_of(me);
+        let eval = games::evaluate(&room.game, &room.moves).ok();
+        let active = room.status == RoomStatus::Active;
+        let turn = if active { eval.as_ref().and_then(|e| e.turn) } else { None };
+        let pending = !st.outbox.is_empty();
+        let my_turn = active && turn.is_some() && turn == seat && !pending;
+        let invited = room.status == RoomStatus::Invited && seat.is_some() && !room.joined.contains(me) && !pending;
+        let draw_for_me = active && !pending && room.draw_offer.as_ref().is_some_and(|d| d != me);
+        GameView {
+            room: room.clone(),
+            title: game_title(&room.game).into(),
+            host_name: st.host_name.clone(),
+            is_host: room.host == *me,
+            my_seat: seat,
+            turn,
+            my_turn,
+            legal: if my_turn { eval.as_ref().map(|e| e.legal.clone()).unwrap_or_default() } else { Vec::new() },
+            info: eval.map(|e| e.info).unwrap_or(Value::Null),
+            pending,
+            needs_me: invited || my_turn || draw_for_me,
+        }
+    }
+
+    pub fn game_list(&self) -> Vec<GameView> {
+        let map = self.games.lock().unwrap();
+        let mut list: Vec<GameView> = map.values().filter(|s| !s.hidden).map(|s| self.game_view(s)).collect();
+        list.sort_by(|a, b| b.room.updated_at.cmp(&a.room.updated_at));
+        list
+    }
+
+    fn emit_games(&self) {
+        self.emit("games", json!(self.game_list()));
+    }
+
+    fn notify_game(&self, room_id: &str, title: &str, body: &str) {
+        self.notify_to(title, body, json!({ "view": "games", "id": room_id }));
+    }
+
+    /// (Sahip) oda değişti: sürümü artırır, diğer oyunculara gönderilmek üzere işaretler.
+    fn touch_room(&self, st: &mut RoomState) {
+        let me = &self.identity.fingerprint;
+        st.room.rev += 1;
+        st.room.updated_at = now_ms();
+        st.sync_pending = st.room.players.iter().map(|p| p.fingerprint.clone()).filter(|f| f != me).collect();
+    }
+
+    /// Oda sayısı sınırı: en eski bitmiş/kapalı odalar silinir.
+    fn prune_games(map: &mut HashMap<String, RoomState>) {
+        if map.len() <= MAX_ROOMS {
+            return;
+        }
+        let mut closed: Vec<(u64, String)> = map
+            .values()
+            .filter(|s| !matches!(s.room.status, RoomStatus::Invited | RoomStatus::Active) && s.sync_pending.is_empty() && s.outbox.is_empty())
+            .map(|s| (s.room.updated_at, s.room.id.clone()))
+            .collect();
+        closed.sort();
+        for (_, id) in closed.into_iter().take(map.len() - MAX_ROOMS) {
+            map.remove(&id);
+        }
+    }
+
+    // ───────────── Kullanıcı işlemleri ─────────────
+
+    /// Oyun daveti gönderir. `my_seat`: sahibin koltuğu (satrançta 0 beyaz, 1 siyah); boşsa rastgele.
+    pub fn game_invite(self: &Arc<Self>, game: &str, opponents: &[String], my_seat: Option<usize>) -> Result<GameView, String> {
+        let def = games::def(game).ok_or("Bilinmeyen oyun")?;
+        let me = self.identity.fingerprint.clone();
+        let my_name = self.device_info().name;
+        let mut others: Vec<GroupMember> = Vec::new();
+        for fp in opponents {
+            if *fp == me || !valid_fingerprint(fp) || others.iter().any(|o| o.fingerprint == *fp) {
+                continue;
+            }
+            if self.is_blocked(fp) {
+                return Err("Engellediğiniz bir kişiyi davet edemezsiniz".into());
+            }
+            let name = self.name_for(fp).ok_or("Davet edilen kişi bulunamadı")?;
+            others.push(GroupMember { fingerprint: fp.clone(), name });
+        }
+        let total = others.len() + 1;
+        if total < def.min_players || total > def.max_players {
+            let need = if def.min_players == def.max_players {
+                format!("{} rakip", def.min_players - 1)
+            } else {
+                format!("{}–{} rakip", def.min_players - 1, def.max_players - 1)
+            };
+            return Err(format!("{} için {need} seçin", def.name));
+        }
+        let seat = match my_seat {
+            Some(s) if s < total => s,
+            _ => uuid::Uuid::new_v4().as_bytes()[0] as usize % total,
+        };
+        let mut players = others;
+        players.insert(seat, GroupMember { fingerprint: me.clone(), name: my_name.clone() });
+        let now = now_ms();
+        let room = GameRoom {
+            id: uuid::Uuid::new_v4().to_string(),
+            game: def.id.into(),
+            host: me.clone(),
+            players,
+            joined: vec![me.clone()],
+            status: RoomStatus::Invited,
+            moves: Vec::new(),
+            result: None,
+            draw_offer: None,
+            rev: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        let st = RoomState {
+            sync_pending: room.players.iter().map(|p| p.fingerprint.clone()).filter(|f| *f != me).collect(),
+            room,
+            host_name: my_name,
+            ..Default::default()
+        };
+        let view = self.game_view(&st);
+        {
+            let mut map = self.games.lock().unwrap();
+            map.insert(st.room.id.clone(), st);
+            Self::prune_games(&mut map);
+            self.save_games(&map);
+        }
+        self.emit_games();
+        self.flush_games();
+        Ok(view)
+    }
+
+    /// Kullanıcının hamlesi/kararı. Sahipte hemen uygulanır; oyuncuda sahibine gönderilir.
+    pub fn game_act(self: &Arc<Self>, id: &str, action: GameAction) -> Result<(), String> {
+        {
+            let mut map = self.games.lock().unwrap();
+            let st = map.get_mut(id).ok_or("Oyun bulunamadı")?;
+            self.act_locked(st, action)?;
+            self.save_games(&map);
+        }
+        self.emit_games();
+        self.flush_games();
+        Ok(())
+    }
+
+    fn act_locked(&self, st: &mut RoomState, action: GameAction) -> Result<(), String> {
+        let me = self.identity.fingerprint.clone();
+        if st.room.host == me {
+            if let Some(next) = apply(&st.room, &me, &action).map_err(action_error)? {
+                st.room = next;
+                self.touch_room(st);
+            }
+            return Ok(());
+        }
+        // Önce aynı kurallarla dene (sahip de aynısını uygular); bekleyenler de hesaba katılır.
+        let mut sim = st.room.clone();
+        for a in &st.outbox {
+            if let Ok(Some(n)) = apply(&sim, &me, a) {
+                sim = n;
+            }
+        }
+        let Some(next) = apply(&sim, &me, &action).map_err(action_error)? else { return Ok(()) };
+        match &action {
+            GameAction::Move { mv } => st.my_moves.push((next.moves.len() - 1, mv.clone())),
+            GameAction::Join => st.claims.push("join".into()),
+            GameAction::Resign => st.claims.push("resign".into()),
+            GameAction::OfferDraw | GameAction::AcceptDraw => st.claims.push("draw".into()),
+            _ => {}
+        }
+        st.outbox.push(action);
+        Ok(())
+    }
+
+    /// Oyunu listeden kaldırır. Bekleyen davet reddedilir/geri çekilir, süren oyunda pes edilir.
+    pub fn game_remove(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        let me = self.identity.fingerprint.clone();
+        {
+            let mut map = self.games.lock().unwrap();
+            let st = map.get_mut(id).ok_or("Oyun bulunamadı")?;
+            if st.room.seat_of(&me).is_some() {
+                let action = match st.room.status {
+                    RoomStatus::Invited => Some(GameAction::Decline),
+                    RoomStatus::Active => Some(GameAction::Resign),
+                    _ => None,
+                };
+                if let Some(a) = action {
+                    let _ = self.act_locked(st, a);
+                }
+            }
+            st.hidden = true;
+            if st.sync_pending.is_empty() && st.outbox.is_empty() {
+                map.remove(id);
+            }
+            self.save_games(&map);
+        }
+        self.emit_games();
+        self.flush_games();
+        Ok(())
+    }
+
+    // ───────────── Teslimat ─────────────
+
+    /// Bekleyen oda güncellemelerini ve hamleleri çevrimiçi olanlara gönderir. Her değişiklikten
+    /// hemen sonra ve keşif döngüsünde (yeniden deneme için) çağrılır.
+    pub fn flush_games(self: &Arc<Self>) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let me = self.identity.fingerprint.clone();
+        let online: HashMap<String, Peer> =
+            self.peers().into_iter().filter(|p| !p.blocked).map(|p| (p.fingerprint.clone(), p)).collect();
+        let mut jobs: Vec<(Peer, String, Message)> = Vec::new();
+        {
+            let mut map = self.games.lock().unwrap();
+            let before = map.len();
+            map.retain(|_, s| !(s.hidden && s.sync_pending.is_empty() && s.outbox.is_empty()));
+            if map.len() != before {
+                self.save_games(&map);
+            }
+            for st in map.values() {
+                if st.room.host == me {
+                    for fp in &st.sync_pending {
+                        if let Some(p) = online.get(fp) {
+                            let msg = Message::GameUpdate { device: self.device_info(), room: st.room.clone(), host_name: st.host_name.clone() };
+                            jobs.push((p.clone(), format!("game:{}:sync:{fp}:{}", st.room.id, st.room.rev), msg));
+                        }
+                    }
+                } else if let (Some(action), Some(p)) = (st.outbox.first(), online.get(&st.room.host)) {
+                    let msg = Message::GameAction { device: self.device_info(), room_id: st.room.id.clone(), action: action.clone() };
+                    jobs.push((p.clone(), format!("game:{}:act", st.room.id), msg));
+                }
+            }
+        }
+        for (peer, flight, msg) in jobs {
+            if self.outbox_backoff.lock().unwrap().get(&flight).is_some_and(|until| Instant::now() < *until) {
+                continue;
+            }
+            if !self.outbox_in_flight.lock().unwrap().insert(flight.clone()) {
+                continue;
+            }
+            let node = self.clone();
+            tokio::spawn(async move {
+                let reply = node.game_request(&peer, &msg).await;
+                let (delivered, again) = match (&msg, reply) {
+                    (Message::GameUpdate { room, .. }, Ok(Message::GameReply { .. })) => {
+                        let mut map = node.games.lock().unwrap();
+                        if let Some(st) = map.get_mut(&room.id) {
+                            if st.room.rev == room.rev {
+                                st.sync_pending.retain(|f| *f != peer.fingerprint);
+                                node.save_games(&map);
+                            }
+                        }
+                        (true, false)
+                    }
+                    (Message::GameAction { room_id, action, .. }, Ok(Message::GameReply { ok, reason, room, host_name })) => {
+                        let again = node.on_action_reply(&peer.fingerprint, room_id, action, ok, &reason, room, &host_name);
+                        (true, again)
+                    }
+                    _ => (false, false),
+                };
+                if delivered {
+                    node.outbox_backoff.lock().unwrap().remove(&flight);
+                } else {
+                    node.outbox_backoff.lock().unwrap().insert(flight.clone(), Instant::now() + GAME_RETRY);
+                }
+                node.outbox_in_flight.lock().unwrap().remove(&flight);
+                node.emit_games();
+                if again {
+                    node.flush_games();
+                }
+            });
+        }
+    }
+
+    /// (Oyuncu) sahibin hamle/karar yanıtını işler. Gönderilecek başka iş kaldıysa `true`.
+    #[allow(clippy::too_many_arguments)]
+    fn on_action_reply(
+        &self,
+        host: &str,
+        room_id: &str,
+        action: &GameAction,
+        ok: bool,
+        reason: &str,
+        room: Option<GameRoom>,
+        host_name: &str,
+    ) -> bool {
+        {
+            let mut map = self.games.lock().unwrap();
+            let Some(st) = map.get_mut(room_id) else { return false };
+            if st.outbox.first() == Some(action) {
+                st.outbox.remove(0);
+            }
+            self.save_games(&map);
+        }
+        // Sahibin gönderdiği güncel oda (kendi hamlem dahil) — aynı doğrulamalardan geçer.
+        if let Some(room) = room {
+            let _ = self.accept_game_update(host, room, host_name);
+        }
+        let mut map = self.games.lock().unwrap();
+        let Some(st) = map.get_mut(room_id) else { return false };
+        // Reddedilen (ya da artık geçersiz) hamlelerimi unut: yalnızca odada yer alanlar ve
+        // hâlâ gönderilmeyi bekleyenler kalır.
+        let moves = st.room.moves.clone();
+        let queued: Vec<String> = st.outbox.iter().filter_map(|a| if let GameAction::Move { mv } = a { Some(mv.clone()) } else { None }).collect();
+        st.my_moves.retain(|(ply, mv)| moves.get(*ply) == Some(mv) || (*ply >= moves.len() && queued.contains(mv)));
+        let again = !st.outbox.is_empty();
+        self.save_games(&map);
+        drop(map);
+        // Tekrar gelen istekler ("sıra sizde değil", "oyun bitti") oda güncellenince kendiliğinden
+        // anlaşılır; yalnızca gerçek hatalar kullanıcıya gösterilir.
+        if !ok && !matches!(reason, "closed" | "not_your_turn") {
+            self.emit("game-error", json!({ "id": room_id, "message": action_error(reason) }));
+        }
+        again
+    }
+
+    async fn game_request(&self, peer: &Peer, msg: &Message) -> Result<Message, String> {
+        let mut stream = self.connect(&self.candidates(peer), Some(peer.fingerprint.clone())).await?;
+        write_msg(&mut stream, msg).await.map_err(|e| e.to_string())?;
+        let reply = timeout(Duration::from_secs(8), read_msg(&mut stream))
+            .await
+            .map_err(|_| "yanıt yok".to_string())?
+            .map_err(|e| e.to_string())?;
+        let _ = stream.shutdown().await;
+        Ok(reply)
+    }
+
+    // ───────────── Ağdan gelenler ─────────────
+
+    /// (Oyuncu) sahipten gelen oda.
+    pub(super) fn accept_game_update(&self, sender: &str, room: GameRoom, host_name: &str) -> Message {
+        if self.is_blocked(sender) {
+            return reject("blocked");
+        }
+        let Some(room) = clean_room(room) else { return reject("invalid") };
+        if room.host != sender {
+            return reject("not_owner");
+        }
+        let me = self.identity.fingerprint.clone();
+        let Some(my_seat) = room.seat_of(&me) else { return Message::GameReply { ok: true, reason: String::new(), room: None, host_name: String::new() } };
+        let Ok(eval) = games::evaluate(&room.game, &room.moves) else { return reject("invalid") };
+        // Durum hamlelerle tutarlı olmalı: bitmiş oyun "sürüyor", başlamamış oyun "hamleli" olamaz.
+        if (room.status == RoomStatus::Active && eval.outcome.is_some())
+            || (room.status == RoomStatus::Invited && !room.moves.is_empty())
+        {
+            return reject("invalid");
+        }
+        let host_name = sanitize_name(host_name);
+        let title = game_title(&room.game);
+        let room_id = room.id.clone();
+        let mut notify: Option<(String, String)> = None;
+        {
+            let mut map = self.games.lock().unwrap();
+            match map.get_mut(&room.id) {
+                Some(st) => {
+                    if st.room.host != room.host {
+                        return reject("not_owner");
+                    }
+                    if room.rev <= st.room.rev {
+                        return Message::GameReply { ok: true, reason: String::new(), room: None, host_name: String::new() };
+                    }
+                    if !room.moves.starts_with(&st.room.moves) {
+                        return reject("invalid");
+                    }
+                    // Benim sıramdaki yeni hamleler benim gönderdiklerim olmalı.
+                    for ply in st.room.moves.len()..room.moves.len() {
+                        let turn = games::evaluate(&room.game, &room.moves[..ply]).ok().and_then(|e| e.turn);
+                        if turn == Some(my_seat) && !st.my_moves.contains(&(ply, room.moves[ply].clone())) {
+                            return reject("forged");
+                        }
+                    }
+                    let claimed = |c: &str| st.claims.iter().any(|x| x == c);
+                    if room.joined.contains(&me) && !st.room.joined.contains(&me) && !claimed("join") {
+                        return reject("forged");
+                    }
+                    if let Some(r) = &room.result {
+                        if (r.reason == "resign" && r.by.as_deref() == Some(&me) && !claimed("resign"))
+                            || (r.reason == "agreement" && !claimed("draw"))
+                        {
+                            return reject("forged");
+                        }
+                    }
+                    if !st.hidden {
+                        notify = self.update_notice(&st.room, &room, &me, &eval);
+                    }
+                    st.room = room;
+                    st.host_name = host_name;
+                }
+                None => {
+                    // Yalnızca yeni davetler kabul edilir (silinmiş oda geri gelmez).
+                    if room.status != RoomStatus::Invited || room.joined.contains(&me) {
+                        return Message::GameReply { ok: true, reason: String::new(), room: None, host_name: String::new() };
+                    }
+                    let waiting = map
+                        .values()
+                        .filter(|s| s.room.host == sender && s.room.status == RoomStatus::Invited && !s.room.joined.contains(&me))
+                        .count();
+                    if waiting >= MAX_INVITES_PER_HOST {
+                        return reject("rate");
+                    }
+                    notify = Some((format!("Oyun daveti · {host_name}"), format!("{title} oynamak istiyor")));
+                    map.insert(room.id.clone(), RoomState { room, host_name, ..Default::default() });
+                    Self::prune_games(&mut map);
+                }
+            }
+            self.save_games(&map);
+        }
+        if let Some((t, b)) = notify {
+            self.notify_game(&room_id, &t, &b);
+        }
+        self.emit_games();
+        Message::GameReply { ok: true, reason: String::new(), room: None, host_name: String::new() }
+    }
+
+    /// Oyuncu tarafında, sahipten gelen değişiklik için bildirim metni.
+    fn update_notice(&self, old: &GameRoom, new: &GameRoom, me: &str, eval: &games::Eval) -> Option<(String, String)> {
+        let title = game_title(&new.game);
+        let host = new.name_of(&new.host);
+        if new.status == RoomStatus::Finished && old.status != RoomStatus::Finished {
+            return Some((format!("{title} bitti"), result_line(new, me)));
+        }
+        if new.status == RoomStatus::Cancelled && old.status == RoomStatus::Invited {
+            return Some((format!("{title} daveti geri çekildi"), host));
+        }
+        if new.status == RoomStatus::Active && old.status == RoomStatus::Invited {
+            return Some((format!("{title} başladı"), format!("Rakibiniz: {host}")));
+        }
+        if new.draw_offer.is_some() && new.draw_offer != old.draw_offer && new.draw_offer.as_deref() != Some(me) {
+            return Some(("Beraberlik teklifi".into(), format!("{host} beraberlik teklif ediyor")));
+        }
+        if new.moves.len() > old.moves.len() && new.status == RoomStatus::Active && eval.turn == new.seat_of(me) {
+            let last = eval.info["san"].as_array().and_then(|a| a.last()).and_then(|s| s.as_str()).unwrap_or("");
+            return Some((format!("Sıra sizde · {title}"), format!("{host}: {last}")));
+        }
+        None
+    }
+
+    /// (Sahip) oyuncudan gelen hamle/karar. Yanıt her durumda odanın güncel hâlini taşır.
+    pub(super) fn accept_game_action(self: &Arc<Self>, sender: &str, room_id: &str, action: GameAction) -> Message {
+        if self.is_blocked(sender) {
+            return reject("blocked");
+        }
+        let me = self.identity.fingerprint.clone();
+        let mut changed = false;
+        let mut notify: Option<(String, String)> = None;
+        let reply = {
+            let mut map = self.games.lock().unwrap();
+            let Some(st) = map.get_mut(room_id) else { return reject("unknown_game") };
+            if st.room.host != me {
+                return reject("not_owner");
+            }
+            if st.room.seat_of(sender).is_none() {
+                return reject("not_player");
+            }
+            let (ok, reason) = match apply(&st.room, sender, &action) {
+                Ok(Some(next)) => {
+                    let old = std::mem::replace(&mut st.room, next);
+                    self.touch_room(st);
+                    // Yanıtla birlikte gidecek; ayrıca göndermeye gerek yok.
+                    st.sync_pending.retain(|f| f != sender);
+                    changed = true;
+                    if !st.hidden {
+                        notify = self.action_notice(&old, &st.room, sender, &action, &me);
+                    }
+                    (true, String::new())
+                }
+                Ok(None) => (true, String::new()),
+                Err(r) => (false, r.to_string()),
+            };
+            if changed {
+                self.save_games(&map);
+            }
+            let st = &map[room_id];
+            Message::GameReply { ok, reason, room: Some(st.room.clone()), host_name: st.host_name.clone() }
+        };
+        if let Some((t, b)) = notify {
+            self.notify_game(room_id, &t, &b);
+        }
+        if changed {
+            self.emit_games();
+            self.flush_games();
+        }
+        reply
+    }
+
+    /// Sahip tarafında, oyuncunun işlemi için bildirim metni.
+    fn action_notice(&self, old: &GameRoom, new: &GameRoom, sender: &str, action: &GameAction, me: &str) -> Option<(String, String)> {
+        let title = game_title(&new.game);
+        let who = new.name_of(sender);
+        if new.status == RoomStatus::Finished && old.status != RoomStatus::Finished {
+            return Some((format!("{title} bitti"), result_line(new, me)));
+        }
+        match action {
+            GameAction::Join if new.status == RoomStatus::Active => Some((format!("{who} davetinizi kabul etti"), format!("{title} başladı"))),
+            GameAction::Decline => Some((format!("{who} davetinizi reddetti"), title.into())),
+            GameAction::OfferDraw => Some(("Beraberlik teklifi".into(), format!("{who} beraberlik teklif ediyor"))),
+            GameAction::Move { .. } => {
+                let eval = games::evaluate(&new.game, &new.moves).ok()?;
+                (eval.turn == new.seat_of(me)).then(|| {
+                    let last = eval.info["san"].as_array().and_then(|a| a.last()).and_then(|s| s.as_str()).unwrap_or("").to_string();
+                    (format!("Sıra sizde · {title}"), format!("{who}: {last}"))
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member(fp: &str, name: &str) -> GroupMember {
+        GroupMember { fingerprint: fp.into(), name: name.into() }
+    }
+
+    fn room() -> GameRoom {
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        GameRoom {
+            id: "r1".into(),
+            game: "chess".into(),
+            host: a.clone(),
+            players: vec![member(&a, "Ali"), member(&b, "Banu")],
+            joined: vec![a],
+            status: RoomStatus::Invited,
+            rev: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn room_state_machine() {
+        let (a, b, c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        let r = room();
+        assert_eq!(apply(&r, &c, &GameAction::Join), Err("not_player"));
+        assert_eq!(apply(&r, &b, &GameAction::Move { mv: "e2e4".into() }), Err("closed"));
+        let r = apply(&r, &b, &GameAction::Join).unwrap().unwrap();
+        assert_eq!(r.status, RoomStatus::Active);
+        assert_eq!(apply(&r, &b, &GameAction::Join), Ok(None), "tekrar gelen kabul");
+        // Beyaz (koltuk 0) Ali başlar.
+        assert_eq!(apply(&r, &b, &GameAction::Move { mv: "e7e5".into() }), Err("not_your_turn"));
+        assert_eq!(apply(&r, &a, &GameAction::Move { mv: "e2e5".into() }), Err("illegal"));
+        let r = apply(&r, &a, &GameAction::Move { mv: "e2e4".into() }).unwrap().unwrap();
+        // Beraberlik: teklif → hamle teklifi düşürür → yeni teklif → kabul.
+        let r = apply(&r, &a, &GameAction::OfferDraw).unwrap().unwrap();
+        assert_eq!(r.draw_offer.as_deref(), Some(a.as_str()));
+        assert_eq!(apply(&r, &a, &GameAction::AcceptDraw), Err("no_offer"), "kendi teklifini kabul edemez");
+        let r = apply(&r, &b, &GameAction::Move { mv: "e7e5".into() }).unwrap().unwrap();
+        assert!(r.draw_offer.is_none());
+        let r2 = apply(&r, &b, &GameAction::OfferDraw).unwrap().unwrap();
+        let done = apply(&r2, &a, &GameAction::AcceptDraw).unwrap().unwrap();
+        assert_eq!(done.status, RoomStatus::Finished);
+        assert_eq!(done.result.as_ref().unwrap().reason, "agreement");
+        // Pes etme: diğer oyuncu kazanır.
+        let done = apply(&r, &b, &GameAction::Resign).unwrap().unwrap();
+        assert_eq!(done.result.as_ref().unwrap().winner.as_deref(), Some(a.as_str()));
+        assert_eq!(result_line(&done, &a), "Banu pes etti — kazandınız");
+        assert_eq!(apply(&done, &a, &GameAction::Move { mv: "d2d4".into() }), Err("closed"));
+        // Mat ile biten hamle oyunu bitirir.
+        let mut r = r;
+        for (who, mv) in [(&a, "d1h5"), (&b, "b8c6"), (&a, "f1c4"), (&b, "g8f6"), (&a, "h5f7")] {
+            r = apply(&r, who, &GameAction::Move { mv: mv.into() }).unwrap().unwrap();
+        }
+        assert_eq!(r.status, RoomStatus::Finished);
+        assert_eq!(result_line(&r, &b), "Ali kazandı (şah mat)");
+        // Davet reddi / geri çekme.
+        assert_eq!(apply(&room(), &b, &GameAction::Decline).unwrap().unwrap().status, RoomStatus::Declined);
+        assert_eq!(apply(&room(), &a, &GameAction::Decline).unwrap().unwrap().status, RoomStatus::Cancelled);
+    }
+
+    #[test]
+    fn clean_room_rejects_bad_input() {
+        assert!(clean_room(room()).is_some());
+        let mut r = room();
+        r.game = "tavla".into();
+        assert!(clean_room(r).is_none());
+        let mut r = room();
+        r.players.pop();
+        assert!(clean_room(r).is_none(), "satranç iki kişilik");
+        let mut r = room();
+        r.host = "c".repeat(64);
+        assert!(clean_room(r).is_none(), "sahip oyuncu olmalı");
+        let mut r = room();
+        r.result = Some(GameResult { winner: Some("c".repeat(64)), reason: "resign".into(), by: None });
+        assert!(clean_room(r).is_none());
+        let mut r = room();
+        r.players[1].name = "Banu\u{202E}exe".into();
+        assert_eq!(clean_room(r).unwrap().players[1].name, "Banuexe");
+    }
+}

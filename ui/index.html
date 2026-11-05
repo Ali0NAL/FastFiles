@@ -21,6 +21,10 @@
       <span class="me-ip" id="me-ip"></span>
     </div>
     <div class="top-actions">
+      <button class="btn soft small games-btn" id="btn-games" title="Arkadaşlarınızla oyun oynayın">
+        <svg viewBox="0 0 24 24"><path d="M6 11h4M8 9v4M15 12h.01M18 10h.01"/><path d="M17.3 5H6.7a4 4 0 0 0-4 3.6l-.6 6.1a2.6 2.6 0 0 0 2.6 2.8c.9 0 1.7-.5 2.1-1.2L8 14h8l1.2 2.3c.4.7 1.2 1.2 2.1 1.2a2.6 2.6 0 0 0 2.6-2.8l-.6-6.1A4 4 0 0 0 17.3 5z"/></svg>Oyunlar
+        <span class="tab-badge" id="games-badge" hidden>0</span>
+      </button>
       <button class="icon-btn" id="btn-lock" title="Uygulamayı kilitle">
         <svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
       </button>
@@ -208,6 +212,9 @@
           <button class="icon-btn sm" id="chat-members" title="Grup üyeleri" hidden>
             <svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3 19c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5"/><path d="M16 4.8a3.2 3.2 0 0 1 0 6.4M18 13.8c2 .7 3 2.5 3 5.2"/></svg>
           </button>
+          <button class="icon-btn sm" id="chat-game" title="Oyuna davet et" hidden>
+            <svg viewBox="0 0 24 24"><path d="M6 11h4M8 9v4M15 12h.01M18 10h.01"/><path d="M17.3 5H6.7a4 4 0 0 0-4 3.6l-.6 6.1a2.6 2.6 0 0 0 2.6 2.8c.9 0 1.7-.5 2.1-1.2L8 14h8l1.2 2.3c.4.7 1.2 1.2 2.1 1.2a2.6 2.6 0 0 0 2.6-2.8l-.6-6.1A4 4 0 0 0 17.3 5z"/></svg>
+          </button>
           <button class="icon-btn sm" id="chat-leave" title="Gruptan ayrıl" hidden>
             <svg viewBox="0 0 24 24"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4M10 16l-4-4 4-4M6 12h10"/></svg>
           </button>
@@ -234,6 +241,60 @@
       </div>
     </aside>
   </main>
+
+  <!-- Oyunlar: sol tarafta oyun listesi, sağda oyun seçimi ya da açık oyun odası -->
+  <section class="games-screen" id="games-screen" hidden>
+    <aside class="games-side">
+      <div class="games-side-head">
+        <button class="icon-btn sm" id="games-close" title="Oyunlardan çık (Esc)"><svg viewBox="0 0 24 24"><path d="M15 18 9 12l6-6"/></svg></button>
+        <h2>Oyunlar</h2>
+        <span class="spacer"></span>
+        <button class="btn small" id="btn-new-game"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Yeni oyun</button>
+      </div>
+      <div class="game-list" id="game-list"></div>
+      <div class="empty small-empty" id="games-empty">
+        <div class="empty-piece" aria-hidden="true">&#9822;&#xFE0E;</div>
+        <h3>Henüz oyun yok</h3>
+        <p>Bir oyun seçip ofisten bir arkadaşınızı davet edin. Kabul edince oyun odası açılır.</p>
+      </div>
+    </aside>
+
+    <section class="game-stage">
+      <div class="game-lobby" id="game-lobby">
+        <h2>Bir oyun seçin</h2>
+        <p class="muted">Rakibinizi seçip davet gönderin. Davet kabul edilince oyun odası kurulur, hamleler şifreli olarak doğrudan karşı bilgisayara gider.</p>
+        <div class="game-cards" id="game-cards"></div>
+      </div>
+
+      <div class="game-room" id="game-room" hidden>
+        <div class="room-board">
+          <div class="board-col">
+            <div class="player-bar" id="pb-top"></div>
+            <div class="board-wrap">
+              <div class="board" id="board"></div>
+              <div class="promo" id="promo" hidden></div>
+            </div>
+            <div class="player-bar" id="pb-bottom"></div>
+          </div>
+        </div>
+        <div class="room-side">
+          <div class="room-head">
+            <button class="icon-btn sm room-back" id="room-back" title="Geri"><svg viewBox="0 0 24 24"><path d="M15 18 9 12l6-6"/></svg></button>
+            <div class="room-title">
+              <div class="room-name" id="room-name"></div>
+              <div class="room-sub" id="room-sub"></div>
+            </div>
+            <button class="icon-btn sm" id="room-chat" title="Rakibe mesaj yaz"><svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg></button>
+            <button class="icon-btn sm" id="room-remove" title="Listeden kaldır"><svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg></button>
+          </div>
+          <div class="room-status" id="room-status"></div>
+          <div class="room-actions" id="room-actions"></div>
+          <div class="moves-head">Hamleler</div>
+          <div class="moves" id="moves"></div>
+        </div>
+      </div>
+    </section>
+  </section>
 
   <div class="drop-overlay" id="drop-overlay" aria-hidden="true">
     <div class="drop-msg" id="drop-msg">Bir cihazın üzerine bırakın</div>

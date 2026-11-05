@@ -124,6 +124,19 @@ pub enum Message {
     /// Oy (yalnızca oylamanın sahibine gönderilir). Yanıt: PollAck / ChatReject.
     PollVote { device: DeviceInfo, poll_id: String, option: u32 },
     PollAck,
+    /// Oyun odası (yalnızca oda sahibinden kabul edilir). Yanıt: GameReply.
+    GameUpdate { device: DeviceInfo, room: crate::node::game::GameRoom, host_name: String },
+    /// Oyuncunun hamlesi/kararı (yalnızca oda sahibine gider). Yanıt: GameReply (odanın güncel hâliyle).
+    GameAction { device: DeviceInfo, room_id: String, action: crate::node::game::GameAction },
+    GameReply {
+        ok: bool,
+        #[serde(default)]
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        room: Option<crate::node::game::GameRoom>,
+        #[serde(default)]
+        host_name: String,
+    },
     /// Güncelleme paketi isteği. Yanıt: UpdateOffer + ham paket baytları ya da UpdateNone.
     UpdateRequest,
     UpdateOffer { header: crate::update::PackageHeader },

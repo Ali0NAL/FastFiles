@@ -28,6 +28,8 @@ const state = {
   shareFiles: [],
   polls: [],             // oylamalar
   openPoll: null,        // açık oylama kimliği
+  games: [],             // oyun odaları (davetler dahil)
+  gameCatalog: [],       // oynanabilir oyunlar
 };
 
 // ───────────────────────────── Yardımcılar ─────────────────────────────
@@ -152,6 +154,11 @@ $('#modal-root').addEventListener('mousedown', (e) => {
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   if (modalKind && modalKind !== 'incoming' && modalKind !== 'welcome') closeModal();
+  else if (!modalKind && gamesOpen()) {
+    // Oyun ekranı diğer her şeyin önünde: önce terfi seçimi, sonra ekranın kendisi kapanır.
+    if (!$('#promo').hidden) closePromo();
+    else closeGames();
+  }
   else if (!modalKind && chatOpen()) closeChat();
   else if (!modalKind && shareOpen()) closeShare();
   else if (!modalKind && pollOpen()) closePoll();
@@ -338,7 +345,7 @@ function showClipboardTargets() {
 
 // Ana ekranda (yazı alanı dışında) Ctrl+V: panodakini gönder.
 document.addEventListener('paste', (e) => {
-  if (e.target.closest?.('input, textarea, [contenteditable]') || modalKind || chatOpen()) return;
+  if (e.target.closest?.('input, textarea, [contenteditable]') || modalKind || chatOpen() || gamesOpen()) return;
   const peers = state.peers.filter((p) => !p.blocked);
   if (!peers.length) return toast('Ağda gönderilecek cihaz yok', { type: 'error' });
   e.preventDefault();
@@ -1226,6 +1233,7 @@ $('#convs').addEventListener('click', (e) => {
 });
 
 async function openChat(fp, name) {
+  if (gamesOpen()) closeGames();
   closeEmoji();
   closeViewer();
   if (!state.chats.has(fp)) {
@@ -1302,6 +1310,7 @@ function renderChatHeadBase() {
   $('#chat-members').hidden = !g;
   $('#chat-leave').hidden = !g || conv.left;
   $('#chat-block').hidden = !!g;
+  $('#chat-game').hidden = !!g || isBlocked(state.openChat);
   if (g) {
     const av = $('#chat-avatar');
     av.className = 'avatar sm group';
@@ -2247,6 +2256,12 @@ function onNotificationClick(target = {}) {
   // Kilitliyken hiçbir ekran açılmaz; kilit açılınca kullanıcı kendisi bakar.
   if (lockVisible()) return;
   if (modalKind && modalKind !== 'incoming') closeModal();
+  if (target.view === 'games') {
+    if (target.id && gameById(target.id)) openRoom(target.id);
+    else openGames();
+    return;
+  }
+  if (gamesOpen()) closeGames();
   if (target.view === 'chat' && target.key) {
     openChat(target.key);
   } else if (target.view === 'polls') {
@@ -2433,6 +2448,7 @@ function onShares(list) {
 }
 
 function openShare(id) {
+  if (gamesOpen()) closeGames();
   // Sohbet / oylama açıksa kapat (aynı paneli kullanırlar).
   state.openChat = null;
   $('#chat-view').hidden = true;
@@ -2819,6 +2835,7 @@ function onPolls(list) {
 }
 
 function openPoll(id) {
+  if (gamesOpen()) closeGames();
   state.openChat = null;
   $('#chat-view').hidden = true;
   state.openShare = null;
@@ -2993,6 +3010,687 @@ function showPollCreate() {
 }
 $('#btn-new-poll').onclick = showPollCreate;
 
+// ───────────────────────────── Oyunlar ─────────────────────────────
+// Odanın tek yetkilisi daveti gönderen kişidir (arka uç: node/game.rs, kurallar: games/).
+// Arayüz yalnızca arka ucun verdiği yasal hamleleri (`legal`) önerir; kural kontrolü arka uçtadır.
+// Yeni bir oyun eklenince burada yalnızca o oyunun tahtasını çizen kısım eklenir.
+
+const gameState = {
+  open: null,         // açık oda kimliği
+  selected: null,     // seçili kare, ör. "e2"
+  drag: null,         // sürüklenen taş
+  optimistic: null,   // gönderilen ama henüz onaylanmamış hamle (tahtada hemen görünsün diye)
+  promo: null,        // terfi seçimi bekleyen hamle
+};
+const gameById = (id) => state.games.find((g) => g.id === id);
+const gamesOpen = () => !$('#games-screen').hidden;
+const gameDef = (id) => state.gameCatalog.find((d) => d.id === id);
+const opponentsOf = (g) => g.players.filter((p) => p.fingerprint !== myFp());
+const vsName = (g) => opponentsOf(g).map((p) => p.name).join(', ') || '—';
+const gameOver = (g) => ['finished', 'declined', 'cancelled'].includes(g.status);
+
+// Taşlar: dolu satranç sembolleri; U+FE0E emoji yerine metin olarak çizilmelerini sağlar. Renk CSS'te.
+// Beyaz taş: beyaz dolu sembolün üstüne koyu çizgili sembol (data-o) bindirilir.
+const PIECE_GLYPH = { k: '♚', q: '♛', r: '♜', b: '♝', n: '♞', p: '♟' };
+const OUTLINE_GLYPH = { k: '♔', q: '♕', r: '♖', b: '♗', n: '♘', p: '♙' };
+function pieceHtml(p) {
+  const t = p.toLowerCase();
+  const white = p === p.toUpperCase();
+  return `<span class="pc ${white ? 'w' : 'b'}"${white ? ` data-o="${OUTLINE_GLYPH[t]}︎"` : ''}>${PIECE_GLYPH[t]}︎</span>`;
+}
+// Notasyonda Türkçe taş harfleri: Ş(ah) V(ezir) K(ale) F(il) A(t).
+const TR_PIECE = { K: 'Ş', Q: 'V', R: 'K', B: 'F', N: 'A' };
+const trSan = (san) => String(san).replace(/[KQRBN]/g, (c) => TR_PIECE[c]);
+const RESULT_REASON = { checkmate: 'şah mat', stalemate: 'pat', repetition: 'üç kez tekrar', fifty: '50 hamle kuralı', material: 'yetersiz malzeme', resign: 'pes etme', agreement: 'anlaşmalı' };
+const GAME_ART = { chess: `<span class="gc-piece">${PIECE_GLYPH.n}︎</span>` };
+
+function gameResultText(g) {
+  const r = g.result;
+  if (!r) return 'Oyun bitti';
+  const me = myFp();
+  const nameOf = (fp) => g.players.find((p) => p.fingerprint === fp)?.name || '?';
+  if (r.reason === 'resign') return r.by === me ? 'Pes ettiniz' : `${nameOf(r.by)} pes etti · kazandınız`;
+  const why = RESULT_REASON[r.reason] || 'oyun bitti';
+  if (!r.winner) return `Berabere · ${why}`;
+  return r.winner === me ? `Kazandınız · ${why}` : `${nameOf(r.winner)} kazandı · ${why}`;
+}
+
+/** Sonuç benim açımdan: "win" | "lose" | "draw" */
+function gameOutcome(g) {
+  const r = g.result;
+  if (!r) return 'draw';
+  if (r.reason === 'resign') return r.by === myFp() ? 'lose' : 'win';
+  return !r.winner ? 'draw' : r.winner === myFp() ? 'win' : 'lose';
+}
+
+function gameStatusText(g) {
+  const me = myFp();
+  switch (g.status) {
+    case 'invited':
+      if (g.isHost) return 'Davet gönderildi · yanıt bekleniyor';
+      return g.joined.includes(me) || g.pending ? 'Kabul ettiniz · oda kuruluyor…' : 'Sizi davet ediyor';
+    case 'declined': return g.isHost ? 'Davet reddedildi' : 'Daveti reddettiniz';
+    case 'cancelled': return 'Davet geri çekildi';
+    case 'finished': return gameResultText(g);
+  }
+  if (g.pending) return 'Hamleniz iletiliyor…';
+  if (g.drawOffer && g.drawOffer !== me) return 'Beraberlik teklif ediyor';
+  if (g.myTurn) return g.info?.check ? 'Sıra sizde · Şah!' : 'Sıra sizde';
+  return `${g.players[g.turn]?.name || 'Rakip'} düşünüyor…`;
+}
+
+function renderGames() {
+  const list = state.games;
+  const waiting = list.filter((g) => g.needsMe).length;
+  $('#games-badge').hidden = waiting === 0;
+  $('#games-badge').textContent = waiting;
+  $('#games-empty').hidden = list.length > 0;
+  $('#game-list').hidden = list.length === 0;
+  $('#game-list').innerHTML = list.map((g) => {
+    const opp = opponentsOf(g)[0];
+    const online = opp && !!peerByFp(opp.fingerprint);
+    const cls = [g.id === gameState.open ? 'active' : '', g.needsMe ? 'unread' : '', gameOver(g) ? 'left' : ''].join(' ');
+    const badge = !g.needsMe ? ''
+      : `<span class="badge vote">${g.status === 'invited' ? 'Davet' : g.myTurn ? 'Sıra sizde' : 'Yanıt bekliyor'}</span>`;
+    return `
+      <div class="conv ${cls}" data-game="${esc(g.id)}">
+        <div class="avatar" style="background:${grad(opp?.fingerprint || g.id)}">${opp ? face(opp.fingerprint, opp.name) : ''}</div>
+        <div class="c-name">${online ? '<span class="online-dot" title="Çevrimiçi"></span>' : ''}<span>${esc(vsName(g))}</span><span class="c-count">· ${esc(g.title)}</span></div>
+        <div class="c-time">${esc(shortTime(g.updatedAt))}</div>
+        <div class="c-last">${esc(gameStatusText(g))}</div>
+        <div>${badge}</div>
+      </div>`;
+  }).join('');
+}
+$('#game-list').addEventListener('click', (e) => {
+  const el = e.target.closest('[data-game]');
+  if (el) openRoom(el.dataset.game);
+});
+
+function renderGameCards() {
+  $('#game-cards').innerHTML = state.gameCatalog.map((d) => `
+    <button class="game-card" data-game-new="${esc(d.id)}">
+      <span class="gc-art">${GAME_ART[d.id] || ''}</span>
+      <span class="gc-name">${esc(d.name)}</span>
+      <span class="gc-desc">${esc(d.description)}</span>
+      <span class="gc-meta">${d.minPlayers === d.maxPlayers ? `${d.maxPlayers} oyuncu` : `${d.minPlayers}–${d.maxPlayers} oyuncu`} · Davet gönder →</span>
+    </button>`).join('') + `
+    <div class="game-card soon">
+      <span class="gc-art"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></span>
+      <span class="gc-name">Yakında</span>
+      <span class="gc-desc">Yeni oyunlar eklenecek.</span>
+    </div>`;
+}
+$('#game-cards').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-game-new]');
+  if (b) showGameCreate({ game: b.dataset.gameNew });
+});
+
+function openGames(id) {
+  closeEmoji();
+  closeViewer();
+  $('#games-screen').hidden = false;
+  document.body.classList.add('games-open');
+  if (id !== undefined) gameState.open = id && gameById(id) ? id : null;
+  renderGames();
+  renderGameCards();
+  renderRoom();
+}
+
+function closeGames() {
+  closePromo();
+  cancelDrag();
+  $('#games-screen').hidden = true;
+  document.body.classList.remove('games-open');
+}
+
+function openRoom(id) {
+  if (gameState.open !== id) gameState.selected = null;
+  closePromo();
+  openGames(id);
+}
+
+function closeRoom() {
+  gameState.open = null;
+  gameState.selected = null;
+  closePromo();
+  renderGames();
+  renderRoom();
+}
+
+$('#btn-games').onclick = () => (gamesOpen() ? closeGames() : openGames());
+$('#games-close').onclick = closeGames;
+$('#room-back').onclick = closeRoom;
+$('#btn-new-game').onclick = () => showGameCreate();
+$('#chat-game').onclick = () => { if (state.openChat) showGameCreate({ fp: state.openChat }); };
+
+function onGames(list) {
+  const before = new Map(state.games.map((g) => [g.id, g]));
+  state.games = list;
+  maybeClearOptimistic();
+  // Uygulama öndeyken de haber ver (arkadayken Windows bildirimi gelir).
+  for (const g of list) {
+    const old = before.get(g.id);
+    if (!old) {
+      if (!g.isHost && g.status === 'invited' && g.needsMe) {
+        toast(`${g.hostName} sizi ${g.title} oynamaya davet ediyor`, { action: 'Görüntüle', timeout: 12000, onAction: () => openRoom(g.id) });
+      }
+      continue;
+    }
+    if (gamesOpen() && gameState.open === g.id) continue;
+    if (old.status === 'invited' && g.status === 'active') {
+      toast(`${vsName(g)} ile ${g.title} başladı`, { type: 'success', action: 'Oyuna git', timeout: 10000, onAction: () => openRoom(g.id) });
+    } else if (old.status === 'invited' && g.status === 'declined' && g.isHost) {
+      toast(`${vsName(g)} ${g.title} davetinizi reddetti`, { type: 'error' });
+    } else if (old.status !== 'finished' && g.status === 'finished') {
+      toast(`${g.title} · ${gameResultText(g)}`, { action: 'Gör', timeout: 8000, onAction: () => openRoom(g.id) });
+    } else if (!old.myTurn && g.myTurn) {
+      toast(`${g.title} · sıra sizde (${vsName(g)})`, { action: 'Oyuna git', timeout: 8000, onAction: () => openRoom(g.id) });
+    } else if (g.drawOffer && g.drawOffer !== myFp() && old.drawOffer !== g.drawOffer) {
+      toast(`${vsName(g)} beraberlik teklif ediyor`, { action: 'Gör', timeout: 8000, onAction: () => openRoom(g.id) });
+    }
+  }
+  if (gameState.open && !gameById(gameState.open)) gameState.open = null;
+  renderGames();
+  if (gamesOpen()) renderRoom();
+}
+
+// ── Oda ──
+
+function renderRoom() {
+  const g = gameById(gameState.open);
+  $('#games-screen').classList.toggle('room-open', !!g);
+  $('#game-lobby').hidden = !!g;
+  $('#game-room').hidden = !g;
+  if (!g) return;
+  cancelDrag();
+  if (!g.myTurn) { gameState.selected = null; closePromo(); }
+  renderBoard(g);
+  renderRoomPanel(g);
+  renderMoves(g);
+}
+
+// Satranç tahtası: FEN'den çizilir. Kare adları "a1".."h8"; dizi sırası a1=0 … h8=63.
+const sqName = (i) => String.fromCharCode(97 + (i % 8)) + (Math.floor(i / 8) + 1);
+const sqIndex = (n) => (n.charCodeAt(0) - 97) + (Number(n[1]) - 1) * 8;
+
+function parseFen(fen) {
+  const board = new Array(64).fill(null);
+  const [place = '', side = 'w'] = String(fen).split(' ');
+  place.split('/').forEach((row, i) => {
+    let f = 0;
+    for (const c of row) {
+      if (/\d/.test(c)) f += Number(c);
+      else { board[(7 - i) * 8 + f] = c; f++; }
+    }
+  });
+  return { board, side };
+}
+
+/** Onaylanmamış hamleyi tahtada göstermek için (rok, geçerken alma ve terfi dahil). */
+function applyLocalMove(board, uci) {
+  const b = board.slice();
+  const from = sqIndex(uci.slice(0, 2));
+  const to = sqIndex(uci.slice(2, 4));
+  const p = b[from];
+  if (!p) return b;
+  const white = p === p.toUpperCase();
+  if (p.toLowerCase() === 'p' && from % 8 !== to % 8 && !b[to]) b[to + (white ? -8 : 8)] = null;
+  if (p.toLowerCase() === 'k' && Math.abs(to - from) === 2) {
+    const [rf, rt] = to > from ? [from + 3, from + 1] : [from - 4, from - 1];
+    b[rt] = b[rf];
+    b[rf] = null;
+  }
+  b[to] = uci[4] ? (white ? uci[4].toUpperCase() : uci[4]) : p;
+  b[from] = null;
+  return b;
+}
+
+/** Ekranda görünen tahta (onay bekleyen hamle uygulanmış). */
+function shownBoard(g) {
+  let { board } = parseFen(g.info?.fen || '');
+  const opt = gameState.optimistic?.id === g.id ? gameState.optimistic : null;
+  if (opt) board = applyLocalMove(board, opt.uci);
+  return { board, last: opt ? opt.uci : g.info?.lastMove, opt };
+}
+
+const legalFrom = (g, sq) => (g.myTurn && !gameState.optimistic ? g.legal.filter((m) => m.startsWith(sq)) : []);
+
+function renderBoard(g) {
+  const el = $('#board');
+  if (!g.info?.fen) { el.innerHTML = ''; return; }
+  const { board, last, opt } = shownBoard(g);
+  const flip = g.mySeat === 1;
+  const canMove = g.myTurn && !opt;
+  const sel = gameState.selected;
+  const targets = new Set(sel ? legalFrom(g, sel).map((m) => m.slice(2, 4)) : []);
+  const lastSq = last ? [last.slice(0, 2), last.slice(2, 4)] : [];
+  let checkSq = null;
+  if (g.info.check && !opt) {
+    const k = g.info.fen.split(' ')[1] === 'w' ? 'K' : 'k';
+    const i = board.indexOf(k);
+    if (i >= 0) checkSq = sqName(i);
+  }
+  let html = '';
+  for (let row = 0; row < 8; row++) {
+    for (let col = 0; col < 8; col++) {
+      const r = flip ? row : 7 - row;
+      const f = flip ? 7 - col : col;
+      const name = sqName(r * 8 + f);
+      const p = board[r * 8 + f];
+      const cls = ['sq', (r + f) % 2 === 0 ? 'dark' : 'light'];
+      if (lastSq.includes(name)) cls.push('last');
+      if (sel === name) cls.push('sel');
+      if (targets.has(name)) cls.push(p ? 'target cap' : 'target');
+      if (checkSq === name) cls.push('check');
+      if (canMove && legalFrom(g, name).length) cls.push('movable');
+      html += `<div class="${cls.join(' ')}" data-sq="${name}">`
+        + (col === 0 ? `<span class="cr">${name[1]}</span>` : '')
+        + (row === 7 ? `<span class="cf">${name[0]}</span>` : '')
+        + (p ? pieceHtml(p) : '') + '</div>';
+    }
+  }
+  el.innerHTML = html;
+  el.classList.toggle('flipped', flip);
+  el.classList.toggle('live', canMove);
+  const tops = g.players.map((p, seat) => ({ p, seat }));
+  const mine = tops.find((x) => x.p.fingerprint === myFp());
+  const other = tops.find((x) => x.p.fingerprint !== myFp());
+  const mat = material(board);
+  $('#pb-top').innerHTML = other ? playerBar(g, other.p, other.seat, mat) : '';
+  $('#pb-bottom').innerHTML = mine ? playerBar(g, mine.p, mine.seat, mat) : '';
+}
+
+const START_COUNT = { q: 1, r: 2, b: 2, n: 2, p: 8 };
+const PIECE_VALUE = { q: 9, r: 5, b: 3, n: 3, p: 1 };
+function material(board) {
+  const cnt = { w: {}, b: {} };
+  const score = { w: 0, b: 0 };
+  for (const p of board) {
+    if (!p || p.toLowerCase() === 'k') continue;
+    const c = p === p.toUpperCase() ? 'w' : 'b';
+    const t = p.toLowerCase();
+    cnt[c][t] = (cnt[c][t] || 0) + 1;
+    score[c] += PIECE_VALUE[t];
+  }
+  return { cnt, score };
+}
+
+/** Oyuncunun aldığı taşlar ve malzeme farkı. Koltuk 0 beyaz, 1 siyah. */
+function capturesHtml(mat, seat) {
+  const me = seat === 0 ? 'w' : 'b';
+  const victim = seat === 0 ? 'b' : 'w';
+  let s = '';
+  for (const t of ['q', 'r', 'b', 'n', 'p']) {
+    const n = Math.max(0, START_COUNT[t] - (mat.cnt[victim][t] || 0));
+    s += pieceHtml(victim === 'w' ? t.toUpperCase() : t).repeat(n);
+  }
+  const diff = mat.score[me] - mat.score[victim];
+  return s + (diff > 0 ? `<span class="pb-adv">+${diff}</span>` : '');
+}
+
+function playerBar(g, player, seat, mat) {
+  const isMe = player.fingerprint === myFp();
+  const online = isMe || !!peerByFp(player.fingerprint);
+  const turn = g.status === 'active' && g.turn === seat;
+  const seatName = gameDef(g.game)?.seats?.[seat] || '';
+  return `
+    <span class="avatar" style="background:${grad(player.fingerprint)}">${face(player.fingerprint, player.name)}</span>
+    <div class="pb-who">
+      <div class="pb-name"><span>${esc(player.name)}${isMe ? ' <span class="muted">(siz)</span>' : ''}</span>
+        ${isMe ? '' : online ? '<span class="online-dot" title="Çevrimiçi"></span>' : '<span class="off">çevrimdışı</span>'}</div>
+      <div class="pb-caps">${capturesHtml(mat, seat)}</div>
+    </div>
+    ${turn ? '<span class="pb-turn">Sırada</span>' : ''}
+    <span class="pb-seat ${seat === 0 ? 'w' : 'b'}" title="${esc(seatName)}">${esc(seatName)}</span>`;
+}
+
+/** "1.4.3" < "1.5.0" gibi sürüm karşılaştırması. */
+function versionLess(a, b) {
+  const pa = String(a).split('.').map(Number);
+  const pb = String(b).split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d < 0;
+  }
+  return false;
+}
+
+const roomBtn = (act, label, cls = '', disabled = false) =>
+  `<button class="btn small ${cls}" data-room-act="${act}" ${disabled ? 'disabled' : ''}>${esc(label)}</button>`;
+
+function renderRoomPanel(g) {
+  const me = myFp();
+  const opp = opponentsOf(g)[0];
+  const oppName = opp?.name || 'Rakip';
+  const oppOnline = !!opp && !!peerByFp(opp.fingerprint);
+  const seatName = (gameDef(g.game)?.seats?.[g.mySeat] || '').toLocaleLowerCase('tr-TR');
+  $('#room-name').textContent = `${g.title} · ${vsName(g)}`;
+  $('#room-sub').textContent = seatName ? `Siz ${seatName} taşlarla oynuyorsunuz` : '';
+  $('#room-chat').hidden = !opp;
+  let status = '';
+  let tone = '';
+  let actions = '';
+  switch (g.status) {
+    case 'invited':
+      if (g.isHost) {
+        // Oyunları bilmeyen eski sürüm daveti alamaz; otomatik güncelleme gelince ulaşır.
+        const oppVer = opp && peerByFp(opp.fingerprint)?.version;
+        const oldVer = oppVer && state.device?.version && versionLess(oppVer, state.device.version);
+        status = `<b>${esc(oppName)}</b> davetinize henüz yanıt vermedi.`
+          + (!oppOnline ? '<div class="small muted">Şu an çevrimdışı; FastFiles açılınca davet ulaşır.</div>'
+            : oldVer ? `<div class="small muted">FastFiles sürümü eski (v${esc(oppVer)}); güncellenince davet ulaşır.</div>` : '');
+        actions = roomBtn('cancel', 'Daveti geri çek', 'ghost');
+      } else if (g.joined.includes(me) || g.pending) {
+        status = 'Daveti kabul ettiniz. Oda kuruluyor…';
+      } else {
+        tone = 'invite';
+        status = `<b>${esc(g.hostName)}</b> sizi <b>${esc(g.title)}</b> oynamaya davet ediyor.`
+          + (seatName ? `<div class="small">Siz <b>${esc(seatName)}</b> taşlarla oynayacaksınız.</div>` : '');
+        actions = roomBtn('join', 'Kabul et') + roomBtn('decline', 'Reddet', 'ghost');
+      }
+      break;
+    case 'active': {
+      const offered = g.drawOffer && g.drawOffer !== me && !g.pending;
+      if (g.pending) status = oppOnline ? 'Hamleniz iletiliyor…' : `<b>${esc(oppName)}</b> çevrimdışı; hamleniz o dönünce iletilecek.`;
+      else if (g.myTurn) { status = g.info?.check ? '<b>Şah!</b> Sıra sizde.' : '<b>Sıra sizde.</b> Bir taşa tıklayın ya da sürükleyin.'; tone = g.info?.check ? 'danger' : 'turn'; }
+      else status = oppOnline ? `<b>${esc(oppName)}</b> düşünüyor…` : `<b>${esc(oppName)}</b> çevrimdışı. Döndüğünde oyun kaldığı yerden sürer.`;
+      if (offered) {
+        status += `<div class="offer">${esc(oppName)} beraberlik teklif ediyor.</div>`;
+        actions = roomBtn('acceptDraw', 'Beraberliği kabul et') + roomBtn('declineDraw', 'Reddet', 'ghost');
+      } else {
+        if (g.drawOffer === me) status += '<div class="offer mine">Beraberlik teklifiniz yanıt bekliyor.</div>';
+        actions = roomBtn('offerDraw', 'Beraberlik teklif et', 'ghost', g.drawOffer === me || g.pending);
+      }
+      actions += roomBtn('resign', 'Pes et', 'ghost danger-text', g.pending);
+      break;
+    }
+    case 'finished':
+      tone = gameOutcome(g);
+      status = `<b>${esc(gameResultText(g))}</b>`;
+      actions = roomBtn('rematch', 'Rövanş') ;
+      break;
+    case 'declined':
+      status = g.isHost ? `<b>${esc(oppName)}</b> davetinizi reddetti.` : 'Daveti reddettiniz.';
+      actions = roomBtn('rematch', g.isHost ? 'Tekrar davet et' : 'Davet et', 'ghost');
+      break;
+    case 'cancelled':
+      status = g.isHost ? 'Daveti geri çektiniz.' : `<b>${esc(g.hostName)}</b> daveti geri çekti.`;
+      actions = roomBtn('rematch', 'Davet et', 'ghost');
+      break;
+  }
+  const st = $('#room-status');
+  st.className = `room-status ${tone}`;
+  st.innerHTML = status;
+  $('#room-actions').innerHTML = actions;
+}
+
+function renderMoves(g) {
+  const san = g.info?.san || [];
+  const optUci = gameState.optimistic?.id === g.id ? gameState.optimistic.uci : null;
+  const all = optUci ? [...san, '…'] : san;
+  let html = '';
+  for (let i = 0; i < all.length; i += 2) {
+    const cell = (j) => (j < all.length ? `<span class="mv ${j === all.length - 1 ? 'cur' : ''}">${esc(trSan(all[j]))}</span>` : '<span></span>');
+    html += `<div class="mv-row"><span class="mv-no">${i / 2 + 1}.</span>${cell(i)}${cell(i + 1)}</div>`;
+  }
+  const el = $('#moves');
+  el.innerHTML = html || '<div class="mv-empty">Henüz hamle yok</div>';
+  el.scrollTop = el.scrollHeight;
+}
+
+$('#room-actions').addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-room-act]');
+  const g = gameById(gameState.open);
+  if (!b || !g) return;
+  const act = b.dataset.roomAct;
+  if (act === 'rematch') return rematch(g);
+  if (act === 'resign' && !(await confirmDialog('Pes etmek istiyor musunuz?', `Oyunu ${vsName(g)} kazanmış sayılır.`, 'Pes et', true))) return;
+  b.disabled = true;
+  const kind = act === 'cancel' ? 'decline' : act;
+  await call('game_act', { id: g.id, action: { kind } }).catch(() => {});
+});
+
+async function rematch(g) {
+  const two = g.players.length === 2 && g.mySeat != null;
+  try {
+    const n = await call('game_invite', { game: g.game, players: opponentsOf(g).map((p) => p.fingerprint), seat: two ? 1 - g.mySeat : null });
+    if (!gameById(n.id)) state.games = [n, ...state.games];
+    openRoom(n.id);
+    toast(`Davet gönderildi → ${vsName(n)}`, { type: 'success' });
+  } catch { /* toast gösterildi */ }
+}
+
+$('#room-chat').onclick = () => {
+  const opp = opponentsOf(gameById(gameState.open) || { players: [] })[0];
+  if (!opp) return;
+  closeGames();
+  openChat(opp.fingerprint, opp.name);
+};
+
+$('#room-remove').onclick = async () => {
+  const g = gameById(gameState.open);
+  if (!g) return;
+  const text = g.status === 'active' ? 'Oyun sürüyor; kaldırırsanız pes etmiş sayılırsınız.'
+    : g.status === 'invited' ? (g.isHost ? 'Davet geri çekilir.' : 'Davet reddedilir.')
+    : 'Yalnızca sizin listenizden kaldırılır.';
+  if (!(await confirmDialog('Oyun listeden kaldırılsın mı?', text, 'Kaldır', true))) return;
+  await call('game_remove', { id: g.id }).catch(() => {});
+  state.games = state.games.filter((x) => x.id !== g.id);
+  closeRoom();
+};
+
+// ── Hamle: tıkla-tıkla ya da sürükle-bırak ──
+
+const boardEl = $('#board');
+
+function sqFromPoint(x, y) {
+  const r = boardEl.getBoundingClientRect();
+  if (x < r.left || y < r.top || x >= r.right || y >= r.bottom) return null;
+  const col = Math.floor((x - r.left) / (r.width / 8));
+  const row = Math.floor((y - r.top) / (r.height / 8));
+  const flip = boardEl.classList.contains('flipped');
+  return sqName((flip ? row : 7 - row) * 8 + (flip ? 7 - col : col));
+}
+
+boardEl.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0) return;
+  const g = gameById(gameState.open);
+  const sq = g && sqFromPoint(e.clientX, e.clientY);
+  if (!sq) return;
+  const sel = gameState.selected;
+  if (sel && sel !== sq && legalFrom(g, sel).some((m) => m.slice(2, 4) === sq)) {
+    tryMove(g, sel, sq);
+    return;
+  }
+  if (legalFrom(g, sq).length) {
+    e.preventDefault();
+    gameState.drag = { from: sq, x: e.clientX, y: e.clientY, moved: false, wasSelected: sel === sq, pointerId: e.pointerId };
+    gameState.selected = sq;
+    boardEl.setPointerCapture(e.pointerId);
+    renderBoard(g);
+    return;
+  }
+  if (sel) { gameState.selected = null; renderBoard(g); }
+});
+
+boardEl.addEventListener('pointermove', (e) => {
+  const d = gameState.drag;
+  if (!d) return;
+  if (!d.moved) {
+    if (Math.hypot(e.clientX - d.x, e.clientY - d.y) < 4) return;
+    d.moved = true;
+    const src = boardEl.querySelector(`[data-sq="${d.from}"] .pc`);
+    if (src) {
+      d.ghost = src.cloneNode(true);
+      d.ghost.classList.add('ghost');
+      d.ghost.style.fontSize = getComputedStyle(src).fontSize;
+      document.body.appendChild(d.ghost);
+      src.classList.add('lifted');
+    }
+  }
+  if (d.ghost) { d.ghost.style.left = `${e.clientX}px`; d.ghost.style.top = `${e.clientY}px`; }
+  const over = sqFromPoint(e.clientX, e.clientY);
+  if (over !== d.over) {
+    boardEl.querySelector('.sq.hover')?.classList.remove('hover');
+    if (over) boardEl.querySelector(`[data-sq="${over}"]`)?.classList.add('hover');
+    d.over = over;
+  }
+});
+
+function endPieceDrag(e, cancelled) {
+  const d = gameState.drag;
+  if (!d) return;
+  gameState.drag = null;
+  d.ghost?.remove();
+  try { boardEl.releasePointerCapture(d.pointerId); } catch { /* bırakılmış */ }
+  const g = gameById(gameState.open);
+  if (!g) return;
+  if (d.moved && !cancelled) {
+    const to = sqFromPoint(e.clientX, e.clientY);
+    if (to && to !== d.from && legalFrom(g, d.from).some((m) => m.slice(2, 4) === to)) { tryMove(g, d.from, to); return; }
+  } else if (!d.moved && d.wasSelected) {
+    gameState.selected = null; // seçili taşa ikinci tıklama seçimi kaldırır
+  }
+  renderBoard(g);
+}
+boardEl.addEventListener('pointerup', (e) => endPieceDrag(e, false));
+boardEl.addEventListener('pointercancel', (e) => endPieceDrag(e, true));
+
+function cancelDrag() {
+  if (!gameState.drag) return;
+  gameState.drag.ghost?.remove();
+  gameState.drag = null;
+}
+
+function tryMove(g, from, to) {
+  const cands = g.legal.filter((m) => m.startsWith(from + to));
+  if (!cands.length) return;
+  gameState.selected = null;
+  if (cands.length > 1) { renderBoard(g); showPromo(g, from, to); return; }
+  sendMove(g, cands[0]);
+}
+
+async function sendMove(g, uci) {
+  gameState.optimistic = { id: g.id, uci, base: g.moves.length, inCall: true };
+  renderRoom();
+  try {
+    await api.invoke('game_act', { id: g.id, action: { kind: 'move', mv: uci } });
+    if (gameState.optimistic?.uci === uci) gameState.optimistic.inCall = false;
+  } catch (e) {
+    gameState.optimistic = null;
+    toast(String(e), { type: 'error' });
+  }
+  maybeClearOptimistic();
+  renderRoom();
+}
+
+/** Hamle odaya işlendiyse ya da sahibi reddettiyse geçici gösterimi kaldır. */
+function maybeClearOptimistic() {
+  const o = gameState.optimistic;
+  if (!o) return;
+  const g = gameById(o.id);
+  if (!g || g.moves.length !== o.base || (!g.pending && !o.inCall)) gameState.optimistic = null;
+}
+
+function showPromo(g, from, to) {
+  const color = g.mySeat === 1 ? 'b' : 'w';
+  const names = { q: 'Vezir', r: 'Kale', b: 'Fil', n: 'At' };
+  const el = $('#promo');
+  el.innerHTML = `<div class="promo-title">Piyon neye dönüşsün?</div><div class="promo-row">${['q', 'r', 'b', 'n']
+    .map((t) => `<button data-promo="${t}" title="${names[t]}">${pieceHtml(color === 'w' ? t.toUpperCase() : t)}<span>${names[t]}</span></button>`).join('')}</div>`;
+  el.hidden = false;
+  gameState.promo = { id: g.id, from, to };
+}
+
+function closePromo() {
+  $('#promo').hidden = true;
+  gameState.promo = null;
+}
+
+$('#promo').addEventListener('click', (e) => {
+  const p = gameState.promo;
+  const b = e.target.closest('[data-promo]');
+  if (!p) return;
+  const g = gameById(p.id);
+  closePromo();
+  if (b && g) sendMove(g, p.from + p.to + b.dataset.promo);
+  else if (g) renderBoard(g);
+});
+
+// ── Yeni oyun / davet ──
+
+function showGameCreate({ game, fp } = {}) {
+  const defs = state.gameCatalog;
+  if (!defs.length) return toast('Oyun listesi yüklenemedi', { type: 'error' });
+  let chosen = gameDef(game) || defs[0];
+  const selected = new Set(fp && !isBlocked(fp) ? [fp] : []);
+  let seat = 'random';
+  const m = openModal('game-new', `
+    <h3>Yeni oyun</h3>
+    <p class="lead">Rakibinize davet gider. Kabul edince oyun odası açılır ve oynamaya başlarsınız.</p>
+    <div class="field"><label>Oyun</label><div class="game-pick" id="gn-games"></div></div>
+    <div class="field"><label id="gn-people-label">Rakip</label><div class="recips" id="gn-people"></div></div>
+    <div class="field" id="gn-seat-field"><label>Taşlarınız</label><div class="seg" id="gn-seat"></div></div>
+    <div class="err" id="gn-err"></div>
+    <div class="foot">
+      <button class="btn ghost" data-close>Vazgeç</button>
+      <button class="btn" id="gn-send">Davet gönder</button>
+    </div>`);
+  const people = candidatePeople();
+  const maxOpp = () => chosen.maxPlayers - 1;
+  const render = () => {
+    const single = maxOpp() === 1;
+    m.querySelector('#gn-games').innerHTML = defs.map((d) => `
+      <button class="gp ${d.id === chosen.id ? 'on' : ''}" data-g="${esc(d.id)}">${GAME_ART[d.id] || ''}<span>${esc(d.name)}</span></button>`).join('');
+    m.querySelector('#gn-people-label').textContent = single ? 'Rakip' : `Rakipler (en fazla ${maxOpp()})`;
+    m.querySelector('#gn-people').innerHTML = people.length
+      ? people.map((p) => personRow(p, selected.has(p.fingerprint)).replace('type="checkbox"', single ? 'type="radio" name="gn-opp"' : 'type="checkbox"')).join('')
+      : '<span class="muted small">Davet edilecek kimse yok. Ağda başka bir FastFiles görünmeli.</span>';
+    const seats = chosen.seats || [];
+    m.querySelector('#gn-seat-field').hidden = seats.length !== 2;
+    m.querySelector('#gn-seat').innerHTML = [['random', 'Rastgele'], ...seats.map((s, i) => [String(i), s])]
+      .map(([v, l]) => `<button class="${seat === v ? 'on' : ''}" data-seat="${v}">${esc(l)}</button>`).join('');
+  };
+  m.querySelector('#gn-games').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-g]');
+    if (!b) return;
+    chosen = gameDef(b.dataset.g) || chosen;
+    while (selected.size > maxOpp()) selected.delete([...selected].pop());
+    render();
+  });
+  m.querySelector('#gn-people').addEventListener('change', (e) => {
+    const f = e.target.closest('.recip')?.dataset.fp;
+    if (!f) return;
+    if (maxOpp() === 1) { selected.clear(); selected.add(f); }
+    else if (e.target.checked) { if (selected.size < maxOpp()) selected.add(f); }
+    else selected.delete(f);
+    render();
+  });
+  m.querySelector('#gn-seat').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-seat]');
+    if (b) { seat = b.dataset.seat; render(); }
+  });
+  m.querySelector('[data-close]').onclick = closeModal;
+  m.querySelector('#gn-send').onclick = async () => {
+    const err = m.querySelector('#gn-err');
+    if (selected.size < chosen.minPlayers - 1) {
+      err.textContent = maxOpp() === 1 ? 'Bir rakip seçin' : `En az ${chosen.minPlayers - 1} rakip seçin`;
+      return;
+    }
+    try {
+      const g = await api.invoke('game_invite', { game: chosen.id, players: [...selected], seat: seat === 'random' ? null : Number(seat) });
+      if (!gameById(g.id)) state.games = [g, ...state.games];
+      closeModal();
+      openRoom(g.id);
+      toast(`Davet gönderildi → ${vsName(g)}`, { type: 'success' });
+    } catch (e) {
+      err.textContent = String(e);
+    }
+  };
+  render();
+}
+
 // ───────────────────────────── Sürükle-bırak ─────────────────────────────
 
 function peerIdAt(pos) {
@@ -3127,6 +3825,9 @@ async function init() {
   renderShares();
   state.polls = snap.polls || [];
   renderPolls();
+  state.games = snap.games || [];
+  state.gameCatalog = snap.gameCatalog || [];
+  renderGames();
   renderUpdateBar();
   renderMe();
   renderPeers();
@@ -3151,6 +3852,8 @@ async function init() {
   });
   api.listen('shares', (e) => onShares(e.payload));
   api.listen('polls', (e) => onPolls(e.payload));
+  api.listen('games', (e) => onGames(e.payload));
+  api.listen('game-error', (e) => toast(e.payload.message, { type: 'error', timeout: 6000 }));
   api.listen('share-files', (e) => { if (state.openShare === e.payload.id) loadShareFiles(); });
   api.listen('conversation', (e) => onConversation(e.payload));
   api.listen('notification-click', (e) => onNotificationClick(e.payload));
@@ -3309,6 +4012,54 @@ function createPreviewApi() {
       voters: voters.slice(0, 3), anonymous: false, closed: true, rev: 9, createdAt: now - 3 * 86400e3, counts: [2, 1], voted: [me, fp1, fp2],
       ballots: [{ fingerprint: me, option: 0 }, { fingerprint: fp1, option: 1 }, { fingerprint: fp2, option: 0 }], myVote: 0, votePending: false, canVote: false, isOwner: false, seen: true },
   ];
+  // Örnek oyunlar: Ahmet'le süren satranç (siyahız, sıra bizde), Elif'ten davet, kazanılmış bir oyun.
+  snap.gameCatalog = [{ id: 'chess', name: 'Satranç', description: 'İki kişilik klasik satranç. Rok, geçerken alma, terfi, şah mat, pat ve beraberlik kuralları dahil.', minPlayers: 2, maxPlayers: 2, seats: ['Beyaz', 'Siyah'] }];
+  const START_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+  const startLegal = [...'abcdefgh'].flatMap((f) => [`${f}2${f}3`, `${f}2${f}4`]).concat(['b1a3', 'b1c3', 'g1f3', 'g1h3']);
+  const gameMock = (o) => ({
+    title: 'Satranç', game: 'chess', result: null, drawOffer: null, rev: 1, pending: false, legal: [], turn: null, myTurn: false, needsMe: false,
+    moves: [], info: { fen: START_FEN, check: false, san: [], lastMove: null }, ...o,
+  });
+  snap.games = [
+    gameMock({ id: 'gm1', host: fp1, hostName: 'Ahmet', isHost: false, players: [{ fingerprint: fp1, name: 'Ahmet' }, { fingerprint: me, name: 'Nur' }], joined: [fp1, me],
+      status: 'active', mySeat: 1, turn: 1, myTurn: true, needsMe: true, createdAt: now - 30 * 60e3, updatedAt: now - 40e3,
+      moves: 'e2e4 e7e5 g1f3 b8c6 f1c4 f8c5 c2c3 g8f6 d2d4 e5d4 c3d4 c5b4 b1c3 f6e4 e1g1 e4c3 b2c3'.split(' '),
+      legal: 'b4c5 b4d6 b4e7 b4f8 b4c3 b4a5 b4a3 c6e7 c6e5 c6d4 c6a5 c6b8 a7a6 a7a5 b7b6 b7b5 d7d6 d7d5 f7f6 f7f5 g7g6 g7g5 h7h6 h7h5 a8b8 d8e7 d8f6 d8g5 d8h4 e8f8 e8e7 e8g8 h8g8 h8f8'.split(' '),
+      info: { fen: 'r1bqk2r/pppp1ppp/2n5/8/1bBP4/2P2N2/P4PPP/R1BQ1RK1 b kq - 0 9', check: false, lastMove: 'b2c3',
+        san: ['e4', 'e5', 'Nf3', 'Nc6', 'Bc4', 'Bc5', 'c3', 'Nf6', 'd4', 'exd4', 'cxd4', 'Bb4+', 'Nc3', 'Nxe4', 'O-O', 'Nxc3', 'bxc3'] } }),
+    gameMock({ id: 'gm2', host: fp2, hostName: 'Elif (Tasarım)', isHost: false, players: [{ fingerprint: me, name: 'Nur' }, { fingerprint: fp2, name: 'Elif (Tasarım)' }], joined: [fp2],
+      status: 'invited', mySeat: 0, needsMe: true, createdAt: now - 2 * 60e3, updatedAt: now - 2 * 60e3 }),
+    gameMock({ id: 'gm0', host: me, hostName: 'Nur', isHost: true, players: [{ fingerprint: me, name: 'Nur' }, { fingerprint: fpM, name: 'Mehmet (İzinde)' }], joined: [me, fpM],
+      status: 'finished', mySeat: 0, moves: 'e2e4 e7e5 d1h5 b8c6 f1c4 g8f6 h5f7'.split(' '), result: { winner: me, reason: 'checkmate', by: null },
+      createdAt: now - 2 * 86400e3, updatedAt: now - 2 * 86400e3 + 600e3,
+      info: { fen: 'r1bqkb1r/pppp1Qpp/2n2n2/4p3/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 0 4', check: true, lastMove: 'h5f7', san: ['e4', 'e5', 'Qh5', 'Nc6', 'Bc4', 'Nf6', 'Qxf7#'] } }),
+  ];
+  const fenPlacement = (b) => [7, 6, 5, 4, 3, 2, 1, 0].map((r) => b.slice(r * 8, r * 8 + 8)
+    .reduce((s, p) => (p ? s + p : s.replace(/(\d?)$/, (d) => String(Number(d || 0) + 1))), '')).join('/');
+  const gameAct = (g, a) => {
+    const opp = g.players.find((p) => p.fingerprint !== me).fingerprint;
+    const end = (result) => Object.assign(g, { status: 'finished', result, drawOffer: null, myTurn: false, needsMe: false, legal: [], turn: null });
+    if (a.kind === 'move') {
+      if (!g.legal.includes(a.mv)) throw 'Kurallara aykırı hamle';
+      Object.assign(g, { pending: true, myTurn: false, needsMe: false, legal: [] });
+      setTimeout(() => {
+        const parts = g.info.fen.split(' ');
+        parts[0] = fenPlacement(applyLocalMove(parseFen(g.info.fen).board, a.mv));
+        parts[1] = parts[1] === 'w' ? 'b' : 'w';
+        parts[3] = '-';
+        Object.assign(g, { pending: false, moves: [...g.moves, a.mv], turn: 1 - g.mySeat, rev: g.rev + 1, updatedAt: Date.now(),
+          info: { ...g.info, fen: parts.join(' '), lastMove: a.mv, check: false, san: [...g.info.san, a.mv] } });
+        emit('games', structuredClone(snap.games));
+      }, 500);
+    } else if (a.kind === 'join') {
+      Object.assign(g, { joined: [...g.joined, me], status: 'active', turn: 0, myTurn: g.mySeat === 0, needsMe: g.mySeat === 0, legal: g.mySeat === 0 ? startLegal : [] });
+    } else if (a.kind === 'decline') Object.assign(g, { status: g.isHost ? 'cancelled' : 'declined', needsMe: false });
+    else if (a.kind === 'resign') end({ winner: opp, reason: 'resign', by: me });
+    else if (a.kind === 'offerDraw') g.drawOffer = me;
+    else if (a.kind === 'acceptDraw') end({ winner: null, reason: 'agreement', by: me });
+    else if (a.kind === 'declineDraw') g.drawOffer = null;
+    g.updatedAt = Date.now();
+  };
   const tallyMock = (p) => {
     p.counts = p.options.map((_, i) => p.ballots.filter((b) => b.option === i).length);
     p.voted = p.ballots.map((b) => b.fingerprint);
@@ -3328,6 +4079,11 @@ function createPreviewApi() {
     if (location.hash.includes('share')) { setTab('shares'); openShare('sh1'); }
     if (location.hash.includes('locked')) { setTab('shares'); openShare('sh2'); }
     if (location.hash.includes('poll')) openPoll(location.hash.includes('poll-closed') ? 'pl0' : 'pl2');
+    if (location.hash.includes('games')) openGames();
+    if (location.hash.includes('game-play')) openRoom('gm1');
+    if (location.hash.includes('game-invite')) openRoom('gm2');
+    if (location.hash.includes('game-over')) openRoom('gm0');
+    if (location.hash.includes('game-new')) showGameCreate();
     if (location.hash.includes('batch')) {
       showBatch(['C:\\Projeler\\Sunum_v4.pptx', 'C:\\Projeler\\Marka Kiti', 'D:\\Render\\final_cut.mp4'], ['p1', 'p2']);
     }
@@ -3407,6 +4163,25 @@ function createPreviewApi() {
       if (cmd === 'poll_remove') {
         snap.polls = snap.polls.filter((x) => x.id !== args.id);
         setTimeout(() => emit('polls', structuredClone(snap.polls)), 30);
+        return null;
+      }
+      if (cmd === 'game_act') {
+        gameAct(snap.games.find((x) => x.id === args.id), args.action);
+        setTimeout(() => emit('games', structuredClone(snap.games)), 40);
+        return null;
+      }
+      if (cmd === 'game_invite') {
+        const others = args.players.map((f) => ({ fingerprint: f, name: snap.peers.find((p) => p.fingerprint === f)?.name || 'Kişi' }));
+        const seat = args.seat ?? Math.round(Math.random());
+        const players = seat === 0 ? [{ fingerprint: me, name: 'Nur' }, ...others] : [...others, { fingerprint: me, name: 'Nur' }];
+        const g = gameMock({ id: `gm${Date.now()}`, host: me, hostName: 'Nur', isHost: true, players, joined: [me], status: 'invited', mySeat: seat, createdAt: Date.now(), updatedAt: Date.now() });
+        snap.games.unshift(g);
+        setTimeout(() => emit('games', structuredClone(snap.games)), 40);
+        return structuredClone(g);
+      }
+      if (cmd === 'game_remove') {
+        snap.games = snap.games.filter((x) => x.id !== args.id);
+        setTimeout(() => emit('games', structuredClone(snap.games)), 40);
         return null;
       }
       if (cmd === 'send_paths') return args.peerIds;

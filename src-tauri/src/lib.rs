@@ -3,6 +3,7 @@ mod chat;
 mod clipboard;
 mod config;
 mod discovery;
+mod games;
 mod node;
 mod pipeline;
 mod protocol;
@@ -38,6 +39,8 @@ struct Snapshot {
     avatars: std::collections::HashMap<String, String>,
     shares: Vec<ShareSummary>,
     polls: Vec<PollView>,
+    games: Vec<GameView>,
+    game_catalog: Vec<games::GameDef>,
 }
 
 #[tauri::command]
@@ -53,6 +56,8 @@ fn get_snapshot(node: NodeState) -> Snapshot {
         avatars: node.avatars(),
         shares: node.share_list(),
         polls: node.poll_list(),
+        games: node.game_list(),
+        game_catalog: games::CATALOG.to_vec(),
     }
 }
 
@@ -324,6 +329,30 @@ async fn poll_remove(node: NodeState<'_>, id: String) -> Result<(), String> {
 #[tauri::command]
 fn poll_mark_seen(node: NodeState, id: String) {
     node.poll_mark_seen(&id);
+}
+
+// ───────────── Oyunlar ─────────────
+
+use node::game::{GameAction, GameView};
+
+#[tauri::command]
+fn game_list(node: NodeState) -> Vec<GameView> {
+    node.game_list()
+}
+
+#[tauri::command]
+async fn game_invite(node: NodeState<'_>, game: String, players: Vec<String>, seat: Option<usize>) -> Result<GameView, String> {
+    node.game_invite(&game, &players, seat)
+}
+
+#[tauri::command]
+async fn game_act(node: NodeState<'_>, id: String, action: GameAction) -> Result<(), String> {
+    node.game_act(&id, action)
+}
+
+#[tauri::command]
+async fn game_remove(node: NodeState<'_>, id: String) -> Result<(), String> {
+    node.game_remove(&id)
 }
 
 #[tauri::command]
@@ -906,6 +935,10 @@ pub fn run() {
             poll_close,
             poll_remove,
             poll_mark_seen,
+            game_list,
+            game_invite,
+            game_act,
+            game_remove,
             share_add_files,
             remove_avatar,
             update_state,
