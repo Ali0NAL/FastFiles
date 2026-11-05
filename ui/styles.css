@@ -129,6 +129,8 @@ a { color: var(--accent); }
 .icon-btn.sm { width: 28px; height: 28px; border-radius: 8px; }
 .icon-btn.sm svg { width: 15px; height: 15px; }
 .icon-btn.on { color: var(--success); }
+.icon-btn.faint { opacity: .55; }
+.icon-btn.faint:hover { opacity: 1; }
 
 /* ─── Yerleşim ─── */
 .layout { flex: 1; display: grid; grid-template-columns: 1fr 360px; min-height: 0; }
@@ -191,6 +193,15 @@ a { color: var(--accent); }
 .msg.out .bubble { background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 75%, var(--accent-2))); color: #fff; border-bottom-right-radius: 5px; }
 .msg.in .bubble { background: var(--surface-2); border: 1px solid var(--border); border-bottom-left-radius: 5px; }
 .msg.failed .bubble { opacity: .65; }
+.bubble-row { display: flex; align-items: center; gap: 4px; max-width: 100%; }
+.msg.out .bubble-row { flex-direction: row-reverse; }
+.copy-btn {
+  flex-shrink: 0; width: 26px; height: 26px; border-radius: 8px; border: 0; background: none; cursor: pointer;
+  color: var(--muted); display: grid; place-items: center; opacity: 0; transition: opacity .12s;
+}
+.copy-btn svg { width: 14px; height: 14px; }
+.msg:hover .copy-btn, .copy-btn:focus-visible { opacity: 1; }
+.copy-btn:hover { background: var(--surface-2); color: var(--text); }
 .meta { font-size: 11px; color: var(--muted); margin: 2px 4px 4px; display: flex; align-items: center; gap: 4px; font-variant-numeric: tabular-nums; }
 .meta svg { width: 12px; height: 12px; }
 .meta .err { color: var(--danger); margin: 0; min-height: 0; font-size: 11px; }
@@ -233,7 +244,7 @@ a { color: var(--accent); }
 .transfer.flash { animation: flash 1.4s ease-out 2; }
 
 /* ─── Kart üzerindeki mesaj butonu ─── */
-.peer .actions .chat-btn { flex: 0 0 auto; width: 38px; padding: 0; position: relative; }
+.peer .actions .chat-btn, .peer .actions .sq-btn { flex: 0 0 auto; width: 38px; padding: 0; position: relative; }
 .peer .chat-btn .dot-badge { position: absolute; top: -7px; right: -7px; box-shadow: 0 0 0 2px var(--surface); }
 .badge.blocked { background: var(--danger-soft); color: var(--danger); }
 
@@ -375,6 +386,7 @@ body.dragging .peer.drop-target .drop-label { display: grid; }
 @keyframes stripes { to { background-position: -22.6px 0; } }
 .transfer .status { grid-column: 1 / -1; font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; gap: 8px; font-variant-numeric: tabular-nums; }
 .transfer .status .st { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.transfer .status .sp { white-space: nowrap; flex-shrink: 0; }
 .transfer.done .status .st { color: var(--success); font-weight: 600; }
 .transfer.failed .status .st, .transfer.declined .status .st { color: var(--danger); font-weight: 600; }
 .transfer.cancelled .status .st { color: var(--warn); font-weight: 600; }

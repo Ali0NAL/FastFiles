@@ -76,6 +76,9 @@ const ic = {
   ban: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m5.6 5.6 12.8 12.8"/></svg>',
   clock: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
   checks: '<svg viewBox="0 0 24 24"><path d="m3 12 5 5L18 7M13 16l1 1L22 9"/></svg>',
+  retry: '<svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>',
+  clip: '<svg viewBox="0 0 24 24"><rect x="6" y="4" width="12" height="17" rx="2"/><path d="M9 4.5V3h6v1.5M9 10h6M9 14h4"/></svg>',
+  copy: '<svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>',
   users: '<svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3 19c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5"/><path d="M16 4.8a3.2 3.2 0 0 1 0 6.4M18 13.8c2 .7 3 2.5 3 5.2"/></svg>',
 };
 const osIcon = (os) => ic[os === 'macos' ? 'macos' : os === 'linux' ? 'linux' : 'windows'];
@@ -196,6 +199,7 @@ function peerInner(p) {
       <div class="actions">
         <button class="btn soft small" data-act="files">${ic.file}Dosya</button>
         <button class="btn soft small" data-act="folder">${ic.folder}Klasör</button>
+        <button class="btn soft small sq-btn" data-act="clip" title="Panodakini gönder (Ctrl+V): metin, ekran görüntüsü veya kopyalanan dosyalar">${ic.clip}</button>
         <button class="btn soft small chat-btn" data-act="chat" title="Mesaj gönder">${ic.chat}${unreadOf(p.fingerprint) ? `<span class="dot-badge">${unreadOf(p.fingerprint)}</span>` : ''}</button>
       </div>
       <div class="drop-label">Bırak → ${esc(p.name)}</div>`;
@@ -211,6 +215,7 @@ $('#peers').addEventListener('click', async (e) => {
     case 'files': return pickAndSend(peer, false);
     case 'folder': return pickAndSend(peer, true);
     case 'chat': return openChat(peer.fingerprint, peer.name);
+    case 'clip': return sendClipboard([peer.id]);
     case 'trust': {
       const trusted = !peer.trusted;
       state.settings = await call('set_trusted', { fingerprint: peer.fingerprint, name: peer.name, trusted });
@@ -239,6 +244,83 @@ async function sendPaths(peer, paths) {
     await call('send_paths', { peerIds: [peer.id], paths });
   } catch { /* toast gösterildi */ }
 }
+
+// ───────────────────────────── Panoyu gönder ─────────────────────────────
+
+// Pano dosyalarının adında kullanılan yerel tarih-saat, ör. "2026-11-05 14.32.10".
+function clipStamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}.${p(d.getMinutes())}.${p(d.getSeconds())}`;
+}
+
+async function sendClipboard(peerIds) {
+  if (!peerIds.length) return;
+  try {
+    const r = await call('send_clipboard', { peerIds, stamp: clipStamp() });
+    const who = peerIds.length === 1 ? state.peers.find((p) => p.id === peerIds[0])?.name || '' : `${r.count} kişi`;
+    const msg = {
+      text: `Panodaki metin mesaj olarak gönderildi → ${who}`,
+      image: `Ekran görüntüsü gönderiliyor → ${who}`,
+      files: `Kopyalanan dosyalar gönderiliyor → ${who}`,
+      textfile: `Uzun metin .txt dosyası olarak gönderiliyor → ${who}`,
+    }[r.kind];
+    toast(msg || 'Gönderildi', { type: 'success' });
+  } catch { /* toast gösterildi */ }
+}
+
+// Birden fazla cihaz varken Ctrl+V: alıcı seçimi.
+function showClipboardTargets() {
+  const selected = new Set();
+  const m = openModal('clip', `
+    <h3>Panodakini gönder</h3>
+    <p class="lead">Kısa metin mesaj olarak, ekran görüntüsü ve kopyalanan dosyalar dosya olarak gider.</p>
+    <div class="field">
+      <div class="label-row"><label>Alıcılar</label><button class="link-btn" id="c-all">Tümünü seç</button></div>
+      <div class="recips" id="c-recips"></div>
+    </div>
+    <div class="foot">
+      <button class="btn ghost" data-close>Vazgeç</button>
+      <button class="btn" id="c-send" disabled>Gönder</button>
+    </div>`);
+  const peers = () => state.peers.filter((p) => !p.blocked);
+  const render = () => {
+    m.querySelector('#c-recips').innerHTML = peers().map((p) => `
+      <label class="recip ${selected.has(p.id) ? 'on' : ''}" data-id="${esc(p.id)}">
+        <input type="checkbox" ${selected.has(p.id) ? 'checked' : ''} />
+        <span class="avatar" style="background:${grad(p.fingerprint)}">${esc(initials(p.name))}</span>
+        <span class="r-name">${esc(p.name)}</span><span class="muted small">${esc(p.ip)}</span>
+      </label>`).join('');
+    m.querySelector('#c-all').textContent = selected.size === peers().length ? 'Hiçbirini seçme' : 'Tümünü seç';
+    const send = m.querySelector('#c-send');
+    send.disabled = !selected.size;
+    send.textContent = selected.size > 1 ? `${selected.size} kişiye gönder` : 'Gönder';
+  };
+  m.querySelector('#c-recips').addEventListener('change', (e) => {
+    const id = e.target.closest('.recip')?.dataset.id;
+    if (!id) return;
+    e.target.checked ? selected.add(id) : selected.delete(id);
+    render();
+  });
+  m.querySelector('#c-all').onclick = () => {
+    if (selected.size === peers().length) selected.clear();
+    else peers().forEach((p) => selected.add(p.id));
+    render();
+  };
+  m.querySelector('[data-close]').onclick = closeModal;
+  m.querySelector('#c-send').onclick = () => { const ids = [...selected]; closeModal(); sendClipboard(ids); };
+  render();
+}
+
+// Ana ekranda (yazı alanı dışında) Ctrl+V: panodakini gönder.
+document.addEventListener('paste', (e) => {
+  if (e.target.closest?.('input, textarea, [contenteditable]') || modalKind || chatOpen()) return;
+  const peers = state.peers.filter((p) => !p.blocked);
+  if (!peers.length) return toast('Ağda gönderilecek cihaz yok', { type: 'error' });
+  e.preventDefault();
+  if (peers.length === 1) sendClipboard([peers[0].id]);
+  else showClipboardTargets();
+});
 
 // ───────────────────────────── Toplu gönder ─────────────────────────────
 
@@ -376,30 +458,51 @@ function statusText(t) {
   const pct = t.total > 0 ? Math.floor((t.done / t.total) * 100) : 100;
   switch (t.status) {
     case 'waiting':
+      // Kopan bağlantıdan sonra yeniden deneme bekleniyorsa nedeni gösterilir.
+      if (t.error) return [t.error, t.done > 0 ? `%${pct} · ${fmtBytes(t.done)} / ${fmtBytes(t.total)}` : ''];
       return [t.direction === 'send' ? 'Karşı tarafın onayı bekleniyor…' : 'Hazırlanıyor…', ''];
     case 'active': {
       const eta = t.speed > 0 ? fmtEta((t.total - t.done) / t.speed) : '';
-      return [`%${pct} · ${fmtBytes(t.done)} / ${fmtBytes(t.total)}`, t.speed > 0 ? `${fmtSpeed(t.speed)}${eta ? ` · ${eta}` : ''}` : ''];
+      const resumed = t.resumed ? ' · kaldığı yerden' : '';
+      return [`%${pct} · ${fmtBytes(t.done)} / ${fmtBytes(t.total)}${resumed}`, t.speed > 0 ? `${fmtSpeed(t.speed)}${eta ? ` · ${eta}` : ''}` : ''];
     }
     case 'done': {
-      const secs = t.finishedAt && t.createdAt ? (t.finishedAt - t.createdAt) / 1000 : 0;
+      // Kaldığı yerden devam eden aktarımda süre (ve ortalama hız) anlamlı değil.
+      const secs = t.finishedAt && t.createdAt && !t.resumed ? (t.finishedAt - t.createdAt) / 1000 : 0;
       const avg = secs > 0.5 ? ` · ort. ${fmtSpeed(t.total / secs)}` : '';
-      return [t.direction === 'send' ? 'Gönderildi' : 'Alındı', `${fmtTime(t.finishedAt || Date.now())}${avg}`];
+      const label = t.direction === 'send' ? 'Gönderildi' : 'Alındı';
+      return [`${label}${t.resumed ? ' · kaldığı yerden devam edildi' : ''}`, `${whenLabel(t.finishedAt || Date.now())}${avg}`];
     }
-    case 'declined': return [t.error || 'Reddedildi', ''];
-    case 'cancelled': return [t.error || 'İptal edildi', ''];
-    default: return [t.error || 'Başarısız oldu', ''];
+    case 'declined': return [t.error || 'Reddedildi', whenLabel(t.finishedAt)];
+    case 'cancelled': return [t.error || 'İptal edildi', whenLabel(t.finishedAt)];
+    default: return [t.error || 'Başarısız oldu', whenLabel(t.finishedAt)];
   }
+}
+
+// Bugünse saat, değilse "Dün 14:05" / "3 Kas 14:05".
+function whenLabel(ms) {
+  if (!ms) return '';
+  const label = dayLabel(ms);
+  if (label === 'Bugün') return fmtTime(ms);
+  if (label === 'Dün') return `Dün ${fmtTime(ms)}`;
+  return `${new Date(ms).toLocaleDateString('tr-TR', { day: 'numeric', month: 'short' })} ${fmtTime(ms)}`;
 }
 
 function transferActions(t) {
   if (t.status === 'waiting' || t.status === 'active') {
     return `<button class="icon-btn sm" data-act="cancel" title="İptal et">${ic.x}</button>`;
   }
+  let html = '';
   if (t.status === 'done' && t.direction === 'receive' && t.savePath) {
-    return `<button class="icon-btn sm" data-act="reveal" title="Klasörde göster">${ic.reveal}</button>`;
+    html += `<button class="icon-btn sm" data-act="reveal" title="Klasörde göster">${ic.reveal}</button>`;
   }
-  return '';
+  if (t.direction === 'send' && t.sources?.length) {
+    const title = t.status === 'done' ? 'Tekrar gönder'
+      : t.status === 'failed' ? 'Tekrar dene (alıcıda yarım kaldıysa kaldığı yerden devam eder)' : 'Tekrar dene';
+    html += `<button class="icon-btn sm" data-act="retry" title="${title}">${ic.retry}</button>`;
+  }
+  html += `<button class="icon-btn sm faint" data-act="remove" title="Geçmişten sil">${ic.trash}</button>`;
+  return html;
 }
 
 function renderTransfer(t) {
@@ -472,9 +575,14 @@ $('#transfers').addEventListener('click', (e) => {
   if (!t) return;
   if (btn.dataset.act === 'cancel') call('cancel_transfer', { id: t.id });
   if (btn.dataset.act === 'reveal') call('reveal_path', { path: t.savePath });
+  if (btn.dataset.act === 'retry') call('retry_transfer', { id: t.id }).catch(() => {});
+  if (btn.dataset.act === 'remove') call('remove_transfer', { id: t.id }).then(setTransfers).catch(() => {});
 });
 
 $('#btn-clear').onclick = async () => {
+  const ok = await confirmDialog('Aktarım geçmişi silinsin mi?',
+    'Biten tüm gönderim ve alımlar listeden kaldırılır. Dosyalar silinmez.', 'Geçmişi temizle', true);
+  if (!ok) return;
   const list = await call('clear_finished');
   setTransfers(list);
 };
@@ -896,9 +1004,9 @@ function renderMessages(forceBottom = false) {
       ? `<div class="sender" style="color:hsl(${hue(m.sender)} 65% 55%)">${esc(m.senderName)}</div>`
       : '';
     html += `
-      <div class="msg ${dir}${first ? ' first' : ''}${m.status === 'failed' ? ' failed' : ''}">
+      <div class="msg ${dir}${first ? ' first' : ''}${m.status === 'failed' ? ' failed' : ''}" data-id="${esc(m.id)}">
         ${sender}
-        <div class="bubble">${esc(m.text)}</div>
+        <div class="bubble-row"><div class="bubble">${esc(m.text)}</div><button class="copy-btn" data-copy title="Kopyala">${ic.copy}</button></div>
         <div class="meta">${esc(fmtTime(m.at))}${m.outgoing ? statusMeta(m) : ''}</div>
       </div>`;
     prev = who;
@@ -906,9 +1014,20 @@ function renderMessages(forceBottom = false) {
   box.innerHTML = html;
   if (forceBottom || nearBottom) box.scrollTop = box.scrollHeight;
 }
-$('#messages').addEventListener('click', (e) => {
+$('#messages').addEventListener('click', async (e) => {
   const b = e.target.closest('[data-retry]');
   if (b && state.openChat) call('chat_retry', { fingerprint: state.openChat, id: b.dataset.retry }).catch(() => {});
+  if (e.target.closest('[data-copy]')) {
+    const id = e.target.closest('.msg')?.dataset.id;
+    const m = (state.history.get(state.openChat) || []).find((x) => x.id === id);
+    if (!m) return;
+    try {
+      await navigator.clipboard.writeText(m.text);
+      toast('Mesaj panoya kopyalandı', { type: 'success', timeout: 2000 });
+    } catch {
+      toast('Panoya kopyalanamadı', { type: 'error' });
+    }
+  }
 });
 
 function autoGrow() {
@@ -953,6 +1072,16 @@ $('#composer').addEventListener('keydown', (e) => {
   }
 });
 $('#chat-send').onclick = sendChat;
+// Sohbette ekran görüntüsü veya Gezgin'den kopyalanan dosya yapıştırılırsa dosya olarak gönderilir.
+$('#composer').addEventListener('paste', (e) => {
+  const types = [...(e.clipboardData?.types || [])];
+  if (!types.includes('Files') || types.includes('text/plain')) return;
+  const key = state.openChat;
+  const peer = key && !groupOf(key) ? peerByFp(key) : null;
+  e.preventDefault();
+  if (!peer) return toast('Gruplara dosya gönderilemiyor; bir cihaza gönderin', { type: 'error' });
+  sendClipboard([peer.id]);
+});
 
 function confirmDialog(title, text, okLabel, danger = false) {
   return new Promise((resolve) => {
@@ -1386,7 +1515,10 @@ function createPreviewApi() {
       { id: 't3', direction: 'send', peerId: 'p3', peerName: 'Render-Sunucu', title: '3 öğe', fileCount: 3, total: 5e6, done: 0, speed: 0, status: 'waiting', createdAt: now - 3000 },
       { id: 't1', direction: 'send', peerId: 'p1', peerName: 'Ahmet', title: 'Proje_Final', fileCount: 128, total: 2.4e9, done: 1.62e9, speed: 98e6, status: 'active', createdAt: now - 20000, currentFile: 'Proje_Final/assets/scene.fbx' },
       { id: 't2', direction: 'receive', peerId: 'p2', peerName: 'Elif (Tasarım)', title: 'logo-v3.psd', fileCount: 1, total: 84e6, done: 84e6, speed: 0, status: 'done', createdAt: now - 90000, finishedAt: now - 88000, savePath: 'C:\\x' },
-      { id: 't4', direction: 'send', peerId: 'p2', peerName: 'Elif (Tasarım)', title: 'sunum.pptx', fileCount: 1, total: 12e6, done: 0, speed: 0, status: 'declined', createdAt: now - 300000, finishedAt: now - 290000 },
+      { id: 't4', direction: 'send', peerId: 'p2', peerName: 'Elif (Tasarım)', title: 'sunum.pptx', fileCount: 1, total: 12e6, done: 0, speed: 0, status: 'declined', createdAt: now - 300000, finishedAt: now - 290000, sources: ['C:\\x\\sunum.pptx'] },
+      { id: 't5', direction: 'send', peerId: 'p1', peerName: 'Ahmet', title: 'Render_4K.mov', fileCount: 1, total: 18e9, done: 11.2e9, speed: 0, status: 'waiting', error: 'Bağlantı koptu · yeniden bağlanılıyor (2/6)', createdAt: now - 600000, sources: ['D:\\Render_4K.mov'] },
+      { id: 't6', direction: 'receive', peerId: 'p1', peerName: 'Ahmet', title: 'Arşiv 2025', fileCount: 3120, total: 6.4e9, done: 6.4e9, speed: 0, status: 'done', resumed: true, createdAt: now - 2 * 86400e3, finishedAt: now - 2 * 86400e3 + 600e3, savePath: 'C:\\y' },
+      { id: 't7', direction: 'send', peerId: 'p3', peerName: 'Render-Sunucu', title: 'sahne.blend', fileCount: 1, total: 2.1e9, done: 0.9e9, speed: 0, status: 'failed', error: 'Bağlantı koptu', createdAt: now - 26 * 3600e3, finishedAt: now - 26 * 3600e3 + 90e3, sources: ['D:\\sahne.blend'] },
     ],
   };
   const fp2 = snap.peers[1].fingerprint;
@@ -1493,6 +1625,9 @@ function createPreviewApi() {
         return snap.settings;
       }
       if (cmd === 'clear_finished') return snap.transfers.filter((t) => ['waiting', 'active'].includes(t.status));
+      if (cmd === 'remove_transfer') return (snap.transfers = snap.transfers.filter((t) => t.id !== args.id));
+      if (cmd === 'retry_transfer') return args.id;
+      if (cmd === 'send_clipboard') return { kind: 'image', count: args.peerIds.length };
       return snap.settings;
     },
     listen: async (ev, cb) => { (listeners[ev] ||= []).push(cb); },

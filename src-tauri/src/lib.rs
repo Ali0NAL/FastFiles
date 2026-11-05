@@ -1,8 +1,10 @@
 mod chat;
+mod clipboard;
 mod config;
 mod discovery;
 mod node;
 mod protocol;
+mod resume;
 mod tls;
 pub mod update;
 
@@ -157,6 +159,23 @@ fn cancel_transfer(node: NodeState, id: String) {
 #[tauri::command]
 fn clear_finished(node: NodeState) -> Vec<Transfer> {
     node.clear_finished()
+}
+
+#[tauri::command]
+fn remove_transfer(node: NodeState, id: String) -> Vec<Transfer> {
+    node.remove_transfer(&id)
+}
+
+/// Geçmişteki gönderimi tekrarlar (yarıda kaldıysa kaldığı yerden devam eder).
+#[tauri::command]
+async fn retry_transfer(node: NodeState<'_>, id: String) -> Result<String, String> {
+    node.inner().retry_transfer(&id).await
+}
+
+/// `stamp`: dosya adında kullanılacak yerel tarih-saat.
+#[tauri::command]
+async fn send_clipboard(node: NodeState<'_>, peer_ids: Vec<String>, stamp: String) -> Result<serde_json::Value, String> {
+    node.inner().send_clipboard(&peer_ids, &stamp).await
 }
 
 #[tauri::command]
@@ -544,6 +563,9 @@ pub fn run() {
             respond_incoming,
             cancel_transfer,
             clear_finished,
+            remove_transfer,
+            retry_transfer,
+            send_clipboard,
             add_manual_peer,
             forget_manual_peer,
             set_trusted,

@@ -3,6 +3,15 @@
 //! Kontrol mesajları `u32 (big-endian) uzunluk + JSON gövde` şeklinde çerçevelenir.
 //! Gönderim kabul edildikten sonra dosyaların ham byte'ları, teklifte (Offer)
 //! bildirilen sırayla ve boyutlarla, hiçbir sarmalama olmadan akıtılır.
+//!
+//! **Kaldığı yerden devam + doğrulama (`resume-b3`).** Gönderen bu özelliği teklifte
+//! (`features`) duyurur; alıcı da destekliyorsa `Accept`'te geri yollar ve her dosya
+//! için bir başlangıç noktası (`offsets`) bildirir. Bu durumda:
+//! - Gönderen her dosyanın yalnızca `offsets[i]`'den sonraki baytlarını akıtır, ardından
+//!   **tüm dosyanın** 32 baytlık BLAKE3 özetini ham olarak ekler.
+//! - `size > 0 && offsets[i] >= size` olan dosya alıcıda zaten tamamdır: ne bayt ne özet gönderilir.
+//!
+//! Özelliği bilmeyen eski sürümler alanları yok sayar ve eski protokolle devam eder.
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -13,6 +22,10 @@ pub const DEFAULT_PORT: u16 = 53317;
 /// Cihaz keşfi için kullanılan UDP portu.
 pub const DISCOVERY_PORT: u16 = 53318;
 pub const PROTOCOL_VERSION: u32 = 1;
+/// Kaldığı yerden devam + dosya başına BLAKE3 doğrulaması.
+pub const FEATURE_RESUME: &str = "resume-b3";
+/// BLAKE3 özetinin bayt uzunluğu.
+pub const HASH_LEN: usize = 32;
 
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 
@@ -38,6 +51,10 @@ pub struct FileEntry {
     /// `/` ile ayrılmış göreli yol, ör. `Proje/assets/logo.png`
     pub path: String,
     pub size: u64,
+    /// Son değişiklik zamanı (Unix ms). Dosya iki deneme arasında değiştiyse
+    /// eski yarım dosyadan devam edilmesin diye devam kaydının kimliğine katılır.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,8 +68,19 @@ pub enum Message {
         device: DeviceInfo,
         files: Vec<FileEntry>,
         total: u64,
+        /// Gönderenin desteklediği protokol özellikleri (ör. `FEATURE_RESUME`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
     },
-    Accept,
+    /// Alanlar boşsa `{"type":"accept"}` olarak gider; eski sürümler de anlar.
+    Accept {
+        /// Alıcının bu aktarımda kullanacağı özellikler (gönderenin teklif ettiklerinden).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
+        /// `FEATURE_RESUME`: her dosya için alıcıda zaten bulunan bayt sayısı.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        offsets: Vec<u64>,
+    },
     /// `reason`: "declined" | "timeout" | "busy"
     Decline { reason: String },
     /// Alıcı tüm dosyaları diske yazdı.
@@ -75,6 +103,10 @@ pub enum Message {
     UpdateRequest,
     UpdateOffer { header: crate::update::PackageHeader },
     UpdateNone,
+    /// Gönderen, kaldığı yerden devam edebilecek bir aktarımı iptal etti: alıcı yarım
+    /// dosyaları silsin. Yanıt: AbortAck.
+    Abort { device: DeviceInfo, transfer_id: String },
+    AbortAck,
 }
 
 pub const MAX_CHAT_CHARS: usize = 4000;
@@ -209,5 +241,25 @@ mod tests {
         assert!(valid_message_id("3f2a-11aa-bb"));
         assert!(!valid_message_id("../../x"));
         assert!(!valid_message_id(&"a".repeat(65)));
+    }
+
+    /// Eski sürümlerle uyum: özelliksiz Accept/Offer eskisiyle bayt bayt aynı JSON'u üretir,
+    /// eski JSON da yeni türlere sorunsuz çözülür.
+    #[test]
+    fn accept_and_offer_stay_backward_compatible() {
+        let plain = Message::Accept { features: vec![], offsets: vec![] };
+        assert_eq!(serde_json::to_string(&plain).unwrap(), r#"{"type":"accept"}"#);
+        match serde_json::from_str::<Message>(r#"{"type":"accept"}"#).unwrap() {
+            Message::Accept { features, offsets } => assert!(features.is_empty() && offsets.is_empty()),
+            _ => panic!("accept beklenirdi"),
+        }
+        let old_offer = r#"{"type":"offer","transfer_id":"t1","device":{"id":"a","name":"A","port":1,"fingerprint":"f","os":"windows"},"files":[{"path":"a.txt","size":1}],"total":1}"#;
+        match serde_json::from_str::<Message>(old_offer).unwrap() {
+            Message::Offer { features, .. } => assert!(features.is_empty()),
+            _ => panic!("offer beklenirdi"),
+        }
+        let resumed = Message::Accept { features: vec![FEATURE_RESUME.into()], offsets: vec![0, 5] };
+        let json = serde_json::to_string(&resumed).unwrap();
+        assert!(json.contains("resume-b3") && json.contains("[0,5]"));
     }
 }

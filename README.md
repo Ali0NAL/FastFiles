@@ -13,7 +13,11 @@ Aynı ağa (Wi-Fi veya ethernet) bağlı bilgisayarlar birbirini otomatik bulur.
 - **Uçtan uca şifreleme.** Bağlantı karşılıklı TLS 1.3 ile kurulur. Her cihazın kendi sertifikası vardır ve kimlik, sertifika parmak iziyle doğrulanır.
 - **Hız.** Dosyalar sarmalanmadan, 1 MB'lık bloklar halinde akıtılır. Gigabit ethernette hattın sınırına (~110 MB/sn) kadar çıkar.
 - **Canlı ilerleme.** Yüzde, hız ve kalan süre görünür. Aktarım her iki taraftan da iptal edilebilir.
-- **Güvenli kayıt.** Aynı isimde dosya varsa üzerine yazılmaz, `dosya (1).txt` olarak kaydedilir. Yarım kalan dosyalar silinir. `../` gibi zararlı yollar reddedilir.
+- **Kaldığı yerden devam.** Bağlantı koparsa (Wi-Fi gitti, kablo çıktı, bilgisayar uyudu) gönderen birkaç saniye arayla kendiliğinden yeniden bağlanır. Alıcı tekrar onay sormaz, aktarım kaldığı yerden sürer. İlerleme olduğu sürece denemeye devam eder; olmazsa aktarım "başarısız" olur ve "Tekrar dene" ile yine kaldığı yerden sürdürülebilir. Yarım dosyalar alıcıda 3 gün saklanır. Gönderen iptal ederse hemen silinir.
+- **Bütünlük doğrulaması.** Her dosyanın BLAKE3 özeti aktarım sırasında iki tarafta da hesaplanır ve karşılaştırılır. Diskte bozulan ya da iki deneme arasında değişen dosya kabul edilmez, yeniden gönderilir.
+- **Aktarım geçmişi.** Biten gönderim ve alımlar (son 300) uygulama kapansa da saklanır. Alınanlar "Klasörde göster", gönderilenler "Tekrar gönder" ile açılır veya yeniden gönderilir. Kayıtlar tek tek ya da topluca silinebilir.
+- **Panoyu gönder.** Cihaz kartındaki pano düğmesi veya ana ekranda **Ctrl+V**, panodakini gönderir: Gezgin'de kopyalanan dosyalar ve ekran görüntüsü dosya olarak (`Ekran görüntüsü <tarih>.png`), kısa metin mesaj olarak, 4000 karakterden uzun metin `.txt` olarak gider. Sohbette ekran görüntüsü yapıştırmak da onu o kişiye gönderir. Mesajların yanındaki düğmeyle metin tek tıkla kopyalanır.
+- **Güvenli kayıt.** Aynı isimde dosya varsa üzerine yazılmaz, `dosya (1).txt` olarak kaydedilir. Yarım dosyalar `.ffpart` uzantısıyla tutulur ve özet doğrulanmadan asıl adını almaz. `../` gibi zararlı yollar reddedilir.
 - **Sistem tepsisi.** Pencere kapatılsa da arka planda çalışmaya ve dosya almaya devam eder.
 - **IP ile ekleme.** Otomatik keşfin ulaşmadığı ağlar için cihaz adresiyle eklenebilir.
 - **Toplu gönderme.** "Toplu gönder" ile aynı dosya ve klasörler birden fazla kişiye tek seferde gönderilir. Dosyaları kartların dışındaki boş alana bırakmak da bu pencereyi açar. Her alıcı ayrıca onaylar.
@@ -95,6 +99,8 @@ FastFiles/
         ├── node.rs        Çekirdek: cihaz listesi, gönderme/alma, aktarım durumu (+ uçtan uca testler)
         ├── discovery.rs   UDP ile cihaz keşfi
         ├── protocol.rs    Mesaj formatı, güvenli yol kontrolü
+        ├── resume.rs      Yarıda kalan alımların kaydı (kaldığı yerden devam)
+        ├── clipboard.rs   "Panoyu gönder": dosya / ekran görüntüsü / metin
         ├── tls.rs         Sertifika parmak izi ile karşılıklı TLS
         └── config.rs      Cihaz kimliği ve ayarlar
 ```
@@ -103,8 +109,15 @@ FastFiles/
 
 1. Her cihaz 2,5 saniyede bir `{id, ad, port, parmak izi}` içeren bir UDP paketi yayınlar. 10 saniye duyulmayan cihaz listeden düşer.
 2. Gönderen, alıcıya TLS ile bağlanır. Alıcının sertifika parmak izi duyurulanla eşleşmezse bağlantı reddedilir.
-3. Gönderen bir `Offer` (dosya listesi ve boyutlar) yollar. Alıcı kullanıcıya sorar ve `Accept` ya da `Decline` döner.
+3. Gönderen bir `Offer` (dosya listesi, boyutlar, değişiklik zamanları ve desteklediği özellikler) yollar. Alıcı kullanıcıya sorar ve `Accept` ya da `Decline` döner.
 4. Kabul edilirse dosyaların ham byte'ları sırayla akıtılır. Alıcı her dosyayı önce `.ffpart` uzantısıyla yazar, tamamlanınca yeniden adlandırır, en sonda `Done` gönderir.
+
+**Kaldığı yerden devam (`resume-b3` özelliği).** İki taraf da destekliyorsa:
+
+- Alıcı `Accept` içinde her dosya için elindeki bayt sayısını (`offsets`) bildirir. Gönderen yalnızca kalan kısmı akıtır ve her dosyanın ardından **tüm dosyanın** 32 baytlık BLAKE3 özetini ekler. Alıcıda tamamlanmış dosyalar hiç gönderilmez.
+- Alıcı her kabulü `resume.json`'a yazar. Kayıtta gönderenin parmak izi, aktarım kimliği ve dosya listesinin özeti bulunur. Aynı parmak izinden aynı aktarım aynı dosya listesiyle tekrar gelirse onay sorulmaz. Başka bir cihaz bu kaydı kullanamaz.
+- Gönderen iptal ederse alıcıya ayrı bir bağlantıyla `Abort` gönderir ve alıcı yarım dosyaları siler.
+- Eski sürümler bu alanları yok sayar ve aktarım eski yöntemle sürer.
 
 ## Geliştirme
 

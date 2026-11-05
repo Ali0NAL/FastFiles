@@ -32,6 +32,11 @@ sha2 = "0.10"
 ring = "0.17"
 hex = "0.4"
 walkdir = "2"
+# Dosya bütünlüğü doğrulaması (aktarım sırasında akış halinde hesaplanır).
+blake3 = "1"
+# "Panoyu gönder": metin, ekran görüntüsü ve kopyalanan dosyalar.
+arboard = "3"
+png = "0.18"
 
 [target.'cfg(windows)'.dependencies]
 # Bildirime tıklanınca uygulamayı açabilmek için (notification eklentisi tıklamayı bildirmiyor).
