@@ -241,6 +241,8 @@ pub struct Node {
     last_peers: Mutex<String>,
     chats: Mutex<ChatStore>,
     chat_rate: Mutex<HashMap<String, VecDeque<Instant>>>,
+    /// Sormadan kabul edilen resimlerin cihaz başına sayacı (diski doldurma girişimine karşı).
+    image_rate: Mutex<HashMap<String, VecDeque<Instant>>>,
     update_dir: PathBuf,
     update_key: Mutex<Vec<u8>>,
     update_pkg: Mutex<Option<PackageHeader>>,
@@ -318,6 +320,7 @@ impl Node {
             last_peers: Mutex::new(String::new()),
             chats: Mutex::new(chats),
             chat_rate: Mutex::new(HashMap::new()),
+            image_rate: Mutex::new(HashMap::new()),
             update_dir,
             update_key: Mutex::new(update::public_key()),
             update_pkg: Mutex::new(None),
@@ -1235,8 +1238,12 @@ impl Node {
         };
 
         // ── Kullanıcı onayı (yarıda kalan aktarımın devamı zaten onaylanmıştı) ──
+        // Tek bir resim dosyası sohbet mesajı gibi sormadan alınır; klasörler, birden fazla
+        // dosya ve diğer türler onay ister. Kısa sürede çok fazla resim gelirse yine sorulur.
         let trusted = self.is_trusted(&fp);
-        let decision = if prior.is_some() || trusted {
+        let image = prior.is_none() && is_auto_image(&sanitized);
+        let auto_image = image && !trusted && rate_ok(&self.image_rate, &fp, IMAGE_RATE_MAX, IMAGE_RATE_WINDOW);
+        let decision = if prior.is_some() || trusted || auto_image {
             Decision { accept: true, trust: false }
         } else {
             let request_id = uuid::Uuid::new_v4().to_string();
@@ -1421,12 +1428,14 @@ impl Node {
             transfers: vec![FileTransferRef { to: self.identity.fingerprint.clone(), id: id.clone() }],
             sources: Vec::new(),
         };
+        // Resimler sohbet mesajı gibi gelir (okunmamış + mesaj bildirimi).
+        let loud = image;
         match &group {
-            Some((key, name)) => self.store_file_bubble(key, name, &id, false, file, Some((&device.fingerprint, &device.name))),
-            None => self.store_file_bubble(&device.fingerprint, &device.name, &id, false, file, None),
+            Some((key, name)) => self.store_file_bubble(key, name, &id, false, file, Some((&device.fingerprint, &device.name)), loud),
+            None => self.store_file_bubble(&device.fingerprint, &device.name, &id, false, file, None, loud),
         }
         // Güvenilir cihazdan sormadan kabul edildiyse kullanıcının haberi olsun.
-        if trusted && prior.is_none() {
+        if trusted && prior.is_none() && !image {
             self.notify(&format!("{} dosya gönderiyor", device.name), &summary, Some(&id));
         }
 
@@ -1594,17 +1603,7 @@ impl Node {
     // ───────────────────────────── Mesajlaşma ─────────────────────────────
 
     fn chat_rate_ok(&self, fp: &str) -> bool {
-        let mut map = self.chat_rate.lock().unwrap();
-        let q = map.entry(fp.to_string()).or_default();
-        let now = Instant::now();
-        while q.front().map_or(false, |t| now.duration_since(*t) > CHAT_RATE_WINDOW) {
-            q.pop_front();
-        }
-        if q.len() >= CHAT_RATE_MAX {
-            return false;
-        }
-        q.push_back(now);
-        true
+        rate_ok(&self.chat_rate, fp, CHAT_RATE_MAX, CHAT_RATE_WINDOW)
     }
 
     /// Gelen mesajı doğrular ve kaydeder. Hata durumunda karşı tarafa gidecek ret kodu döner.
@@ -1643,7 +1642,18 @@ impl Node {
 
     /// Aktarımı sohbette dosya balonu olarak gösterir (aynı aktarım için bir kez).
     /// Okunmamış sayısını artırmaz ve bildirim tetiklemez: aktarımın kendi bildirimi var.
-    fn store_file_bubble(&self, key: &str, name: &str, transfer_id: &str, outgoing: bool, file: FileRef, sender: Option<(&str, &str)>) {
+    /// `loud`: okunmamış sayılır ve gelen mesaj gibi bildirilir (sormadan alınan resimler).
+    #[allow(clippy::too_many_arguments)]
+    fn store_file_bubble(
+        &self,
+        key: &str,
+        name: &str,
+        transfer_id: &str,
+        outgoing: bool,
+        file: FileRef,
+        sender: Option<(&str, &str)>,
+        loud: bool,
+    ) {
         let msg_id = format!("f-{transfer_id}");
         let msg = {
             let mut chats = self.chats.lock().unwrap();
@@ -1661,11 +1671,15 @@ impl Node {
                 file: Some(file),
                 ..Default::default()
             };
-            chats.push_quiet(key, name, msg.clone());
+            if loud {
+                chats.push(key, name, msg.clone());
+            } else {
+                chats.push_quiet(key, name, msg.clone());
+            }
             msg
         };
         let unread = self.chats.lock().unwrap().conversation_meta(key).map_or(0, |m| m.1);
-        self.emit("chat", json!({ "fingerprint": key, "name": name, "unread": unread, "incoming": false, "message": msg }));
+        self.emit("chat", json!({ "fingerprint": key, "name": name, "unread": unread, "incoming": loud, "message": msg }));
     }
 
     /// `group_id` grubunda hem bu cihaz hem `fp` üyeyse (grup sohbet anahtarı, grup adı).
@@ -2010,7 +2024,7 @@ impl Node {
                 transfers: vec![FileTransferRef { to: peer.fingerprint.clone(), id: id.clone() }],
                 sources: Vec::new(),
             };
-            self.store_file_bubble(&peer.fingerprint, &peer.name, &id, true, file, None);
+            self.store_file_bubble(&peer.fingerprint, &peer.name, &id, true, file, None, false);
         }
         let token = CancellationToken::new();
         self.cancels.lock().unwrap().insert(id.clone(), token.clone());
@@ -2479,7 +2493,31 @@ pub fn fmt_bytes(n: u64) -> String {
 
 /// Kullanıcının seçtiği yolları tarar: (dosya listesi, başlık).
 /// Sohbette önizlenen resimlerin en büyük boyutu (daha büyükleri normal dosya balonu olarak kalır).
+/// Bu boyuta kadar tek bir resim dosyası alıcıya sorulmadan kabul edilir.
 const IMAGE_PREVIEW_MAX: u64 = 40 * 1024 * 1024;
+/// Bir cihazdan dakikada sormadan kabul edilecek en fazla resim.
+const IMAGE_RATE_MAX: usize = 20;
+const IMAGE_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Teklif sormadan alınabilecek tek bir resim mi (klasör içinde değil, boş değil, boyut sınırında)?
+fn is_auto_image(files: &[(Vec<String>, u64)]) -> bool {
+    matches!(files, [(parts, size)] if parts.len() == 1 && *size > 0 && *size <= IMAGE_PREVIEW_MAX && is_image_path(Path::new(&parts[0])))
+}
+
+/// Kayan pencereli sayaç: son pencerede `max`'tan az olay varsa yenisini sayar ve true döner.
+fn rate_ok(map: &Mutex<HashMap<String, VecDeque<Instant>>>, fp: &str, max: usize, window: Duration) -> bool {
+    let mut map = map.lock().unwrap();
+    let q = map.entry(fp.to_string()).or_default();
+    let now = Instant::now();
+    while q.front().is_some_and(|t| now.duration_since(*t) > window) {
+        q.pop_front();
+    }
+    if q.len() >= max {
+        return false;
+    }
+    q.push_back(now);
+    true
+}
 
 /// Sohbette resim olarak gösterilecek uzantılar (WebView'in güvenle çözebildikleri; SVG hariç).
 fn is_image_path(p: &Path) -> bool {
@@ -2639,6 +2677,84 @@ mod tests {
         assert!(recv.iter().all(|t| t.status == Status::Done));
         // Yarım kalmış .ffpart dosyası kalmamalı.
         assert!(walkdir::WalkDir::new(&dl).into_iter().flatten().all(|e| !e.path().to_string_lossy().ends_with(".ffpart")));
+    }
+
+    /// Tek bir resim, güvenilmeyen cihazdan bile sormadan alınır ve sohbet mesajı gibi bildirilir;
+    /// resim olmayan dosya ve resim içeren klasör yine onay ister.
+    #[tokio::test]
+    async fn single_image_arrives_without_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev2 = events.clone();
+        let emitter: Emitter = Arc::new(move |ev, payload| {
+            if ev == "incoming" || ev == "chat" {
+                ev2.lock().unwrap().push((ev.to_string(), payload.clone()));
+            }
+        });
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = Node::new(&tmp.path().join("bob/config"), &tmp.path().join("bob/dl"), emitter).unwrap();
+        bob.start_server(0).await.unwrap();
+        introduce(&alice, &bob);
+        let asked = || events.lock().unwrap().iter().filter(|e| e.0 == "incoming").count();
+
+        let img = tmp.path().join("Foto.JPG");
+        std::fs::write(&img, b"\xff\xd8\xff\xe0 resim").unwrap();
+        let id = alice.send_one(&bob.identity.id, vec![img.to_string_lossy().into()]).await.unwrap();
+        assert_eq!(wait_finished(&alice, &id).await.status, Status::Done);
+        assert_eq!(asked(), 0, "resim için onay sorulmamalı");
+        let dl = PathBuf::from(bob.settings().download_dir);
+        assert!(dl.join("Foto.JPG").exists());
+        // Gelen mesaj gibi: okunmamış sayılır ve "incoming" olarak bildirilir.
+        let fp = alice.identity.fingerprint.clone();
+        assert!(events.lock().unwrap().iter().any(|e| e.0 == "chat" && e.1["incoming"] == true));
+        assert_eq!(bob.chats.lock().unwrap().conversation_meta(&fp).map(|m| m.1), Some(1));
+
+        // Resim olmayan dosya: onay sorulur (yanıt verilmez, gönderen vazgeçer).
+        let doc = tmp.path().join("rapor.pdf");
+        std::fs::write(&doc, "x").unwrap();
+        let id = alice.send_one(&bob.identity.id, vec![doc.to_string_lossy().into()]).await.unwrap();
+        for _ in 0..100 {
+            if asked() > 0 {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(asked(), 1, "resim olmayan dosya onay istemeli");
+        alice.cancel_transfer(&id);
+
+        // Klasör içindeki resim de onay ister.
+        let dir = tmp.path().join("Albüm");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.png"), b"\x89PNG").unwrap();
+        let id = alice.send_one(&bob.identity.id, vec![dir.to_string_lossy().into()]).await.unwrap();
+        for _ in 0..100 {
+            if asked() > 1 {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(asked(), 2, "klasör onay istemeli");
+        alice.cancel_transfer(&id);
+    }
+
+    #[test]
+    fn auto_image_rules_and_rate_limit() {
+        let one = |name: &str, size: u64| vec![(vec![name.to_string()], size)];
+        assert!(is_auto_image(&one("a.png", 10)));
+        assert!(is_auto_image(&one("B.WEBP", IMAGE_PREVIEW_MAX)));
+        assert!(!is_auto_image(&one("a.png", IMAGE_PREVIEW_MAX + 1)));
+        assert!(!is_auto_image(&one("a.png", 0)));
+        assert!(!is_auto_image(&one("a.svg", 10)));
+        assert!(!is_auto_image(&one("a.png.exe", 10)));
+        assert!(!is_auto_image(&[(vec!["k".into(), "a.png".into()], 10)]));
+        assert!(!is_auto_image(&[(vec!["a.png".into()], 10), (vec!["b.png".into()], 10)]));
+
+        let map = Mutex::new(HashMap::new());
+        for _ in 0..IMAGE_RATE_MAX {
+            assert!(rate_ok(&map, "x", IMAGE_RATE_MAX, IMAGE_RATE_WINDOW));
+        }
+        assert!(!rate_ok(&map, "x", IMAGE_RATE_MAX, IMAGE_RATE_WINDOW), "sınır aşılınca yine sorulmalı");
+        assert!(rate_ok(&map, "y", IMAGE_RATE_MAX, IMAGE_RATE_WINDOW), "sayaç cihaz başına");
     }
 
     #[tokio::test]
