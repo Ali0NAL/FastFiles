@@ -389,7 +389,7 @@ impl Node {
         (self.emit)(event, payload)
     }
 
-    /// Bildirim; tıklanınca arayüzün açacağı yer 	arget ile verilir (ör. {"view":"polls"}).
+    /// Bildirim; tıklanınca arayüzün açacağı yer `target` ile verilir (ör. {"view":"polls"}).
     fn notify_to(&self, title: &str, body: &str, target: Value) {
         self.emit("notify", json!({ "title": title, "body": body, "target": target }));
     }
@@ -1776,6 +1776,44 @@ impl Node {
         self.chats.lock().unwrap().history(fp)
     }
 
+    /// Sohbetteki tek dosyalık resim balonunun yerel dosya yolu: gönderende seçilen kaynak,
+    /// alıcıda (aktarım bittiyse) kaydedilen dosya. Yol arayüzden alınmaz; yalnızca mesaj
+    /// kaydından çözülür, böylece bu komutla rastgele dosya okunamaz.
+    pub fn chat_image_path(&self, key: &str, id: &str) -> Result<PathBuf, String> {
+        let msg = self.chats.lock().unwrap().get(key, id).ok_or("Mesaj bulunamadı")?;
+        let file = msg.file.ok_or("Bu mesaj bir dosya değil")?;
+        if file.count != 1 {
+            return Err("Birden fazla dosya".into());
+        }
+        let transfers: Vec<Transfer> = {
+            let map = self.transfers.lock().unwrap();
+            file.transfers.iter().filter_map(|r| map.get(&r.id).cloned()).collect()
+        };
+        let path = if msg.outgoing {
+            file.sources.first().cloned().or_else(|| transfers.iter().find_map(|t| t.sources.first().cloned()))
+        } else {
+            transfers.iter().find(|t| t.status == Status::Done).and_then(|t| t.save_path.clone())
+        };
+        let path = PathBuf::from(path.ok_or("Dosya henüz hazır değil")?);
+        if !is_image_path(&path) {
+            return Err("Resim dosyası değil".into());
+        }
+        Ok(path)
+    }
+
+    /// Resim balonunun içeriği (sohbette önizleme ve resim gösterici için).
+    pub async fn chat_image(&self, key: &str, id: &str) -> Result<Vec<u8>, String> {
+        let path = self.chat_image_path(key, id)?;
+        let meta = tokio::fs::metadata(&path).await.map_err(|_| "Dosya artık yok".to_string())?;
+        if !meta.is_file() {
+            return Err("Dosya artık yok".into());
+        }
+        if meta.len() > IMAGE_PREVIEW_MAX {
+            return Err("Resim önizleme için çok büyük".into());
+        }
+        tokio::fs::read(&path).await.map_err(|e| e.to_string())
+    }
+
     pub fn chat_mark_read(&self, fp: &str) {
         self.chats.lock().unwrap().mark_read(fp);
     }
@@ -2440,6 +2478,15 @@ pub fn fmt_bytes(n: u64) -> String {
 }
 
 /// Kullanıcının seçtiği yolları tarar: (dosya listesi, başlık).
+/// Sohbette önizlenen resimlerin en büyük boyutu (daha büyükleri normal dosya balonu olarak kalır).
+const IMAGE_PREVIEW_MAX: u64 = 40 * 1024 * 1024;
+
+/// Sohbette resim olarak gösterilecek uzantılar (WebView'in güvenle çözebildikleri; SVG hariç).
+fn is_image_path(p: &Path) -> bool {
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "jfif" | "gif" | "webp" | "bmp" | "avif" | "ico")
+}
+
 async fn scan_sources(paths: &[String]) -> Result<(Arc<Vec<(PathBuf, FileEntry)>>, String), String> {
     let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
     let title = match paths.as_slice() {
@@ -3491,6 +3538,52 @@ mod tests {
         assert_eq!(p.fingerprint, "b".repeat(64));
         assert_eq!(p.ip, "192.168.1.20");
         assert!(node.candidates(&p).iter().all(|a| a.ip() != IpAddr::V4(Ipv4Addr::new(192, 168, 1, 66))));
+    }
+
+    /// Sohbetteki resim yolu yalnızca mesaj kaydından çözülür: resim olmayan dosya, bitmemiş
+    /// alım ve çok dosyalı balon önizlenmez.
+    #[tokio::test]
+    async fn chat_image_resolves_only_finished_single_images() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::new(&tmp.path().join("cfg"), &tmp.path().join("dl"), quiet()).unwrap();
+        let fp = "b".repeat(64);
+        let png = tmp.path().join("foto.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\nveri").unwrap();
+        let txt = tmp.path().join("not.txt");
+        std::fs::write(&txt, "x").unwrap();
+        let bubble = |id: &str, outgoing: bool, title: &str, count: u32, sources: Vec<String>, tid: &str| ChatMessage {
+            id: id.into(),
+            outgoing,
+            file: Some(FileRef {
+                title: title.into(),
+                count,
+                total: 12,
+                transfers: vec![FileTransferRef { to: fp.clone(), id: tid.into() }],
+                sources,
+            }),
+            ..Default::default()
+        };
+        {
+            let mut chats = node.chats.lock().unwrap();
+            chats.push_quiet(&fp, "Bob", bubble("o1", true, "foto.png", 1, vec![png.to_string_lossy().into()], "x1"));
+            chats.push_quiet(&fp, "Bob", bubble("o2", true, "not.txt", 1, vec![txt.to_string_lossy().into()], "x2"));
+            chats.push_quiet(&fp, "Bob", bubble("o3", true, "2 dosya", 2, vec![png.to_string_lossy().into()], "x3"));
+            chats.push_quiet(&fp, "Bob", bubble("i1", false, "foto.png", 1, vec![], "r1"));
+        }
+        assert_eq!(node.chat_image(&fp, "o1").await.unwrap(), std::fs::read(&png).unwrap());
+        assert!(node.chat_image(&fp, "o2").await.is_err(), "resim olmayan dosya okunmamalı");
+        assert!(node.chat_image(&fp, "o3").await.is_err());
+        assert!(node.chat_image(&fp, "yok").await.is_err());
+
+        // Alım bitmeden önizleme yok; bitince kaydedilen dosya okunur.
+        let mut t = Transfer::new("r1".into(), Direction::Receive, "bob".into(), "Bob".into(), "foto.png".into(), 1, 12, Status::Active);
+        t.save_path = Some(png.to_string_lossy().into());
+        node.transfers.lock().unwrap().insert("r1".into(), t);
+        assert!(node.chat_image(&fp, "i1").await.is_err());
+        node.transfers.lock().unwrap().get_mut("r1").unwrap().status = Status::Done;
+        assert!(node.chat_image(&fp, "i1").await.is_ok());
+        std::fs::remove_file(&png).unwrap();
+        assert!(node.chat_image(&fp, "i1").await.is_err(), "silinen dosya");
     }
 
     /// Yönetici çevrimdışı bir üyeyi çıkardıktan sonra grubu yeniden düzenlerse, çıkarılan

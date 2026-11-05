@@ -428,6 +428,28 @@ fn set_trusted(node: NodeState, fingerprint: String, name: String, trusted: bool
     node.set_trusted(&fingerprint, &name, trusted)
 }
 
+/// Sohbetteki resim balonunun içeriği (ham bayt; arayüz Blob olarak gösterir).
+#[tauri::command]
+async fn chat_image(node: NodeState<'_>, fingerprint: String, id: String) -> Result<tauri::ipc::Response, String> {
+    let bytes = node.inner().chat_image(&fingerprint, &id).await?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// Resim göstericiden: resmi varsayılan uygulamayla aç ya da klasörde göster.
+#[tauri::command]
+fn chat_image_open(node: NodeState, fingerprint: String, id: String, reveal: bool) -> Result<(), String> {
+    let path = node.chat_image_path(&fingerprint, &id)?;
+    if !path.is_file() {
+        return Err("Dosya artık yok".into());
+    }
+    let path = path.to_string_lossy().into_owned();
+    if reveal {
+        reveal_path(path)
+    } else {
+        open_path(node, path)
+    }
+}
+
 /// Dosyayı Gezgin'de seçili olarak gösterir.
 #[tauri::command]
 fn reveal_path(path: String) -> Result<(), String> {
@@ -851,6 +873,8 @@ pub fn run() {
             set_blocked,
             chat_conversations,
             chat_history,
+            chat_image,
+            chat_image_open,
             chat_send,
             chat_retry,
             chat_mark_read,

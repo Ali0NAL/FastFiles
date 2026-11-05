@@ -960,6 +960,7 @@ function renderPinDots() {
 
 function showLock() {
   closeEmoji();
+  closeViewer(); // kilitliyken resim görünmesin
   lockUi.pin = '';
   renderPinDots();
   $('#pin-err').textContent = '';
@@ -1226,6 +1227,7 @@ $('#convs').addEventListener('click', (e) => {
 
 async function openChat(fp, name) {
   closeEmoji();
+  closeViewer();
   if (!state.chats.has(fp)) {
     state.chats.set(fp, { fingerprint: fp, name: name || peerByFp(fp)?.name || 'Cihaz', unread: 0, last: null });
   }
@@ -1249,6 +1251,7 @@ async function openChat(fp, name) {
 }
 
 function closeChat() {
+  closeViewer();
   state.openChat = null;
   $('#chat-view').hidden = true;
   setTab('chats');
@@ -1364,11 +1367,382 @@ function statusMeta(m) {
   return '';
 }
 
+// ───────────────────────────── Sohbette resimler ─────────────────────────────
+// Tek dosyalık resim balonları resmin kendisiyle gösterilir; tıklayınca resim gösterici açılır.
+// Resim, mesaj kaydından arka uçta çözülen yoldan okunur (gönderende kaynak, alıcıda kaydedilen
+// dosya). Büyük fotoğraflar küçük bir önizlemeye indirgenir; tam boyutu yalnızca gösterici yükler.
+
+const IMG_EXT = /\.(png|jpe?g|jfif|gif|webp|bmp|avif|ico)$/i;
+const IMG_MAX = 40 * 1024 * 1024; // arka uçtaki IMAGE_PREVIEW_MAX ile aynı
+const THUMB_EDGE = 640; // önizlemenin uzun kenarı (px)
+const THUMB_CACHE = 80;
+const BUBBLE_W = 280; // balondaki resmin en büyük genişliği / yüksekliği
+const BUBBLE_H = 300;
+const thumbs = new Map(); // `${sohbet}|${mesaj}` → { url, w, h } | { failed } | {} (yükleniyor)
+const thumbQueue = [];
+let thumbBusy = 0;
+
+const thumbKey = (chat, id) => `${chat}|${id}`;
+const isNearBottom = (box) => box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+
+function isImageMsg(m) {
+  return !!m.file && m.file.count === 1 && m.file.total <= IMG_MAX && IMG_EXT.test(m.file.title || '');
+}
+
+// Resim hazır mı: gönderende hemen, alıcıda aktarım bitince.
+function imageReady(m) {
+  if (!isImageMsg(m)) return false;
+  if (m.outgoing) return true;
+  return (m.file.transfers || []).some((r) => state.transfers.get(r.id)?.status === 'done');
+}
+
+// Balonda resim gösteriliyor mu (yüklenemediyse normal dosya balonuna döner).
+function imageShown(m) {
+  return imageReady(m) && !thumbs.get(thumbKey(state.openChat, m.id))?.failed;
+}
+
+// Resmin balondaki boyutu: oran korunur, çok dar/uzun resimler makul sınırlarda kalır.
+function bubbleImageSize(m) {
+  const t = thumbs.get(thumbKey(state.openChat, m.id));
+  if (!t?.w) return { w: 240, h: 170 };
+  const scale = Math.min(1, BUBBLE_W / t.w, BUBBLE_H / t.h);
+  return { w: Math.max(170, Math.round(t.w * scale)), h: Math.max(60, Math.round(t.h * scale)) };
+}
+
+function bubbleWidthStyle(m) {
+  return `width:${bubbleImageSize(m).w + 12}px`;
+}
+
+function imagePart(m) {
+  if (!imageShown(m)) return '';
+  const t = thumbs.get(thumbKey(state.openChat, m.id));
+  if (!t?.url) queueThumb(state.openChat, m.id);
+  const { h } = bubbleImageSize(m);
+  return `<button class="fb-img${t?.url ? '' : ' loading'}" data-view="${esc(m.id)}" style="height:${h}px" title="Büyüt">${
+    t?.url ? `<img src="${t.url}" alt="${esc(m.file.title)}" draggable="false">` : ''}</button>`;
+}
+
+function sizeImageBubble(msgEl, m) {
+  const bubble = msgEl.querySelector('.file-bubble');
+  if (bubble) bubble.style.width = `${bubbleImageSize(m).w + 12}px`;
+}
+
+// Yüklenen (ya da yüklenemeyen) önizlemeyi açık sohbetteki balona yerleştirir; sohbet en
+// alttaysa en altta kalır.
+function updateImageBubble(chat, id) {
+  if (!chatOpen() || state.openChat !== chat) return;
+  const m = (state.history.get(chat) || []).find((x) => x.id === id);
+  const msg = document.querySelector(`.msg[data-id="${CSS.escape(id)}"]`);
+  if (!m || !msg) return;
+  const box = $('#messages');
+  const stick = isNearBottom(box);
+  const old = msg.querySelector('.fb-img');
+  const html = imagePart(m);
+  if (old) {
+    if (html) old.outerHTML = html;
+    else old.remove();
+  }
+  msg.classList.toggle('img-msg', !!html);
+  if (html) sizeImageBubble(msg, m);
+  else msg.querySelector('.file-bubble')?.style.removeProperty('width');
+  const body = msg.querySelector('.fb-body');
+  if (body) body.innerHTML = fileBubbleInner(m);
+  if (stick) box.scrollTop = box.scrollHeight;
+}
+
+// Tauri ham baytları ArrayBuffer olarak döndürür.
+async function fetchImageBlob(chat, id) {
+  const data = await api.invoke('chat_image', { fingerprint: chat, id });
+  const bytes = data instanceof ArrayBuffer || ArrayBuffer.isView(data) ? data : new Uint8Array(data);
+  return new Blob([bytes]);
+}
+
+function queueThumb(chat, id) {
+  const k = thumbKey(chat, id);
+  if (thumbs.has(k)) return;
+  thumbs.set(k, {});
+  thumbQueue.push([chat, id]);
+  pumpThumbs();
+}
+
+function pumpThumbs() {
+  while (thumbBusy < 3 && thumbQueue.length) {
+    const [chat, id] = thumbQueue.shift();
+    thumbBusy++;
+    makeThumb(chat, id).finally(() => {
+      thumbBusy--;
+      pumpThumbs();
+    });
+  }
+}
+
+async function makeThumb(chat, id) {
+  const k = thumbKey(chat, id);
+  let entry;
+  try {
+    const blob = await fetchImageBlob(chat, id);
+    const bmp = await createImageBitmap(blob);
+    const { width: w, height: h } = bmp;
+    const head = new TextDecoder().decode(await blob.slice(0, 3).arrayBuffer());
+    let url;
+    if (head === 'GIF' || (blob.size < 400 * 1024 && Math.max(w, h) <= THUMB_EDGE * 1.5)) {
+      // Küçük resimler ve GIF'ler (hareket kaybolmasın) olduğu gibi gösterilir.
+      url = URL.createObjectURL(blob);
+    } else {
+      const scale = Math.min(1, THUMB_EDGE / Math.max(w, h));
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(w * scale));
+      c.height = Math.max(1, Math.round(h * scale));
+      const x = c.getContext('2d');
+      x.imageSmoothingQuality = 'high';
+      x.drawImage(bmp, 0, 0, c.width, c.height);
+      const small = await new Promise((res) => c.toBlob(res, 'image/webp', 0.85));
+      url = URL.createObjectURL(small || blob);
+    }
+    bmp.close();
+    entry = { url, w, h };
+  } catch {
+    entry = { failed: true };
+  }
+  thumbs.delete(k); // en sona taşı (en son kullanılan)
+  thumbs.set(k, entry);
+  while (thumbs.size > THUMB_CACHE) {
+    const [oldKey, old] = thumbs.entries().next().value;
+    if (old.url) URL.revokeObjectURL(old.url);
+    thumbs.delete(oldKey);
+  }
+  updateImageBubble(chat, id);
+  if (viewer.open && viewer.chat === chat) renderViewerCount();
+}
+
+// ───────────────────────────── Resim gösterici ─────────────────────────────
+
+const viewer = { open: false, chat: null, ids: [], index: 0, url: null, w: 0, h: 0, s: 1, x: 0, y: 0, fit: 1, token: 0, drag: null, dragged: false };
+
+function viewerEl() {
+  let el = $('#viewer');
+  if (el) return el;
+  el = document.createElement('div');
+  el.id = 'viewer';
+  el.hidden = true;
+  el.innerHTML = `
+    <div class="vw-top">
+      <div class="vw-info"><b id="vw-name"></b><span id="vw-sub"></span></div>
+      <span id="vw-count"></span>
+      <div class="vw-tools">
+        <button class="vw-btn" data-vw="out" title="Uzaklaştır (−)"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4M8 11h6"/></svg></button>
+        <span id="vw-zoom">100%</span>
+        <button class="vw-btn" data-vw="in" title="Yakınlaştır (+)"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4M8 11h6M11 8v6"/></svg></button>
+        <button class="vw-btn" data-vw="fit" title="Ekrana sığdır (0)"><svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
+        <span class="vw-sep"></span>
+        <button class="vw-btn" data-vw="open" title="Varsayılan uygulamada aç"><svg viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg></button>
+        <button class="vw-btn" data-vw="reveal" title="Klasörde göster">${ic.reveal}</button>
+        <button class="vw-btn" data-vw="close" title="Kapat (Esc)">${ic.x}</button>
+      </div>
+    </div>
+    <div class="vw-stage"><img id="vw-img" alt="" draggable="false"><div class="vw-msg" id="vw-msg"></div></div>
+    <button class="vw-nav prev" data-vw="prev" title="Önceki (←)"><svg viewBox="0 0 24 24"><path d="m15 5-7 7 7 7"/></svg></button>
+    <button class="vw-nav next" data-vw="next" title="Sonraki (→)"><svg viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></svg></button>`;
+  document.body.appendChild(el);
+  el.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-vw]');
+    if (b) return viewerAction(b.dataset.vw);
+    // Resmin dışındaki boş alana tıklamak kapatır.
+    if (e.target.classList.contains('vw-stage') && !viewer.dragged) closeViewer();
+  });
+  const stage = el.querySelector('.vw-stage');
+  stage.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const r = stage.getBoundingClientRect();
+    zoomViewer(viewer.s * Math.exp(-e.deltaY * 0.0015), e.clientX - r.left, e.clientY - r.top);
+  }, { passive: false });
+  stage.addEventListener('dblclick', (e) => {
+    const r = stage.getBoundingClientRect();
+    const zoomed = viewer.s > viewer.fit * 1.01;
+    zoomViewer(zoomed ? viewer.fit : Math.max(1, viewer.fit * 2), e.clientX - r.left, e.clientY - r.top);
+  });
+  stage.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || !e.target.closest('#vw-img')) return;
+    viewer.drag = { x: e.clientX, y: e.clientY, ox: viewer.x, oy: viewer.y };
+    viewer.dragged = false;
+    stage.setPointerCapture(e.pointerId);
+  });
+  stage.addEventListener('pointermove', (e) => {
+    if (!viewer.drag) return;
+    const dx = e.clientX - viewer.drag.x;
+    const dy = e.clientY - viewer.drag.y;
+    if (Math.abs(dx) + Math.abs(dy) > 3) viewer.dragged = true;
+    viewer.x = viewer.drag.ox + dx;
+    viewer.y = viewer.drag.oy + dy;
+    applyViewer();
+  });
+  const endDragView = () => {
+    viewer.drag = null;
+    setTimeout(() => { viewer.dragged = false; }, 0);
+  };
+  stage.addEventListener('pointerup', endDragView);
+  stage.addEventListener('pointercancel', endDragView);
+  window.addEventListener('resize', () => viewer.open && fitViewer());
+  return el;
+}
+
+// Sohbetteki gösterilebilir resimler (sırayla).
+function viewerIds(chat) {
+  return (state.history.get(chat) || []).filter((m) => imageShown(m)).map((m) => m.id);
+}
+
+function openViewer(id) {
+  if (lockVisible() || !state.openChat) return;
+  closeEmoji();
+  viewer.chat = state.openChat;
+  viewer.ids = viewerIds(viewer.chat);
+  viewer.index = Math.max(0, viewer.ids.indexOf(id));
+  viewer.open = true;
+  viewerEl().hidden = false;
+  showViewerImage();
+}
+
+function closeViewer() {
+  if (!viewer.open) return;
+  viewer.open = false;
+  viewer.token++;
+  $('#viewer').hidden = true;
+  $('#vw-img').removeAttribute('src');
+  if (viewer.url) URL.revokeObjectURL(viewer.url);
+  viewer.url = null;
+}
+
+function renderViewerCount() {
+  const current = viewer.ids[viewer.index];
+  viewer.ids = viewerIds(viewer.chat);
+  viewer.index = Math.max(0, viewer.ids.indexOf(current));
+  const n = viewer.ids.length;
+  $('#vw-count').textContent = n > 1 ? `${viewer.index + 1} / ${n}` : '';
+  $('#viewer .vw-nav.prev').hidden = viewer.index <= 0;
+  $('#viewer .vw-nav.next').hidden = viewer.index >= n - 1;
+}
+
+async function showViewerImage() {
+  const id = viewer.ids[viewer.index];
+  const m = (state.history.get(viewer.chat) || []).find((x) => x.id === id);
+  if (!m) return closeViewer();
+  const token = ++viewer.token;
+  const img = $('#vw-img');
+  $('#vw-msg').textContent = '';
+  $('#vw-name').textContent = m.file.title;
+  const who = m.outgoing ? 'Siz' : (m.senderName || state.chats.get(viewer.chat)?.name || '');
+  $('#vw-sub').textContent = `${who} · ${dayLabel(m.at)} ${fmtTime(m.at)} · ${fmtBytes(m.file.total)}`;
+  renderViewerCount();
+  if (viewer.url) URL.revokeObjectURL(viewer.url);
+  viewer.url = null;
+  // Önce eldeki önizleme gösterilir, tam boyut gelince değiştirilir.
+  const t = thumbs.get(thumbKey(viewer.chat, id));
+  if (t?.url) {
+    viewer.w = t.w;
+    viewer.h = t.h;
+    img.src = t.url;
+    img.hidden = false;
+    fitViewer();
+  } else {
+    img.hidden = true;
+  }
+  try {
+    const blob = await fetchImageBlob(viewer.chat, id);
+    if (token !== viewer.token) return;
+    const url = URL.createObjectURL(blob);
+    const probe = new Image();
+    probe.src = url;
+    await probe.decode();
+    if (token !== viewer.token) return URL.revokeObjectURL(url);
+    viewer.url = url;
+    const sameSize = !img.hidden && viewer.w === probe.naturalWidth && viewer.h === probe.naturalHeight;
+    viewer.w = probe.naturalWidth;
+    viewer.h = probe.naturalHeight;
+    img.src = url;
+    img.hidden = false;
+    if (!sameSize) fitViewer();
+  } catch (e) {
+    if (token !== viewer.token) return;
+    if (!t?.url) $('#vw-msg').textContent = `Resim açılamadı${typeof e === 'string' ? `: ${e}` : ''}`;
+  }
+}
+
+function fitViewer() {
+  const stage = $('#viewer .vw-stage');
+  if (!viewer.w || !stage) return;
+  viewer.fit = Math.min(1, (stage.clientWidth - 48) / viewer.w, (stage.clientHeight - 32) / viewer.h);
+  viewer.s = viewer.fit;
+  applyViewer();
+}
+
+function zoomViewer(s, cx, cy) {
+  if (!viewer.w) return;
+  const stage = $('#viewer .vw-stage');
+  if (cx == null) {
+    cx = stage.clientWidth / 2;
+    cy = stage.clientHeight / 2;
+  }
+  const next = Math.min(Math.max(s, viewer.fit), Math.max(8, viewer.fit));
+  viewer.x = cx - ((cx - viewer.x) * next) / viewer.s;
+  viewer.y = cy - ((cy - viewer.y) * next) / viewer.s;
+  viewer.s = next;
+  applyViewer();
+}
+
+// Ölçek/konumu uygular: resim alandan küçükse ortalanır, büyükse kenar dışına kaydırılamaz.
+function applyViewer() {
+  const stage = $('#viewer .vw-stage');
+  const W = stage.clientWidth;
+  const H = stage.clientHeight;
+  const w = viewer.w * viewer.s;
+  const h = viewer.h * viewer.s;
+  viewer.x = w <= W ? (W - w) / 2 : Math.min(0, Math.max(W - w, viewer.x));
+  viewer.y = h <= H ? (H - h) / 2 : Math.min(0, Math.max(H - h, viewer.y));
+  const img = $('#vw-img');
+  img.style.width = `${viewer.w}px`;
+  img.style.height = `${viewer.h}px`;
+  img.style.transform = `translate(${viewer.x}px, ${viewer.y}px) scale(${viewer.s})`;
+  img.classList.toggle('grab', viewer.s > viewer.fit * 1.01);
+  $('#vw-zoom').textContent = `${Math.round(viewer.s * 100)}%`;
+}
+
+function stepViewer(d) {
+  const i = viewer.index + d;
+  if (i < 0 || i >= viewer.ids.length) return;
+  viewer.index = i;
+  showViewerImage();
+}
+
+function viewerAction(a) {
+  const id = viewer.ids[viewer.index];
+  if (a === 'close') closeViewer();
+  else if (a === 'prev') stepViewer(-1);
+  else if (a === 'next') stepViewer(1);
+  else if (a === 'in') zoomViewer(viewer.s * 1.25);
+  else if (a === 'out') zoomViewer(viewer.s / 1.25);
+  else if (a === 'fit') fitViewer();
+  else if ((a === 'open' || a === 'reveal') && id) {
+    api.invoke('chat_image_open', { fingerprint: viewer.chat, id, reveal: a === 'reveal' })
+      .catch((e) => toast(String(e), { type: 'error' }));
+  }
+}
+
+window.addEventListener('keydown', (e) => {
+  if (!viewer.open || modalKind || lockVisible()) return;
+  const map = { Escape: 'close', ArrowLeft: 'prev', ArrowRight: 'next', '+': 'in', '=': 'in', '-': 'out', '0': 'fit' };
+  const a = map[e.key];
+  if (!a) return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+  viewerAction(a);
+}, true);
+
 // Dosya balonu: durum ve ilerleme bağlı aktarım kayıtlarından (state.transfers) okunur.
 function fileBubbleInner(m) {
   const f = m.file;
   const ts = (f.transfers || []).map((r) => state.transfers.get(r.id)).filter(Boolean);
   const icon = f.count > 1 ? ic.folder : ic.file;
+  const showsImage = imageShown(m);
   let status = '';
   let bar = '';
   let actions = '';
@@ -1407,7 +1781,7 @@ function fileBubbleInner(m) {
   }
   return `
     <div class="fb-row">
-      <span class="fb-icon">${icon}</span>
+      ${showsImage ? '' : `<span class="fb-icon">${icon}</span>`}
       <div class="fb-main">
         <div class="fb-title" title="${esc(f.title)}">${esc(f.title)}</div>
         <div class="fb-sub">${f.count} dosya · ${fmtBytes(f.total)}</div>
@@ -1423,8 +1797,18 @@ function refreshFileBubbles(tid) {
   if (!chatOpen()) return;
   for (const m of state.history.get(state.openChat) || []) {
     if (!m.file?.transfers?.some((r) => r.id === tid)) continue;
-    const el = document.querySelector(`.msg[data-id="${CSS.escape(m.id)}"] .file-bubble`);
-    if (el) el.innerHTML = fileBubbleInner(m);
+    const msg = document.querySelector(`.msg[data-id="${CSS.escape(m.id)}"]`);
+    const body = msg?.querySelector('.fb-body');
+    if (!body) continue;
+    // Alınan resim tamamlandıysa önizleme şimdi eklenir.
+    if (!msg.querySelector('.fb-img') && imageShown(m)) {
+      const stick = isNearBottom($('#messages'));
+      body.insertAdjacentHTML('beforebegin', imagePart(m));
+      msg.classList.add('img-msg');
+      sizeImageBubble(msg, m);
+      if (stick) $('#messages').scrollTop = $('#messages').scrollHeight;
+    }
+    body.innerHTML = fileBubbleInner(m);
   }
 }
 
@@ -1459,10 +1843,11 @@ function renderMessages(forceBottom = false) {
       ? `<div class="sender" style="color:hsl(${hue(m.sender)} 65% 55%)">${esc(m.senderName)}</div>`
       : '';
     if (m.file) {
+      const img = imagePart(m);
       html += `
-      <div class="msg ${dir}${first ? ' first' : ''} file-msg" data-id="${esc(m.id)}">
+      <div class="msg ${dir}${first ? ' first' : ''} file-msg${img ? ' img-msg' : ''}" data-id="${esc(m.id)}">
         ${sender}
-        <div class="bubble file-bubble">${fileBubbleInner(m)}</div>
+        <div class="bubble file-bubble" style="${img ? bubbleWidthStyle(m) : ''}">${img}<div class="fb-body">${fileBubbleInner(m)}</div></div>
         <div class="meta">${esc(fmtTime(m.at))}</div>
       </div>`;
       prev = who;
@@ -1480,6 +1865,8 @@ function renderMessages(forceBottom = false) {
   if (forceBottom || nearBottom) box.scrollTop = box.scrollHeight;
 }
 $('#messages').addEventListener('click', async (e) => {
+  const v = e.target.closest('[data-view]');
+  if (v) return openViewer(v.dataset.view);
   const fb = e.target.closest('[data-fact]');
   if (fb) {
     const t = state.transfers.get(fb.dataset.tid);
@@ -2826,6 +3213,9 @@ function createPreviewApi() {
       { id: 't4', direction: 'send', peerId: 'p2', peerName: 'Elif (Tasarım)', title: 'sunum.pptx', fileCount: 1, total: 12e6, done: 0, speed: 0, status: 'declined', createdAt: now - 300000, finishedAt: now - 290000, sources: ['C:\\x\\sunum.pptx'] },
       { id: 't5', direction: 'send', peerId: 'p1', peerName: 'Ahmet', title: 'Render_4K.mov', fileCount: 1, total: 18e9, done: 11.2e9, speed: 0, status: 'waiting', error: 'Bağlantı koptu · yeniden bağlanılıyor (2/6)', createdAt: now - 600000, sources: ['D:\\Render_4K.mov'] },
       { id: 't6', direction: 'receive', peerId: 'p1', peerName: 'Ahmet', title: 'Arşiv 2025', fileCount: 3120, total: 6.4e9, done: 6.4e9, speed: 0, status: 'done', resumed: true, createdAt: now - 2 * 86400e3, finishedAt: now - 2 * 86400e3 + 600e3, savePath: 'C:\\y' },
+      { id: 't9', direction: 'receive', peerId: 'p2', peerName: 'Elif (Tasarım)', title: 'afis-taslak.png', fileCount: 1, total: 2.4e6, done: 2.4e6, speed: 0, status: 'done', createdAt: now - 26e3, finishedAt: now - 25e3, savePath: 'C:\a.png' },
+      { id: 't10', direction: 'send', peerId: 'p2', peerName: 'Elif (Tasarım)', title: 'ofis-panorama.jpg', fileCount: 1, total: 5.1e6, done: 2.2e6, speed: 41e6, status: 'active', createdAt: now - 21e3, sources: ['C:\b.jpg'] },
+      { id: 't11', direction: 'receive', peerId: 'p2', peerName: 'Elif (Tasarım)', title: 'ekran.png', fileCount: 1, total: 900e3, done: 300e3, speed: 12e6, status: 'active', createdAt: now - 16e3 },
       { id: 't7', direction: 'send', peerId: 'p3', peerName: 'Render-Sunucu', title: 'sahne.blend', fileCount: 1, total: 2.1e9, done: 0.9e9, speed: 0, status: 'failed', error: 'Bağlantı koptu', createdAt: now - 26 * 3600e3, finishedAt: now - 26 * 3600e3 + 90e3, sources: ['D:\\sahne.blend'] },
     ],
   };
@@ -2842,6 +3232,9 @@ function createPreviewApi() {
       { id: 'f-t2', outgoing: false, text: '📎 logo-v3.psd', at: now - 50e3, status: 'received', file: { title: 'logo-v3.psd', count: 1, total: 84e6, transfers: [{ to: 'me', id: 't2' }] } },
       { id: 'f-t8', outgoing: true, text: '📎 Çekim_RAW', at: now - 40e3, status: 'sent', file: { title: 'Çekim_RAW', count: 412, total: 38e9, transfers: [{ to: 'x', id: 't8' }] } },
       { id: 'f-t4', outgoing: true, text: '📎 sunum.pptx', at: now - 30e3, status: 'sent', file: { title: 'sunum.pptx', count: 1, total: 12e6, transfers: [{ to: 'x', id: 't4' }] } },
+      { id: 'f-t9', outgoing: false, text: '📎 afis-taslak.png', at: now - 25e3, status: 'received', file: { title: 'afis-taslak.png', count: 1, total: 2.4e6, transfers: [{ to: 'me', id: 't9' }] } },
+      { id: 'f-t10', outgoing: true, text: '📎 ofis-panorama.jpg', at: now - 20e3, status: 'sent', file: { title: 'ofis-panorama.jpg', count: 1, total: 5.1e6, transfers: [{ to: 'x', id: 't10' }] } },
+      { id: 'f-t11', outgoing: false, text: '📎 ekran.png', at: now - 15e3, status: 'received', file: { title: 'ekran.png', count: 1, total: 900e3, transfers: [{ to: 'me', id: 't11' }] } },
     ],
   };
   snap.conversations = [
@@ -2948,6 +3341,30 @@ function createPreviewApi() {
     invoke: async (cmd, args = {}) => {
       if (cmd === 'get_snapshot') return location.hash.includes('empty') ? { ...snap, peers: [], transfers: [], conversations: [] } : snap;
       if (cmd === 'chat_history') return structuredClone(history[args.fingerprint] || []);
+      if (cmd === 'chat_image') {
+        // Örnek resim: mesaja göre farklı boyut/renkte çizilir.
+        const spec = { 'f-t9': [1080, 1350, 280], 'f-t10': [3200, 1200, 170], 'f-t11': [1600, 1000, 20] }[args.id];
+        if (!spec) throw 'Dosya artık yok';
+        const [w, h, hueA] = spec;
+        const c = document.createElement('canvas');
+        c.width = w; c.height = h;
+        const x = c.getContext('2d');
+        const g = x.createLinearGradient(0, 0, w, h);
+        g.addColorStop(0, `hsl(${hueA} 70% 55%)`);
+        g.addColorStop(1, `hsl(${hueA + 60} 70% 30%)`);
+        x.fillStyle = g; x.fillRect(0, 0, w, h);
+        x.fillStyle = 'rgba(255,255,255,.85)';
+        x.font = `bold ${Math.round(h / 9)}px sans-serif`;
+        x.textAlign = 'center';
+        x.fillText(`${w} × ${h}`, w / 2, h / 2);
+        for (let i = 0; i < 40; i++) {
+          x.fillStyle = `rgba(255,255,255,${0.05 + (i % 5) * 0.03})`;
+          x.beginPath(); x.arc((i * 997) % w, (i * 577) % h, 20 + (i % 7) * 18, 0, Math.PI * 2); x.fill();
+        }
+        const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+        return blob.arrayBuffer();
+      }
+      if (cmd === 'chat_image_open') return null;
       if (cmd === 'share_files') return structuredClone(shareFilesMock[args.id] || []);
       if (cmd === 'share_unlock') {
         if (args.password !== '1234') throw 'Şifre yanlış';

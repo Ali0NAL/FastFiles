@@ -238,6 +238,59 @@ a { color: var(--accent); }
   padding: 10px 10px 8px; width: 100%; white-space: normal;
 }
 .msg.out.file-msg .bubble.file-bubble { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); background: var(--accent-soft); }
+/* Resim balonu: resmin kendisi, altında küçük dosya satırı */
+.msg.img-msg { min-width: 0; }
+.msg.img-msg .bubble.file-bubble { padding: 5px 5px 7px; max-width: 100%; }
+.fb-img {
+  display: block; width: 100%; padding: 0; border: 0; border-radius: 11px; overflow: hidden; cursor: zoom-in;
+  background: var(--surface); margin-bottom: 6px;
+}
+.fb-img img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.fb-img.loading {
+  background: linear-gradient(100deg, var(--surface) 30%, color-mix(in srgb, var(--surface) 60%, var(--border)) 50%, var(--surface) 70%);
+  background-size: 300% 100%; animation: shimmer 1.2s linear infinite;
+}
+@keyframes shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.fb-img:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.img-msg .fb-body { padding: 0 5px; }
+.img-msg .fb-row { gap: 6px; }
+.img-msg .fb-title { font-size: 12.5px; }
+.img-msg .fb-sub { font-size: 11.5px; }
+
+/* ─── Resim gösterici ─── */
+#viewer {
+  position: fixed; inset: 0; z-index: 45; display: flex; flex-direction: column;
+  background: rgba(8, 9, 16, .94); color: #f1f2f6; animation: fade .15s ease-out;
+}
+.vw-top { display: flex; align-items: center; gap: 14px; padding: 10px 14px 10px 20px; flex-shrink: 0; }
+.vw-info { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.vw-info b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vw-info span { font-size: 12px; color: rgba(241, 242, 246, .6); }
+#vw-count { font-size: 13px; color: rgba(241, 242, 246, .7); font-variant-numeric: tabular-nums; }
+.vw-tools { display: flex; align-items: center; gap: 2px; }
+#vw-zoom { min-width: 46px; text-align: center; font-size: 12px; color: rgba(241, 242, 246, .7); font-variant-numeric: tabular-nums; }
+.vw-sep { width: 1px; height: 20px; background: rgba(255, 255, 255, .15); margin: 0 6px; }
+.vw-btn {
+  width: 36px; height: 36px; border-radius: 10px; border: 0; background: none; color: inherit; cursor: pointer;
+  display: grid; place-items: center;
+}
+.vw-btn:hover { background: rgba(255, 255, 255, .1); }
+.vw-btn svg, .vw-nav svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.vw-stage { flex: 1; position: relative; overflow: hidden; }
+#vw-img {
+  position: absolute; left: 0; top: 0; transform-origin: 0 0; max-width: none; user-select: none;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, .45); image-rendering: auto;
+}
+#vw-img.grab { cursor: grab; }
+#vw-img.grab:active { cursor: grabbing; }
+.vw-msg { position: absolute; inset: 0; display: grid; place-items: center; color: rgba(241, 242, 246, .7); pointer-events: none; }
+.vw-nav {
+  position: absolute; top: 50%; width: 46px; height: 46px; margin-top: -2px; border-radius: 50%; border: 0; cursor: pointer;
+  display: grid; place-items: center; background: rgba(255, 255, 255, .1); color: #fff;
+}
+.vw-nav:hover { background: rgba(255, 255, 255, .2); }
+.vw-nav.prev { left: 16px; }
+.vw-nav.next { right: 16px; }
 .fb-row { display: flex; align-items: center; gap: 10px; }
 .fb-icon { width: 34px; height: 34px; flex-shrink: 0; border-radius: 10px; display: grid; place-items: center; background: var(--surface); color: var(--accent); }
 .fb-icon svg { width: 17px; height: 17px; }
