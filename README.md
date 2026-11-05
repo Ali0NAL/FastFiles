@@ -58,11 +58,15 @@ Aynı ağa (Wi-Fi veya ethernet) bağlı bilgisayarlar birbirini otomatik bulur.
 
 ### Otomatik güncelleme nasıl çalışır?
 
-1. Yeni sürümü yayınlamak için sürüm numarasını artırın (`src-tauri/tauri.conf.json` ve `src-tauri/Cargo.toml` aynı olmalı), sonra çalıştırın:
+1. Ofisteki herkesi güncellemek için proje klasöründe tek komut yeterlidir (yeni sürüm numarasını siz verirsiniz, mevcuttan büyük olmalı):
 
    ```powershell
-   .\release.ps1
+   .\release.cmd -Version 1.4.1
    ```
+
+   (`release.cmd`, Windows'un `.ps1` betik kısıtlamasını yalnızca bu çalıştırma için atlayıp `release.ps1`'i çalıştırır. Betik çalıştırmaya izin verilen bir terminalde doğrudan `.\release.ps1 -Version 1.4.1` de olur.) Komutu çalıştırırken **bu bilgisayardaki FastFiles açık olmalıdır** (tepside de olur). Kapalıysa güncelleme, FastFiles açılana kadar gelen kutusunda bekler.
+
+   Betik sürüm numarasını `src-tauri/tauri.conf.json` ve `src-tauri/Cargo.toml` içinde günceller, derler ve gizli anahtarla imzalar. Komut, imza anahtarının bulunduğu bilgisayarda çalıştırılmalıdır. `git push` tek başına kimseyi güncellemez.
 
 2. Başka bir şey yapmanız gerekmez. Betik paketi bu bilgisayardaki FastFiles'ın gelen kutusuna (`%APPDATA%\io.twinup.fastfiles\updates\inbox`) koyar. FastFiles imzayı doğrulayıp paketi içe alır, önce kendini günceller, sonra paketi ağa dağıtır. (Paketi elle vermek isterseniz `.ffupdate` dosyasını FastFiles penceresine sürükleyin ya da Ayarlar → "Güncelleme paketi yükle".)
 3. Her FastFiles birkaç saniyede bir yaptığı duyuruda sürümünü ve elindeki paketi bildirir. Daha eski sürümdeki cihazlar paketi indirir, doğrular ve kendileri de dağıtmaya başlar.
