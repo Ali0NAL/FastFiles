@@ -44,6 +44,20 @@ pub struct DeviceInfo {
     /// Profil resminin kısa özeti (yoksa boş).
     #[serde(default)]
     pub avatar: String,
+    /// Sanal ofiste seçilen koltuk (1..=MAX_SEAT). 0 = seçilmedi (eski sürümler göndermez).
+    #[serde(default)]
+    pub seat: u8,
+    /// Durum: "" (müsait) | "busy" (toplantıda) | "focus" (odakta) | "away" (dışarıda).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+}
+
+/// Sanal ofisteki en yüksek koltuk numarası (masa düzeni büyürse artırılabilir).
+pub const MAX_SEAT: u8 = 32;
+/// Geçerli durum değerleri ("" = müsait).
+pub const STATUSES: [&str; 4] = ["", "busy", "focus", "away"];
+pub fn valid_status(s: &str) -> bool {
+    STATUSES.contains(&s)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,14 +107,29 @@ pub enum Message {
     /// Alıcı aktarımı iptal etti.
     Cancel,
     /// Metin mesajı. Gönderenin kimliği TLS istemci sertifikasıyla doğrulanır.
-    Chat { device: DeviceInfo, id: String, text: String },
+    Chat {
+        device: DeviceInfo,
+        id: String,
+        text: String,
+        /// Alıntılanarak yanıtlanan mesaj (eski sürümler göndermez/yok sayar).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply: Option<crate::chat::ReplyRef>,
+    },
     ChatAck { id: String },
     /// `reason`: "blocked" | "rate" | "too_long" | "empty" | "invalid"
     ChatReject { reason: String },
     /// Grup bilgisi (oluşturma/değişiklik/silme). Yalnızca grubun yöneticisinden kabul edilir.
     GroupUpdate { device: DeviceInfo, group: crate::chat::GroupInfo },
     /// Grup mesajı. Yanıt: ChatAck ya da ChatReject ("unknown_group" | "not_member" | ...).
-    GroupChat { device: DeviceInfo, group_id: String, id: String, text: String, sent_at: u64 },
+    GroupChat {
+        device: DeviceInfo,
+        group_id: String,
+        id: String,
+        text: String,
+        sent_at: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply: Option<crate::chat::ReplyRef>,
+    },
     /// Üye gruptan ayrılıyor (yöneticiye gönderilir).
     GroupLeave { device: DeviceInfo, group_id: String },
     GroupAck,
@@ -153,6 +182,21 @@ pub enum Message {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group_id: Option<String>,
     },
+    /// Sohbet olayı: tepki, düzenleme, silme, dürtme. Yanıt: GroupAck.
+    ChatEvent {
+        device: DeviceInfo,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group_id: Option<String>,
+        event: crate::chat::ChatEventKind,
+    },
+    /// Ekran paylaşımı daveti (paylaşan → izleyici). Yanıt: GroupAck.
+    ScreenOffer { device: DeviceInfo, session: String },
+    /// Paylaşım bitti (paylaşan → izleyici). Yanıt: GroupAck.
+    ScreenEnd { device: DeviceInfo, session: String },
+    /// İzleme isteği (izleyici → paylaşan). Yanıt: ScreenStart + JPEG kareleri ya da ChatReject.
+    /// Kareler `u32 (big-endian) uzunluk + JPEG` olarak akar; uzunluk 0 = paylaşım bitti.
+    ScreenWatch { device: DeviceInfo, session: String },
+    ScreenStart { width: u32, height: u32 },
 }
 
 pub const MAX_CHAT_CHARS: usize = 4000;

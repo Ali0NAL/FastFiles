@@ -4,6 +4,7 @@
 const T = window.__TAURI__;
 const api = T ? {
   invoke: (cmd, args) => T.core.invoke(cmd, args),
+  invokeRaw: (cmd, body, headers) => T.core.invoke(cmd, body, { headers }),
   listen: (ev, cb) => T.event.listen(ev, cb),
   onDragDrop: (cb) => T.webview.getCurrentWebview().onDragDropEvent(cb),
   pick: (opts) => (T.dialog ? T.dialog.open(opts) : T.core.invoke('plugin:dialog|open', { options: opts })),
@@ -154,11 +155,21 @@ $('#modal-root').addEventListener('mousedown', (e) => {
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   if (modalKind && modalKind !== 'incoming' && modalKind !== 'welcome') closeModal();
+  else if (!modalKind && !$('#screen-viewer').hidden) closeScreenViewer();
+  else if (document.getElementById('status-menu')) closeStatusMenu();
+  else if (document.getElementById('react-pop')) closeReactPicker();
   else if (!modalKind && gamesOpen()) {
     // Oyun ekranı diğer her şeyin önünde: önce terfi seçimi, sonra ekranın kendisi kapanır.
     if (!$('#promo').hidden) closePromo();
     else closeGames();
   }
+  else if (!modalKind && officeOpen()) {
+    if (officeState.mod?.pickMode) setOfficePick(false);
+    else closeOffice();
+  }
+  else if (!modalKind && chatOpen() && !$('#mention-pop').hidden) $('#mention-pop').hidden = true;
+  else if (!modalKind && chatOpen() && (chatx.reply || chatx.edit)) cancelCompose();
+  else if (!modalKind && chatOpen() && !$('#chat-searchbar').hidden) closeSearch();
   else if (!modalKind && chatOpen()) closeChat();
   else if (!modalKind && shareOpen()) closeShare();
   else if (!modalKind && pollOpen()) closePoll();
@@ -172,11 +183,12 @@ function renderMe() {
   const ip = state.ips[0] || '';
   $('#me-ip').textContent = ip;
   $('#empty-ip').textContent = ip || '—';
-  $('#me').title = `Bu bilgisayar · ${state.ips.join(', ')} · port ${state.device?.port ?? ''}`;
+  $('#me').title = `Durumunuzu değiştirmek için tıklayın · ${state.ips.join(', ')} · port ${state.device?.port ?? ''}`;
   const av = $('#me-avatar');
   const fp = state.device?.fingerprint;
   av.style.background = grad(fp);
   av.innerHTML = face(fp, state.settings.deviceName);
+  renderMyStatus();
 }
 
 // ───────────────────────────── Cihazlar ─────────────────────────────
@@ -202,7 +214,7 @@ function renderPeers() {
       el.dataset.id = p.id;
       setTimeout(() => el.classList.remove('enter'), 400);
     }
-    const sig = JSON.stringify([p.name, p.ip, p.os, p.version, p.trusted, p.blocked, p.manualAddr, unreadOf(p.fingerprint), state.avatars.get(p.fingerprint)?.length || 0]);
+    const sig = JSON.stringify([p.name, p.ip, p.os, p.version, p.trusted, p.blocked, p.manualAddr, p.status, unreadOf(p.fingerprint), state.avatars.get(p.fingerprint)?.length || 0]);
     if (el.dataset.sig !== sig) {
       el.dataset.sig = sig;
       el.innerHTML = peerInner(p);
@@ -210,6 +222,7 @@ function renderPeers() {
     if (container.children[i] !== el) container.insertBefore(el, container.children[i] || null);
   });
   existing.forEach((el) => el.remove());
+  officeSyncPeople();
 }
 
 function peerInner(p) {
@@ -221,6 +234,7 @@ function peerInner(p) {
       </div>
       <div class="avatar" style="background:${grad(p.fingerprint)}">${face(p.fingerprint, p.name)}<span class="os">${osIcon(p.os)}</span></div>
       <div class="name" title="${esc(p.name)}">${esc(p.name)}</div>
+      ${p.status ? `<div class="peer-status">${statusChip(p.status)}</div>` : ''}
       <div class="addr">${esc(p.ip)}${p.version ? ` · v${esc(p.version)}` : ''}</div>
       <div class="badges">
         ${p.blocked ? `<span class="badge blocked">${ic.ban}Engellendi</span>` : ''}
@@ -589,6 +603,7 @@ function onTransfer(t) {
   renderTransfer(t);
   updateTransfersChrome();
   refreshFileBubbles(t.id);
+  officeOnTransfer(prev, t);
   if (prev?.status === t.status) return;
   if (t.status === 'done') {
     if (t.direction === 'receive') {
@@ -632,6 +647,7 @@ function setTransfers(list) {
   $('#transfers').innerHTML = '';
   [...list].reverse().forEach(renderTransfer);
   updateTransfersChrome();
+  officeTransfers();
 }
 
 // ───────────────────────────── Gelen istekler ─────────────────────────────
@@ -800,6 +816,8 @@ function showSettings() {
     </div>
     <label class="check"><input type="checkbox" id="s-shell" ${s.shellMenu !== false ? 'checked' : ''} />
       <span>Gezgin'de sağ tık menüsüne "FastFiles ile gönder" ekle<br><span class="muted small">Dosya ve klasörlere sağ tıklayıp doğrudan gönderin. Windows 11'de "Diğer seçenekleri göster" altında; çok sayıda dosya için "Gönder" menüsünde de bulunur.</span></span></label>
+    <label class="check"><input type="checkbox" id="s-hotkeys" ${s.hotkeys !== false ? 'checked' : ''} />
+      <span>Genel kısayollar<br><span class="muted small"><b>Ctrl+Shift+Boşluk</b>: hangi programda olursanız olun hızlı gönderim · <b>Ctrl+Shift+PrtSc</b>: ekran görüntüsü al, üzerine çiz, gönder. Uygulama içinde <b>Ctrl+K</b> de hızlı gönderimi açar. Başka bir programın kısayoluyla çakışırsa kapatın.</span></span></label>
     <label class="check"><input type="checkbox" id="s-compress" ${s.compress !== false ? 'checked' : ''} />
       <span>Uygun dosyaları sıkıştırarak gönder<br><span class="muted small">Metin, log, CSV, kaynak kod gibi dosyalar özellikle Wi-Fi'da birkaç kat hızlı gider. Zip, video, fotoğraf gibi zaten sıkıştırılmış dosyalar olduğu gibi gider. Karşı tarafta FastFiles'ın güncel sürümü olmalı.</span></span></label>
     <hr class="sep" />
@@ -905,6 +923,7 @@ function showSettings() {
         closeToTray: m.querySelector('#s-tray').checked,
         compress: m.querySelector('#s-compress').checked,
         shellMenu: m.querySelector('#s-shell').checked,
+        hotkeys: m.querySelector('#s-hotkeys').checked,
         speedLimitMb: Number(m.querySelector('#s-limit').value),
         theme: m.querySelector('.swatch.on')?.dataset.theme || 'mor',
         appearance: m.querySelector('#s-appearance').value,
@@ -1135,7 +1154,7 @@ setInterval(async () => {
   }
 }, 10000);
 $('#btn-settings').onclick = showSettings;
-$('#me').onclick = showSettings;
+// Ada tıklamak durum menüsünü açar (Ayarlar: dişli düğmesi ya da menünün altı).
 $('#btn-downloads').onclick = () => call('open_path', { path: state.settings.downloadDir });
 
 function showWelcome() {
@@ -1165,8 +1184,9 @@ function showWelcome() {
 }
 
 // ───────────────────────────── Mesajlaşma ─────────────────────────────
-// Güvenlik: mesaj metni her zaman `esc()`/textContent ile basılır (HTML yorumlanmaz),
-// bağlantılar tıklanabilir yapılmaz. Arka uç ayrıca görünmez/yön değiştiren karakterleri temizler.
+// Güvenlik: mesaj metni her zaman `esc()`/textContent ile basılır (HTML yorumlanmaz). Bağlantılar
+// yalnızca http(s)/www olarak tanınır ve arka uçtaki `open_url` ile tarayıcıda açılır (bkz.
+// `messageBody`). Arka uç ayrıca görünmez/yön değiştiren karakterleri temizler.
 
 const unreadOf = (fp) => state.chats.get(fp)?.unread || 0;
 const peerByFp = (fp) => state.peers.find((p) => p.fingerprint === fp);
@@ -1207,7 +1227,7 @@ function renderConvs() {
   $('#convs').innerHTML = list.map((c) => {
     const g = c.group;
     const online = !g && !!peerByFp(c.fingerprint);
-    const lastText = c.last ? c.last.text.replace(/\s+/g, ' ') : '';
+    const lastText = c.last ? (c.last.deleted ? '🚫 Bu mesaj silindi' : c.last.text.replace(/\s+/g, ' ')) : '';
     const who = !c.last || c.last.system ? '' : c.last.outgoing ? 'Siz: ' : c.last.senderName ? `${c.last.senderName}: ` : '';
     const last = `${who}${lastText}`;
     const avatar = g
@@ -1234,6 +1254,7 @@ $('#convs').addEventListener('click', (e) => {
 
 async function openChat(fp, name) {
   if (gamesOpen()) closeGames();
+  if (state.openChat !== fp) resetChatExtras();
   closeEmoji();
   closeViewer();
   if (!state.chats.has(fp)) {
@@ -1260,6 +1281,7 @@ async function openChat(fp, name) {
 
 function closeChat() {
   closeViewer();
+  resetChatExtras();
   state.openChat = null;
   $('#chat-view').hidden = true;
   setTab('chats');
@@ -1291,6 +1313,7 @@ const typingText = (key) => {
 function onTyping({ key, fingerprint, name }) {
   state.typing ||= new Map();
   state.typing.set(key, { name, fp: fingerprint, until: Date.now() + 6000 });
+  officeState.mod?.typing(fingerprint);
   renderChatHead();
   renderConvs();
   setTimeout(() => { renderChatHead(); renderConvs(); }, 6100);
@@ -1330,8 +1353,13 @@ function renderChatHeadBase() {
     $('#chat-attach').disabled = !canSend;
     $('#chat-emoji').disabled = !canSend;
     if (!canSend) closeEmoji();
-    ta.placeholder = canSend ? 'Gruba mesaj yazın…' : 'Bu gruba mesaj gönderemezsiniz';
+    ta.placeholder = canSend ? 'Gruba mesaj yazın… (@ ile birinden bahsedin)' : 'Bu gruba mesaj gönderemezsiniz';
     $('#chat-send').disabled = !canSend || !ta.value.trim();
+    $('#chat-nudge').hidden = true;
+    $('#chat-screen').hidden = !canSend;
+    $('#chat-shot').disabled = !canSend;
+    $('#chat-attach').title = 'Dosya gönder (ya da dosyaları sohbete sürükleyin)';
+    if (chatx.edit) ta.disabled = false;
     updateComposerNote();
     return;
   }
@@ -1345,7 +1373,9 @@ function renderChatHeadBase() {
   $('#chat-name').textContent = name;
   const st = $('#chat-status');
   st.className = `chat-status${peer && !blocked ? ' on' : ''}`;
-  st.innerHTML = blocked ? 'Engellendi' : peer ? `<span class="online-dot"></span>Çevrimiçi · ${esc(peer.ip)}` : 'Çevrimdışı';
+  st.innerHTML = blocked ? 'Engellendi' : peer
+    ? `<span class="online-dot st-${esc(peer.status || 'ok')}"></span>${peer.status ? `${statusOf(peer.status).icon} ${esc(statusOf(peer.status).label)}` : 'Çevrimiçi'} · ${esc(peer.ip)}`
+    : 'Çevrimdışı';
   const bb = $('#chat-block');
   bb.innerHTML = ic.ban;
   bb.classList.toggle('on', blocked);
@@ -1353,11 +1383,16 @@ function renderChatHeadBase() {
   const canSend = !!peer && !blocked;
   const ta = $('#composer');
   ta.disabled = !canSend;
-  $('#chat-attach').disabled = !canSend;
+  // Çevrimdışı kişiye de dosya bırakılabilir: çevrimiçi olunca kendiliğinden gider.
+  $('#chat-attach').disabled = blocked;
+  $('#chat-attach').title = peer ? 'Dosya gönder (ya da dosyaları sohbete sürükleyin)' : 'Dosya bırak: kişi çevrimiçi olunca kendiliğinden gönderilir';
   $('#chat-emoji').disabled = !canSend;
   if (!canSend) closeEmoji();
-  ta.placeholder = canSend ? 'Mesaj yazın…' : blocked ? 'Bu cihazı engellediniz' : 'Cihaz çevrimdışı, mesaj gönderilemez';
+  ta.placeholder = canSend ? 'Mesaj yazın…' : blocked ? 'Bu cihazı engellediniz' : 'Çevrimdışı · mesaj gönderilemez, ama dosya bırakabilirsiniz';
   $('#chat-send').disabled = !canSend || !ta.value.trim();
+  $('#chat-nudge').hidden = !canSend;
+  $('#chat-screen').hidden = !canSend;
+  $('#chat-shot').disabled = blocked;
   updateComposerNote();
 }
 
@@ -1823,6 +1858,7 @@ function refreshFileBubbles(tid) {
 
 function renderMessages(forceBottom = false) {
   const box = $('#messages');
+  const hitRe = searchRegex();
   const list = state.history.get(state.openChat) || [];
   const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
   if (!list.length) {
@@ -1862,18 +1898,28 @@ function renderMessages(forceBottom = false) {
       prev = who;
       continue;
     }
-    html += `
-      <div class="msg ${dir}${first ? ' first' : ''}${m.status === 'failed' ? ' failed' : ''}" data-id="${esc(m.id)}">
-        ${sender}
-        <div class="bubble-row"><div class="bubble">${esc(m.text)}</div><button class="copy-btn" data-copy title="Kopyala">${ic.copy}</button></div>
-        <div class="meta">${esc(fmtTime(m.at))}${m.outgoing ? statusMeta(m) : ''}</div>
-      </div>`;
+    html += textMessageHtml(m, dir, first, sender, hitRe);
     prev = who;
   }
   box.innerHTML = html;
+  if (hitRe) {
+    const hits = updateSearchHits();
+    hits.forEach((h, i) => h.classList.toggle('hit-cur', i === chatx.hit));
+    return;
+  }
   if (forceBottom || nearBottom) box.scrollTop = box.scrollHeight;
 }
+$('#messages').addEventListener('keydown', (e) => {
+  const link = e.key === 'Enter' && e.target.closest?.('.msg-link');
+  if (link) call('open_url', { url: link.dataset.url }).catch(() => {});
+});
 $('#messages').addEventListener('click', async (e) => {
+  const link = e.target.closest('.msg-link');
+  if (link) {
+    e.preventDefault();
+    call('open_url', { url: link.dataset.url }).catch(() => {});
+    return;
+  }
   const v = e.target.closest('[data-view]');
   if (v) return openViewer(v.dataset.view);
   const fb = e.target.closest('[data-fact]');
@@ -1917,12 +1963,26 @@ async function sendChat() {
   const ta = $('#composer');
   const text = ta.value.trim();
   const key = state.openChat;
-  if (!text || ta.disabled || !key) return;
+  if (!text || (ta.disabled && !chatx.edit) || !key) return;
   const peer = peerByFp(key);
-  if (!groupOf(key) && !peer) return;
+  if (!groupOf(key) && !peer && !chatx.edit) return;
   try {
-    if (groupOf(key)) await call('group_send', { key, text });
-    else await call('chat_send', { peerId: peer.id, text });
+    if (chatx.edit) {
+      await call('chat_edit', { key, id: chatx.edit.id, text });
+      chatx.edit = null;
+      renderReplyBar();
+      ta.value = '';
+      autoGrow();
+      updateComposerNote();
+      renderChatHead();
+      return;
+    }
+    const replyTo = chatx.reply?.id || null;
+    if (groupOf(key)) await call('group_send', { key, text, replyTo });
+    else await call('chat_send', { peerId: peer.id, text, replyTo });
+    chatx.reply = null;
+    renderReplyBar();
+    $('#mention-pop').hidden = true;
     ta.value = '';
     autoGrow();
     updateComposerNote();
@@ -1960,7 +2020,7 @@ async function sendToChat(paths, target = state.openChat) {
     return;
   }
   const peer = peerByFp(key);
-  if (!peer) return toast('Bu cihaz çevrimdışı, dosya gönderilemez', { type: 'error' });
+  if (!peer) return queueFiles(key, paths);
   sendPaths(peer, paths);
 }
 
@@ -2255,6 +2315,8 @@ function onConversation(summary) {
 function onNotificationClick(target = {}) {
   // Kilitliyken hiçbir ekran açılmaz; kilit açılınca kullanıcı kendisi bakar.
   if (lockVisible()) return;
+  if (target.view === 'phone') return openPhone();
+  if (target.view === 'screen' && target.session) return watchScreen(target.session);
   if (modalKind && modalKind !== 'incoming') closeModal();
   if (target.view === 'games') {
     if (target.id && gameById(target.id)) openRoom(target.id);
@@ -2262,6 +2324,7 @@ function onNotificationClick(target = {}) {
     return;
   }
   if (gamesOpen()) closeGames();
+  if (officeOpen()) closeOffice();
   if (target.view === 'chat' && target.key) {
     openChat(target.key);
   } else if (target.view === 'polls') {
@@ -2291,13 +2354,15 @@ function onChat({ fingerprint: fp, name, unread, incoming, message }) {
   if (!c.last || c.last.id === message.id || message.at >= c.last.at) c.last = message;
   state.chats.set(fp, c);
   const hist = state.history.get(fp);
+  let isNew = true;
   if (hist) {
     const i = hist.findIndex((m) => m.id === message.id);
+    isNew = i < 0;
     if (i >= 0) hist[i] = message; else hist.push(message);
   }
   const viewing = state.openChat === fp && chatOpen();
   if (viewing) {
-    renderMessages(!incoming);
+    renderMessages(!incoming && isNew);
     renderChatHead();
     if (incoming && document.hasFocus()) markRead(fp);
   } else if (incoming) {
@@ -2308,6 +2373,7 @@ function onChat({ fingerprint: fp, name, unread, incoming, message }) {
   }
   renderConvs();
   renderPeers();
+  officeOnChat(fp, incoming, message);
 }
 
 // ───────────────────────────── Güncelleme ─────────────────────────────
@@ -3041,8 +3107,14 @@ function pieceHtml(p) {
 // Notasyonda Türkçe taş harfleri: Ş(ah) V(ezir) K(ale) F(il) A(t).
 const TR_PIECE = { K: 'Ş', Q: 'V', R: 'K', B: 'F', N: 'A' };
 const trSan = (san) => String(san).replace(/[KQRBN]/g, (c) => TR_PIECE[c]);
-const RESULT_REASON = { checkmate: 'şah mat', stalemate: 'pat', repetition: 'üç kez tekrar', fifty: '50 hamle kuralı', material: 'yetersiz malzeme', resign: 'pes etme', agreement: 'anlaşmalı' };
-const GAME_ART = { chess: `<span class="gc-piece">${PIECE_GLYPH.n}︎</span>` };
+const RESULT_REASON = {
+  checkmate: 'şah mat', stalemate: 'pat', repetition: 'üç kez tekrar', fifty: '50 hamle kuralı', material: 'yetersiz malzeme',
+  resign: 'pes etme', agreement: 'anlaşmalı', score: 'en az vuruş', tie: 'eşit vuruş', forfeit: 'diğerleri çekildi',
+};
+const GAME_ART = {
+  chess: `<span class="gc-piece">${PIECE_GLYPH.n}︎</span>`,
+  golf: '<span class="gc-golf"><svg viewBox="0 0 24 24"><path d="M8 20V3l8 3.5L8 10"/><path d="M3 20.5c0-1.4 2.5-2.5 6-2.5s6 1.1 6 2.5"/><circle cx="18.5" cy="18.5" r="2"/></svg></span>',
+};
 
 function gameResultText(g) {
   const r = g.result;
@@ -3073,10 +3145,12 @@ function gameStatusText(g) {
     case 'cancelled': return 'Davet geri çekildi';
     case 'finished': return gameResultText(g);
   }
-  if (g.pending) return 'Hamleniz iletiliyor…';
+  const golf = g.game === 'golf';
+  if (golf && g.info?.quit?.[g.mySeat]) return 'Çekildiniz · izliyorsunuz';
+  if (g.pending) return golf ? 'Vuruşunuz iletiliyor…' : 'Hamleniz iletiliyor…';
   if (g.drawOffer && g.drawOffer !== me) return 'Beraberlik teklif ediyor';
-  if (g.myTurn) return g.info?.check ? 'Sıra sizde · Şah!' : 'Sıra sizde';
-  return `${g.players[g.turn]?.name || 'Rakip'} düşünüyor…`;
+  if (g.myTurn) return golf ? `Sıra sizde · ${(g.info?.hole ?? 0) + 1}. delik` : g.info?.check ? 'Sıra sizde · Şah!' : 'Sıra sizde';
+  return `${g.players[g.turn]?.name || 'Rakip'} ${golf ? 'vuruyor…' : 'düşünüyor…'}`;
 }
 
 function renderGames() {
@@ -3127,6 +3201,7 @@ $('#game-cards').addEventListener('click', (e) => {
 });
 
 function openGames(id) {
+  if (officeOpen()) closeOffice();
   closeEmoji();
   closeViewer();
   $('#games-screen').hidden = false;
@@ -3164,8 +3239,22 @@ $('#room-back').onclick = closeRoom;
 $('#btn-new-game').onclick = () => showGameCreate();
 $('#chat-game').onclick = () => { if (state.openChat) showGameCreate({ fp: state.openChat }); };
 
+/** Arka uç değişen tek odayı gönderir; listeye yerleştirilir. */
+function onGame(view) {
+  const list = state.games.filter((g) => g.id !== view.id);
+  list.push(view);
+  list.sort((a, b) => b.updatedAt - a.updatedAt);
+  onGames(list);
+}
+
+/** Açık odanın ekranda görünen her şeyini belirleyen alanlar; değişmediyse yeniden çizilmez
+ *  (gereksiz çizim, sürüklenen satranç taşını bırakıyor ve nişanı bozuyordu). */
+const roomSig = (g) => (g ? JSON.stringify([g.rev, g.status, g.moves.length, g.pending, g.myTurn, g.turn, g.drawOffer, g.players.length, g.joined.length]) : '');
+
 function onGames(list) {
   const before = new Map(state.games.map((g) => [g.id, g]));
+  const openSig = roomSig(before.get(gameState.open));
+  const hadOpt = gameState.optimistic;
   state.games = list;
   maybeClearOptimistic();
   // Uygulama öndeyken de haber ver (arkadayken Windows bildirimi gelir).
@@ -3192,21 +3281,33 @@ function onGames(list) {
   }
   if (gameState.open && !gameById(gameState.open)) gameState.open = null;
   renderGames();
-  if (gamesOpen()) renderRoom();
+  if (gamesOpen() && (roomSig(gameById(gameState.open)) !== openSig || hadOpt !== gameState.optimistic)) renderRoom();
+  officeGames();
 }
 
 // ── Oda ──
 
 function renderRoom() {
   const g = gameById(gameState.open);
+  const isGolf = g?.game === 'golf';
   $('#games-screen').classList.toggle('room-open', !!g);
+  // Golf sahası geniş: açıkken oyun listesi gizlenir (geri düğmesi listeye döner).
+  $('#games-screen').classList.toggle('wide-room', isGolf);
   $('#game-lobby').hidden = !!g;
   $('#game-room').hidden = !g;
   if (!g) return;
+  $('#chess-col').hidden = isGolf;
+  $('#golf-col').hidden = !isGolf;
+  $('#moves-head').textContent = isGolf ? 'Skor tablosu' : 'Hamleler';
+  renderRoomPanel(g);
+  if (isGolf) {
+    renderGolf(g);
+    renderScores(g);
+    return;
+  }
   cancelDrag();
   if (!g.myTurn) { gameState.selected = null; closePromo(); }
   renderBoard(g);
-  renderRoomPanel(g);
   renderMoves(g);
 }
 
@@ -3365,9 +3466,16 @@ function renderRoomPanel(g) {
   const oppName = opp?.name || 'Rakip';
   const oppOnline = !!opp && !!peerByFp(opp.fingerprint);
   const seatName = (gameDef(g.game)?.seats?.[g.mySeat] || '').toLocaleLowerCase('tr-TR');
+  const isGolf = g.game === 'golf';
+  const many = g.players.length > 2;
   $('#room-name').textContent = `${g.title} · ${vsName(g)}`;
-  $('#room-sub').textContent = seatName ? `Siz ${seatName} taşlarla oynuyorsunuz` : '';
-  $('#room-chat').hidden = !opp;
+  if (isGolf && g.info?.holes) {
+    const h = g.info.holes[g.info.hole];
+    $('#room-sub').textContent = `${g.info.hole + 1}/${g.info.holes.length}. delik · ${h.name} · Par ${h.par}`;
+  } else {
+    $('#room-sub').textContent = seatName ? `Siz ${seatName} taşlarla oynuyorsunuz` : '';
+  }
+  $('#room-chat').hidden = !opp || many;
   let status = '';
   let tone = '';
   let actions = '';
@@ -3375,22 +3483,37 @@ function renderRoomPanel(g) {
     case 'invited':
       if (g.isHost) {
         // Oyunları bilmeyen eski sürüm daveti alamaz; otomatik güncelleme gelince ulaşır.
-        const oppVer = opp && peerByFp(opp.fingerprint)?.version;
+        const waiting = g.players.filter((p) => !g.joined.includes(p.fingerprint));
+        const first = waiting[0] || opp;
+        const firstOnline = !!first && !!peerByFp(first.fingerprint);
+        const oppVer = first && peerByFp(first.fingerprint)?.version;
         const oldVer = oppVer && state.device?.version && versionLess(oppVer, state.device.version);
-        status = `<b>${esc(oppName)}</b> davetinize henüz yanıt vermedi.`
-          + (!oppOnline ? '<div class="small muted">Şu an çevrimdışı; FastFiles açılınca davet ulaşır.</div>'
+        status = `<b>${esc(waiting.map((p) => p.name).join(', ') || oppName)}</b> davetinize henüz yanıt vermedi.`
+          + (many && g.joined.length > 1 ? `<div class="small">Kabul eden: ${esc(g.players.filter((p) => g.joined.includes(p.fingerprint) && p.fingerprint !== me).map((p) => p.name).join(', '))}</div>` : '')
+          + (!firstOnline ? '<div class="small muted">Çevrimdışı olan, FastFiles açılınca daveti alır.</div>'
             : oldVer ? `<div class="small muted">FastFiles sürümü eski (v${esc(oppVer)}); güncellenince davet ulaşır.</div>` : '');
         actions = roomBtn('cancel', 'Daveti geri çek', 'ghost');
       } else if (g.joined.includes(me) || g.pending) {
-        status = 'Daveti kabul ettiniz. Oda kuruluyor…';
+        status = many ? 'Daveti kabul ettiniz. Herkes katılınca oyun başlar.' : 'Daveti kabul ettiniz. Oda kuruluyor…';
       } else {
         tone = 'invite';
         status = `<b>${esc(g.hostName)}</b> sizi <b>${esc(g.title)}</b> oynamaya davet ediyor.`
-          + (seatName ? `<div class="small">Siz <b>${esc(seatName)}</b> taşlarla oynayacaksınız.</div>` : '');
+          + (seatName ? `<div class="small">Siz <b>${esc(seatName)}</b> taşlarla oynayacaksınız.</div>` : '')
+          + (many ? `<div class="small">Oyuncular: ${esc(g.players.map((p) => (p.fingerprint === me ? 'siz' : p.name)).join(', '))}</div>` : '');
         actions = roomBtn('join', 'Kabul et') + roomBtn('decline', 'Reddet', 'ghost');
       }
       break;
     case 'active': {
+      if (isGolf) {
+        const cur = g.players[g.turn];
+        const curOnline = !!cur && (cur.fingerprint === me || !!peerByFp(cur.fingerprint));
+        if (g.info?.quit?.[g.mySeat]) status = 'Oyundan çekildiniz; oyunu izliyorsunuz.';
+        else if (g.pending) status = 'Vuruşunuz iletiliyor…';
+        else if (g.myTurn) { status = '<b>Sıra sizde.</b> Topu geriye doğru çekip bırakın.'; tone = 'turn'; }
+        else if (cur) status = curOnline ? `<b>${esc(cur.name)}</b> vuruyor…` : `<b>${esc(cur.name)}</b> çevrimdışı; döndüğünde oyun sürer.`;
+        if (!g.info?.quit?.[g.mySeat]) actions = roomBtn('resign', 'Oyundan çekil', 'ghost danger-text', g.pending);
+        break;
+      }
       const offered = g.drawOffer && g.drawOffer !== me && !g.pending;
       if (g.pending) status = oppOnline ? 'Hamleniz iletiliyor…' : `<b>${esc(oppName)}</b> çevrimdışı; hamleniz o dönünce iletilecek.`;
       else if (g.myTurn) { status = g.info?.check ? '<b>Şah!</b> Sıra sizde.' : '<b>Sıra sizde.</b> Bir taşa tıklayın ya da sürükleyin.'; tone = g.info?.check ? 'danger' : 'turn'; }
@@ -3439,13 +3562,358 @@ function renderMoves(g) {
   el.scrollTop = el.scrollHeight;
 }
 
+// ── Mini golf ──
+// Fizik arka uçtadır (games/golf.rs): arayüz yalnızca sahayı çizer, nişanı alır ve arka ucun
+// verdiği top yolunu (`lastShot.path`, ~40 nokta/sn) canlandırır. Saha 800×500 birimdir.
+
+const golfCanvas = $('#golf-canvas');
+const golfView = { room: null, shots: -1, anim: null, aim: null, raf: 0, flashTimer: 0 };
+const GOLF_PULL = 220;           // bu kadar geri çekince %100 güç (saha birimi)
+const GOLF_POINT_MS = 25;        // yol noktaları arası süre (1/40 sn)
+const golfColor = (fp) => `hsl(${hue(fp)} 78% 52%)`;
+const shotCount = (g) => g.moves.filter((m) => m[0] === 'a').length;
+
+function renderGolf(g) {
+  if (!g.info?.holes) return;
+  const n = shotCount(g);
+  if (golfView.room !== g.id) {
+    // Odaya yeni girildi: eski vuruş canlandırılmaz.
+    Object.assign(golfView, { room: g.id, shots: n, anim: null, aim: null });
+    $('#golf-flash').hidden = true;
+  } else if (n > golfView.shots) {
+    golfView.shots = n;
+    const s = g.info.lastShot;
+    if (s?.path?.length > 1) golfView.anim = { shot: s, start: performance.now() };
+  }
+  if (!g.myTurn) golfView.aim = null;
+  renderGolfHud(g);
+  golfLoop();
+}
+
+function renderGolfHud(g) {
+  const info = g.info;
+  const h = info.holes[info.hole];
+  const chips = g.players.map((p, seat) => {
+    const b = info.balls[seat];
+    const quit = info.quit[seat];
+    const cur = g.status === 'active' && g.turn === seat;
+    const state = quit ? 'çekildi' : b.done ? `⛳ ${b.strokes}` : b.strokes ? `${b.strokes} vuruş` : 'başlamadı';
+    return `<span class="gh-chip${cur ? ' cur' : ''}${quit ? ' quit' : ''}" title="${esc(p.name)}">
+      <i style="background:${golfColor(p.fingerprint)}"></i>${esc(p.fingerprint === myFp() ? 'Siz' : p.name)}<small>${esc(state)}</small></span>`;
+  }).join('');
+  $('#golf-hud').innerHTML = `<div class="gh-hole"><b>${info.hole + 1}. delik</b> · ${esc(h.name)} · Par ${h.par}</div><div class="gh-chips">${chips}</div>`;
+  let hint = '';
+  if (g.status === 'finished') hint = gameResultText(g);
+  else if (g.status !== 'active') hint = 'Herkes katılınca oyun başlar.';
+  else if (g.myTurn) hint = 'Topu tutup geriye doğru çekin ve bırakın: ne kadar çekerseniz o kadar sert vurur. (Esc: vazgeç)';
+  else if (g.pending) hint = 'Vuruşunuz iletiliyor…';
+  else hint = `${g.players[g.turn]?.name || ''} vuruyor…`;
+  $('#golf-hint').textContent = hint;
+}
+
+function golfLoop() {
+  if (!golfView.raf) golfView.raf = requestAnimationFrame(golfTick);
+}
+function golfTick(now) {
+  golfView.raf = 0;
+  if (drawGolf(now)) golfView.raf = requestAnimationFrame(golfTick);
+}
+new ResizeObserver(() => golfLoop()).observe(golfCanvas);
+
+/** Yol üzerinde t (0–1) anındaki nokta. */
+function pointAlong(path, t) {
+  const f = t * (path.length - 1);
+  const i = Math.min(path.length - 2, Math.floor(f));
+  const k = f - i;
+  return [path[i][0] + (path[i + 1][0] - path[i][0]) * k, path[i][1] + (path[i + 1][1] - path[i][1]) * k];
+}
+
+/** Bir kare çizer; canlandırma ya da nişan sürüyorsa `true` döner. */
+function drawGolf(now) {
+  const g = gameById(gameState.open);
+  if (!g || g.game !== 'golf' || !gamesOpen() || !g.info?.holes) return false;
+  const info = g.info;
+  const r = golfCanvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(r.width * dpr));
+  const h = Math.max(1, Math.round(r.height * dpr));
+  if (golfCanvas.width !== w || golfCanvas.height !== h) { golfCanvas.width = w; golfCanvas.height = h; }
+  const ctx = golfCanvas.getContext('2d');
+  const k = w / info.width;
+  ctx.setTransform(k, 0, 0, k, 0, 0);
+  ctx.clearRect(0, 0, info.width, info.height);
+
+  let holeIdx = info.hole;
+  let animPos = null;
+  let animating = false;
+  const a = golfView.anim;
+  if (a) {
+    const dur = Math.max(250, (a.shot.path.length - 1) * GOLF_POINT_MS);
+    const t = Math.min(1, (now - a.start) / dur);
+    holeIdx = a.shot.hole;
+    animPos = pointAlong(a.shot.path, t);
+    animating = t < 1;
+    if (!animating) {
+      golfView.anim = null;
+      golfFlash(a.shot);
+      holeIdx = info.hole;
+      animPos = null;
+    }
+  }
+  drawCourse(ctx, info.holes[holeIdx], info);
+  const sameHole = holeIdx === info.hole;
+  const order = g.players.map((p, seat) => seat).sort((x, y) => (x === g.turn) - (y === g.turn));
+  let waiting = 0;
+  for (const seat of order) {
+    const p = g.players[seat];
+    const b = info.balls[seat];
+    if (info.quit[seat]) continue;
+    let pos = null;
+    if (animPos && a.shot.seat === seat) pos = animPos;
+    else if (sameHole && !b.done) pos = [b.x, b.y];
+    // Henüz vurmamış ve sırası gelmemiş toplar başlangıcın yanında sıraya dizilir (üst üste binmesin).
+    if (pos && !b.strokes && seat !== g.turn && !(animPos && a.shot.seat === seat)) {
+      pos = [pos[0] - 24 - 16 * (waiting % 3), pos[1] + 18 * (Math.floor(waiting / 3) - 0.5)];
+      waiting++;
+    }
+    if (pos) drawBall(ctx, pos, info.ballR, golfColor(p.fingerprint), !animating && g.status === 'active' && seat === g.turn, now);
+  }
+  const aiming = !!golfView.aim && !animating && g.myTurn;
+  if (aiming) drawAim(ctx, info);
+  // Yalnızca canlandırma ve nişan sürerken çizmeye devam edilir (boştayken işlemci harcanmaz).
+  return animating || aiming;
+}
+
+function drawCourse(ctx, hole, info) {
+  const poly = (pts) => {
+    ctx.beginPath();
+    pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    ctx.closePath();
+  };
+  // Duvarlar: sınırın dışına taşan kalın çizgi; çim üstüne dökülünce iç yarısı örtülür.
+  ctx.lineJoin = 'round';
+  poly(hole.bounds);
+  ctx.strokeStyle = '#6b4329';
+  ctx.lineWidth = 18;
+  ctx.stroke();
+  ctx.strokeStyle = '#8a5a39';
+  ctx.lineWidth = 12;
+  ctx.stroke();
+  ctx.save();
+  poly(hole.bounds);
+  ctx.fillStyle = '#3f9d4f';
+  ctx.fill();
+  ctx.clip();
+  ctx.fillStyle = 'rgba(255, 255, 255, .055)';
+  for (let x = 0; x < info.width; x += 70) ctx.fillRect(x, 0, 35, info.height);
+  for (const [x, y, w, h] of hole.sand) {
+    ctx.fillStyle = '#e6d39b';
+    ctx.beginPath(); ctx.roundRect(x, y, w, h, 14); ctx.fill();
+    ctx.fillStyle = 'rgba(150, 120, 60, .35)';
+    for (let i = 0; i < (w * h) / 220; i++) {
+      const px = x + 6 + ((i * 37) % (w - 12));
+      const py = y + 6 + ((i * 53) % (h - 12));
+      ctx.fillRect(px, py, 2, 2);
+    }
+  }
+  for (const [x, y, w, h] of hole.water) {
+    ctx.fillStyle = '#3b8fd9';
+    ctx.beginPath(); ctx.roundRect(x, y, w, h, 16); ctx.fill();
+    ctx.strokeStyle = 'rgba(255, 255, 255, .35)';
+    ctx.lineWidth = 2;
+    for (let yy = y + 18; yy < y + h - 8; yy += 22) {
+      ctx.beginPath();
+      for (let xx = x + 10; xx < x + w - 10; xx += 4) ctx.lineTo(xx, yy + Math.sin(xx / 9) * 3);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+  for (const b of hole.blocks) {
+    poly(b);
+    ctx.fillStyle = '#8a5a39';
+    ctx.fill();
+    ctx.strokeStyle = '#6b4329';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+  for (const [x, y, r] of hole.posts) {
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = '#9aa3ad'; ctx.fill();
+    ctx.lineWidth = 3; ctx.strokeStyle = '#6e7781'; ctx.stroke();
+    ctx.beginPath(); ctx.arc(x - r * 0.3, y - r * 0.3, r * 0.35, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255, 255, 255, .35)'; ctx.fill();
+  }
+  // Başlangıç minderi
+  const [tx, ty] = hole.tee;
+  ctx.fillStyle = 'rgba(255, 255, 255, .28)';
+  ctx.beginPath(); ctx.roundRect(tx - 16, ty - 16, 32, 32, 6); ctx.fill();
+  // Delik ve bayrak
+  const [cx, cy] = hole.cup;
+  ctx.beginPath(); ctx.arc(cx, cy, info.cupR, 0, Math.PI * 2);
+  ctx.fillStyle = '#16231a'; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(255, 255, 255, .5)'; ctx.stroke();
+  ctx.strokeStyle = '#f2f2f2'; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.moveTo(cx + 1, cy); ctx.lineTo(cx + 1, cy - 46); ctx.stroke();
+  ctx.fillStyle = '#e5484d';
+  ctx.beginPath(); ctx.moveTo(cx + 2, cy - 46); ctx.lineTo(cx + 26, cy - 38); ctx.lineTo(cx + 2, cy - 30); ctx.closePath(); ctx.fill();
+}
+
+function drawBall(ctx, [x, y], r, color, active, now) {
+  if (active) {
+    // Sırası gelen top: sabit çift halka (yanıp sönme sürekli çizim gerektirirdi).
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = 0.6;
+    ctx.beginPath(); ctx.arc(x, y, r + 6, 0, Math.PI * 2); ctx.stroke();
+    ctx.globalAlpha = 0.25;
+    ctx.beginPath(); ctx.arc(x, y, r + 11, 0, Math.PI * 2); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  ctx.beginPath(); ctx.ellipse(x + 2, y + 3, r, r * 0.8, 0, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(0, 0, 0, .25)'; ctx.fill();
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fillStyle = '#fff'; ctx.fill();
+  ctx.lineWidth = 3; ctx.strokeStyle = color; ctx.stroke();
+}
+
+function drawAim(ctx, info) {
+  const { ball: [bx, by], cur: [px, py] } = golfView.aim;
+  const { angle, power } = aimShot();
+  // Lastik: toptan imlece
+  ctx.setLineDash([4, 5]);
+  ctx.strokeStyle = 'rgba(255, 255, 255, .6)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(px, py); ctx.stroke();
+  ctx.setLineDash([]);
+  if (power < 0.04) return;
+  // Gidiş yönü ve güç
+  const len = 40 + power * 240;
+  const [dx, dy] = [Math.cos(angle), Math.sin(angle)];
+  const color = `hsl(${120 - 120 * power} 85% 50%)`;
+  ctx.strokeStyle = color; ctx.lineWidth = 4; ctx.lineCap = 'round';
+  ctx.setLineDash([2, 10]);
+  ctx.beginPath(); ctx.moveTo(bx + dx * (info.ballR + 6), by + dy * (info.ballR + 6)); ctx.lineTo(bx + dx * len, by + dy * len); ctx.stroke();
+  ctx.setLineDash([]);
+  const [ex, ey] = [bx + dx * len, by + dy * len];
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(ex + dx * 10, ey + dy * 10);
+  ctx.lineTo(ex - dy * 7, ey + dx * 7);
+  ctx.lineTo(ex + dy * 7, ey - dx * 7);
+  ctx.closePath(); ctx.fill();
+  ctx.font = 'bold 16px "Segoe UI", sans-serif';
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = 'rgba(0, 0, 0, .55)'; ctx.lineWidth = 3;
+  const label = `%${Math.max(1, Math.round(power * 100))}`;
+  ctx.strokeText(label, bx + 14, by - 14);
+  ctx.fillText(label, bx + 14, by - 14);
+}
+
+/** Geri çekme vektöründen vuruş: yön imlecin tersine, güç çekme uzunluğuyla. */
+function aimShot() {
+  const { ball: [bx, by], cur: [px, py] } = golfView.aim;
+  const [dx, dy] = [bx - px, by - py];
+  return { angle: Math.atan2(dy, dx), power: Math.min(1, Math.hypot(dx, dy) / GOLF_PULL) };
+}
+
+function golfPoint(e) {
+  const g = gameById(gameState.open);
+  const r = golfCanvas.getBoundingClientRect();
+  const k = (g?.info?.width || 800) / r.width;
+  return [(e.clientX - r.left) * k, (e.clientY - r.top) * k];
+}
+
+golfCanvas.addEventListener('pointerdown', (e) => {
+  const g = gameById(gameState.open);
+  if (e.button !== 0 || !g || g.game !== 'golf' || !g.myTurn || golfView.anim) return;
+  const b = g.info.balls[g.mySeat];
+  golfView.aim = { ball: [b.x, b.y], cur: golfPoint(e), pointerId: e.pointerId };
+  golfCanvas.setPointerCapture(e.pointerId);
+  e.preventDefault();
+  golfLoop();
+});
+golfCanvas.addEventListener('pointermove', (e) => {
+  if (!golfView.aim) return;
+  golfView.aim.cur = golfPoint(e);
+  golfLoop();
+});
+golfCanvas.addEventListener('pointerup', async (e) => {
+  const aim = golfView.aim;
+  const g = gameById(gameState.open);
+  if (!aim) return;
+  aim.cur = golfPoint(e);
+  const { angle, power } = aimShot();
+  golfView.aim = null;
+  golfLoop();
+  if (!g?.myTurn || power < 0.04) return;
+  const deg10 = ((Math.round((angle * 180 / Math.PI) * 10) % 3600) + 3600) % 3600;
+  const mv = `a${deg10}p${Math.max(1, Math.min(100, Math.round(power * 100)))}`;
+  await call('game_act', { id: g.id, action: { kind: 'move', mv } }).catch(() => {});
+});
+golfCanvas.addEventListener('pointercancel', () => { golfView.aim = null; golfLoop(); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && golfView.aim) { golfView.aim = null; golfLoop(); e.stopImmediatePropagation(); }
+}, true);
+
+function golfFlash(shot) {
+  const g = gameById(gameState.open);
+  const who = g?.players[shot.seat];
+  const name = who?.fingerprint === myFp() ? 'Siz' : who?.name || '';
+  const text = shot.result === 'in' ? (shot.strokes === 1 ? `${name}: tek vuruşta delik! 🎉` : `${name}: delikte! ⛳ (${shot.strokes} vuruş)`)
+    : shot.result === 'water' ? `${name}: suya düştü! +1 ceza`
+    : shot.result === 'max' ? `${name}: vuruş hakkı doldu`
+    : '';
+  const el = $('#golf-flash');
+  if (!text) return;
+  el.textContent = text;
+  el.className = `golf-flash ${shot.result}`;
+  el.hidden = false;
+  clearTimeout(golfView.flashTimer);
+  golfView.flashTimer = setTimeout(() => { el.hidden = true; }, 1800);
+}
+
+function renderScores(g) {
+  const info = g.info;
+  if (!info?.holes) return;
+  const live = g.status === 'active';
+  const parAt = (n) => info.holes.slice(0, n).reduce((s, h) => s + h.par, 0);
+  const head = `<tr><th></th>${info.holes.map((h, i) => `<th class="${live && i === info.hole ? 'cur' : ''}" title="${esc(h.name)}">${i + 1}</th>`).join('')}<th>Top.</th></tr>`;
+  const par = `<tr class="par"><td>Par</td>${info.holes.map((h) => `<td>${h.par}</td>`).join('')}<td>${parAt(info.holes.length)}</td></tr>`;
+  const winner = g.result?.winner;
+  const rows = g.players.map((p, seat) => {
+    const done = info.scores[seat] || [];
+    const cells = info.holes.map((h, i) => {
+      if (i < done.length) {
+        const s = done[i];
+        if (s == null) return '<td class="q">—</td>';
+        return `<td class="${s < h.par ? 'under' : s > h.par ? 'over' : ''}">${s}</td>`;
+      }
+      if (live && i === info.hole && !info.quit[seat]) {
+        const b = info.balls[seat];
+        return `<td class="now">${b.strokes || ''}${b.done ? '' : b.strokes ? '…' : ''}</td>`;
+      }
+      return '<td></td>';
+    }).join('');
+    const diff = info.totals[seat] - parAt(done.length);
+    const rel = done.length ? (diff === 0 ? 'E' : diff > 0 ? `+${diff}` : String(diff)) : '';
+    return `<tr class="${p.fingerprint === winner ? 'win' : ''}${info.quit[seat] ? ' quit' : ''}">
+      <td class="who"><i style="background:${golfColor(p.fingerprint)}"></i>${esc(p.fingerprint === myFp() ? 'Siz' : p.name)}</td>
+      ${cells}<td class="tot">${info.totals[seat]}<small>${rel}</small></td></tr>`;
+  }).join('');
+  $('#moves').innerHTML = `<table class="golf-scores">${head}${par}${rows}</table>
+    <div class="golf-legend">Her delikte en fazla ${info.maxStrokes} vuruş. Suya düşen top +1 ceza ile geri gelir.</div>`;
+}
+
 $('#room-actions').addEventListener('click', async (e) => {
   const b = e.target.closest('[data-room-act]');
   const g = gameById(gameState.open);
   if (!b || !g) return;
   const act = b.dataset.roomAct;
   if (act === 'rematch') return rematch(g);
-  if (act === 'resign' && !(await confirmDialog('Pes etmek istiyor musunuz?', `Oyunu ${vsName(g)} kazanmış sayılır.`, 'Pes et', true))) return;
+  if (act === 'resign') {
+    const ok = g.game === 'golf'
+      ? await confirmDialog('Oyundan çekilmek istiyor musunuz?', 'Diğer oyuncular oyuna devam eder; tek kişi kalırsa o kazanır.', 'Çekil', true)
+      : await confirmDialog('Pes etmek istiyor musunuz?', `Oyunu ${vsName(g)} kazanmış sayılır.`, 'Pes et', true);
+    if (!ok) return;
+  }
   b.disabled = true;
   const kind = act === 'cancel' ? 'decline' : act;
   await call('game_act', { id: g.id, action: { kind } }).catch(() => {});
@@ -3471,7 +3939,8 @@ $('#room-chat').onclick = () => {
 $('#room-remove').onclick = async () => {
   const g = gameById(gameState.open);
   if (!g) return;
-  const text = g.status === 'active' ? 'Oyun sürüyor; kaldırırsanız pes etmiş sayılırsınız.'
+  const text = g.status === 'active' && g.game === 'golf' ? 'Oyun sürüyor; kaldırırsanız oyundan çekilmiş sayılırsınız.'
+    : g.status === 'active' ? 'Oyun sürüyor; kaldırırsanız pes etmiş sayılırsınız.'
     : g.status === 'invited' ? (g.isHost ? 'Davet geri çekilir.' : 'Davet reddedilir.')
     : 'Yalnızca sizin listenizden kaldırılır.';
   if (!(await confirmDialog('Oyun listeden kaldırılsın mı?', text, 'Kaldır', true))) return;
@@ -3691,17 +4160,1188 @@ function showGameCreate({ game, fp } = {}) {
   render();
 }
 
+// ───────────────────────────── Durum ─────────────────────────────
+// Müsait / Toplantıda / Odakta / Dışarıda. Elle seçilir; "Müsait"teyken 10 dakika işlem
+// yapılmazsa arka uç kendiliğinden "Dışarıda" yapar. "Odakta" iken bildirimler susar.
+
+const STATUS = {
+  '': { label: 'Müsait', icon: '🟢', help: 'Herkes ulaşabilir' },
+  busy: { label: 'Toplantıda', icon: '📅', help: 'Toplantıdayım, geç dönebilirim' },
+  focus: { label: 'Odakta', icon: '🎧', help: 'Bildirimler susar (adınız geçince gelir)' },
+  away: { label: 'Dışarıda', icon: '☕', help: 'Bilgisayar başında değilim' },
+};
+const statusOf = (s) => STATUS[s] || STATUS[''];
+const myStatus = () => state.myStatus ?? state.device?.status ?? '';
+
+function renderMyStatus() {
+  const s = myStatus();
+  $('#me').dataset.status = s;
+  const el = $('#me-status');
+  el.textContent = s ? `${statusOf(s).icon} ${statusOf(s).label}` : '';
+  el.hidden = !s;
+  el.title = s === 'away' && !state.settings?.status ? '10 dakikadır işlem yapılmadı' : '';
+}
+
+function statusChip(s) {
+  return s ? `<span class="st-chip st-${esc(s)}">${statusOf(s).icon} ${esc(statusOf(s).label)}</span>` : '';
+}
+
+function closeStatusMenu() {
+  document.getElementById('status-menu')?.remove();
+  document.removeEventListener('mousedown', statusMenuOutside, true);
+}
+function statusMenuOutside(e) {
+  if (!e.target.closest('#status-menu') && !e.target.closest('#me')) closeStatusMenu();
+}
+function showStatusMenu() {
+  closeStatusMenu();
+  const cur = state.settings?.status || '';
+  const pop = document.createElement('div');
+  pop.className = 'status-menu';
+  pop.id = 'status-menu';
+  pop.innerHTML = `<div class="sm-head">Durumunuz</div>${Object.entries(STATUS).map(([k, v]) => `
+    <button data-status="${k}" class="${cur === k ? 'on' : ''}"><span class="sm-ic">${v.icon}</span>
+      <span class="sm-txt"><b>${esc(v.label)}</b><small>${esc(v.help)}</small></span></button>`).join('')}
+    <div class="sm-sep"></div>
+    <button data-settings><span class="sm-ic">⚙️</span><span class="sm-txt"><b>Ayarlar</b></span></button>`;
+  document.body.appendChild(pop);
+  pop.querySelector('[data-settings]').onclick = () => { closeStatusMenu(); showSettings(); };
+  const r = $('#me').getBoundingClientRect();
+  pop.style.left = `${Math.max(8, Math.min(window.innerWidth - 270, r.left))}px`;
+  pop.style.top = `${r.bottom + 6}px`;
+  pop.addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-status]');
+    if (!b) return;
+    closeStatusMenu();
+    try {
+      state.settings = await call('set_status', { status: b.dataset.status });
+      state.myStatus = b.dataset.status;
+      renderMyStatus();
+      officeSyncPeople();
+      toast(`Durumunuz: ${statusOf(b.dataset.status).icon} ${statusOf(b.dataset.status).label}`, { type: 'success', timeout: 2500 });
+    } catch { /* toast gösterildi */ }
+  });
+  setTimeout(() => document.addEventListener('mousedown', statusMenuOutside, true), 0);
+}
+$('#me').addEventListener('click', () => (document.getElementById('status-menu') ? closeStatusMenu() : showStatusMenu()));
+$('#me').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); showStatusMenu(); }
+});
+
+// ───────────────────────────── Sohbet: tepki, yanıt, düzenleme, arama, @bahsetme ─────────────────────────────
+
+const REACTIONS = ['👍', '❤️', '😂', '😮', '😢', '🙏', '🎉', '🔥'];
+const chatx = { reply: null, edit: null, search: '', hit: -1, mention: null };
+const reEsc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+ic.reply = '<svg viewBox="0 0 24 24"><path d="M10 8 5 12l5 4M5 12h9a5 5 0 0 1 5 5v1"/></svg>';
+ic.edit = '<svg viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="m13.5 6.5 4 4"/></svg>';
+ic.smile = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8.5 14.5s1.3 2 3.5 2 3.5-2 3.5-2M9 9.5h.01M15 9.5h.01"/></svg>';
+
+function resetChatExtras() {
+  chatx.reply = null;
+  chatx.edit = null;
+  chatx.search = '';
+  chatx.hit = -1;
+  $('#chat-searchbar').hidden = true;
+  $('#chat-search-input').value = '';
+  $('#mention-pop').hidden = true;
+  renderReplyBar();
+}
+
+function searchRegex() {
+  return chatx.search ? new RegExp(reEsc(chatx.search), 'giu') : null;
+}
+
+// Sohbetteki bağlantılar: yalnızca http(s):// ve www. ile başlayanlar. Bağlantının görünen metni
+// adresin kendisidir (başka bir yazının arkasına gizlenemez); tıklanınca arka uç adresi yeniden
+// denetleyip varsayılan tarayıcıda açar. Sondaki noktalama bağlantıya dahil edilmez.
+const LINK_RE = /\b(?:https?:\/\/|www\.)[^\s<>"'`]+/giu;
+function trimLink(url) {
+  let u = url.replace(/[.,;:!?…'"]+$/u, '');
+  // "(bkz. https://a.com/x)" gibi: eşi olmayan kapanış parantezi bağlantıya ait değildir.
+  for (const [o, c] of [['(', ')'], ['[', ']'], ['{', '}']]) {
+    while (u.endsWith(c) && u.split(c).length > u.split(o).length) u = u.slice(0, -1);
+  }
+  return u;
+}
+
+/** Mesaj metni: bağlantılar tıklanabilir, grupta @ad vurgulanır, aramada eşleşmeler işaretlenir. */
+function messageBody(text, key, hitRe) {
+  let out = '';
+  let last = 0;
+  for (const mm of text.matchAll(LINK_RE)) {
+    const url = trimLink(mm[0]);
+    if (!url.includes('.')) continue;
+    out += messageSpan(text.slice(last, mm.index), key, hitRe);
+    out += `<a class="msg-link" data-url="${esc(url)}" title="${esc(url)}" tabindex="0">${messageSpan(url, null, hitRe)}</a>`;
+    last = mm.index + url.length;
+  }
+  return out + messageSpan(text.slice(last), key, hitRe);
+}
+
+function messageSpan(text, key, hitRe) {
+  if (!text) return '';
+  if (hitRe) {
+    let out = '';
+    let last = 0;
+    for (const mm of text.matchAll(hitRe)) {
+      out += `${esc(text.slice(last, mm.index))}<mark>${esc(mm[0])}</mark>`;
+      last = mm.index + mm[0].length;
+    }
+    return out + esc(text.slice(last));
+  }
+  const g = groupOf(key);
+  if (!g || !text.includes('@')) return esc(text);
+  const names = [...new Set([...g.members.map((x) => x.name), 'herkes'])].filter(Boolean).sort((a, b) => b.length - a.length);
+  const re = new RegExp(`@(${names.map(reEsc).join('|')})(?![\\p{L}\\p{N}])`, 'giu');
+  let out = '';
+  let last = 0;
+  for (const mm of text.matchAll(re)) {
+    out += `${esc(text.slice(last, mm.index))}<span class="mention">${esc(mm[0])}</span>`;
+    last = mm.index + mm[0].length;
+  }
+  return out + esc(text.slice(last));
+}
+
+function reactionsHtml(m) {
+  if (!m.reactions?.length) return '';
+  const me = myFp();
+  const by = new Map();
+  for (const r of m.reactions) by.set(r.emoji, [...(by.get(r.emoji) || []), r.fp]);
+  return `<div class="reactions">${[...by].map(([emo, fps]) => `<button class="react-pill${fps.includes(me) ? ' mine' : ''}" data-react="${esc(emo)}"
+    title="${esc(fps.map((f) => (f === me ? 'Siz' : officeName(f))).join(', '))}">${esc(emo)}<span>${fps.length}</span></button>`).join('')}</div>`;
+}
+
+function msgTools(m) {
+  const own = m.outgoing;
+  return `<div class="msg-tools">
+    <button data-mt="react" title="Tepki ver">${ic.smile}</button>
+    <button data-mt="reply" title="Yanıtla">${ic.reply}</button>
+    ${own ? `<button data-mt="edit" title="Düzenle">${ic.edit}</button><button data-mt="delete" title="Herkesten sil">${ic.trash}</button>` : ''}
+    <button data-copy title="Kopyala">${ic.copy}</button>
+  </div>`;
+}
+
+function textMessageHtml(m, dir, first, sender, hitRe) {
+  const id = esc(m.id);
+  if (m.deleted) {
+    return `<div class="msg ${dir}${first ? ' first' : ''} deleted" data-id="${id}">${sender}
+      <div class="bubble-row"><div class="bubble"><i class="deleted-text">🚫 Bu mesaj silindi</i></div></div>
+      <div class="meta">${esc(fmtTime(m.at))}</div></div>`;
+  }
+  const quote = m.reply
+    ? `<div class="quote" data-jump="${esc(m.reply.id)}"><b>${esc(m.reply.name || '')}</b><span>${esc(m.reply.text || '…')}</span></div>`
+    : '';
+  const hit = hitRe && new RegExp(hitRe.source, 'iu').test(m.text);
+  return `
+    <div class="msg ${dir}${first ? ' first' : ''}${m.status === 'failed' ? ' failed' : ''}${m.mention ? ' mentioned' : ''}${hit ? ' hit' : ''}" data-id="${id}">
+      ${sender}
+      <div class="bubble-row"><div class="bubble">${quote}${messageBody(m.text, state.openChat, hit ? hitRe : null)}</div>${msgTools(m)}</div>
+      ${reactionsHtml(m)}
+      <div class="meta">${m.edited ? '<span class="edited">düzenlendi</span> · ' : ''}${esc(fmtTime(m.at))}${m.outgoing ? statusMeta(m) : ''}</div>
+    </div>`;
+}
+
+const msgById = (id) => (state.history.get(state.openChat) || []).find((x) => x.id === id);
+
+function closeReactPicker() {
+  document.getElementById('react-pop')?.remove();
+  document.removeEventListener('mousedown', reactOutside, true);
+}
+function reactOutside(e) {
+  if (!e.target.closest('#react-pop')) closeReactPicker();
+}
+function showReactPicker(anchor, id) {
+  closeReactPicker();
+  const mine = msgById(id)?.reactions?.find((r) => r.fp === myFp())?.emoji;
+  const pop = document.createElement('div');
+  pop.className = 'react-pop';
+  pop.id = 'react-pop';
+  pop.innerHTML = REACTIONS.map((e) => `<button data-pick="${e}" class="${e === mine ? 'on' : ''}">${e}</button>`).join('');
+  document.body.appendChild(pop);
+  const r = anchor.getBoundingClientRect();
+  pop.style.left = `${Math.max(8, Math.min(window.innerWidth - pop.offsetWidth - 8, r.left + r.width / 2 - pop.offsetWidth / 2))}px`;
+  pop.style.top = `${Math.max(8, r.top - pop.offsetHeight - 6)}px`;
+  pop.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-pick]');
+    if (!b) return;
+    closeReactPicker();
+    toggleReaction(id, b.dataset.pick);
+  });
+  setTimeout(() => document.addEventListener('mousedown', reactOutside, true), 0);
+}
+async function toggleReaction(id, emoji) {
+  const key = state.openChat;
+  const mine = msgById(id)?.reactions?.find((r) => r.fp === myFp())?.emoji;
+  await call('chat_react', { key, id, emoji: mine === emoji ? '' : emoji }).catch(() => {});
+}
+
+function startReply(m) {
+  if (chatx.edit) $('#composer').value = '';
+  chatx.edit = null;
+  const name = m.outgoing ? 'Kendinizi' : (m.senderName || state.chats.get(state.openChat)?.name || '');
+  chatx.reply = { id: m.id, name, text: m.text };
+  renderReplyBar();
+  $('#composer').focus();
+}
+function startEdit(m) {
+  chatx.reply = null;
+  chatx.edit = { id: m.id };
+  const ta = $('#composer');
+  ta.value = m.text;
+  autoGrow();
+  updateComposerNote();
+  renderReplyBar();
+  ta.disabled = false;
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+  $('#chat-send').disabled = false;
+}
+function cancelCompose() {
+  if (chatx.edit) {
+    $('#composer').value = '';
+    autoGrow();
+    updateComposerNote();
+    $('#chat-send').disabled = true;
+  }
+  chatx.reply = null;
+  chatx.edit = null;
+  renderReplyBar();
+  renderChatHead();
+}
+function renderReplyBar() {
+  const bar = $('#reply-bar');
+  const r = chatx.edit
+    ? { title: '✎ Mesajı düzenliyorsunuz', text: 'Enter: kaydet · Esc: vazgeç' }
+    : chatx.reply ? { title: `↩ ${chatx.reply.name} yanıtlıyorsunuz`, text: chatx.reply.text } : null;
+  bar.hidden = !r;
+  bar.classList.toggle('editing', !!chatx.edit);
+  if (r) {
+    $('#reply-title').textContent = r.title;
+    $('#reply-text').textContent = r.text.replace(/\s+/g, ' ').slice(0, 180);
+  }
+}
+$('#reply-cancel').onclick = cancelCompose;
+
+function jumpTo(id) {
+  const el = document.querySelector(`#messages .msg[data-id="${CSS.escape(id)}"]`);
+  if (!el) return toast('Alıntılanan mesaj bu sohbette artık yok', { timeout: 2500 });
+  el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  el.classList.remove('flash');
+  void el.offsetWidth;
+  el.classList.add('flash');
+}
+
+$('#messages').addEventListener('click', async (e) => {
+  const pill = e.target.closest('[data-react]');
+  const msgEl = e.target.closest('.msg');
+  if (pill && msgEl) return toggleReaction(msgEl.dataset.id, pill.dataset.react);
+  const q = e.target.closest('[data-jump]');
+  if (q) return jumpTo(q.dataset.jump);
+  const t = e.target.closest('[data-mt]');
+  if (!t || !msgEl) return;
+  const m = msgById(msgEl.dataset.id);
+  if (!m) return;
+  if (t.dataset.mt === 'react') showReactPicker(t, m.id);
+  if (t.dataset.mt === 'reply') startReply(m);
+  if (t.dataset.mt === 'edit') startEdit(m);
+  if (t.dataset.mt === 'delete') {
+    const ok = await confirmDialog('Mesaj herkesten silinsin mi?', 'Mesaj sizde ve karşı tarafta "Bu mesaj silindi" olarak görünür.', 'Herkesten sil', true);
+    if (ok) call('chat_delete', { key: state.openChat, id: m.id }).catch(() => {});
+  }
+});
+$('#messages').addEventListener('dblclick', (e) => {
+  // Çift tıklama hızlı 👍
+  const el = e.target.closest('.msg:not(.deleted):not(.file-msg)');
+  if (el && !e.target.closest('.msg-tools, .reactions, .quote') && !window.getSelection()?.toString()) toggleReaction(el.dataset.id, '👍');
+});
+
+// ── Arama ──
+function openSearch() {
+  if (!chatOpen()) return;
+  $('#chat-searchbar').hidden = false;
+  const i = $('#chat-search-input');
+  i.focus();
+  i.select();
+}
+function closeSearch() {
+  $('#chat-searchbar').hidden = true;
+  $('#chat-search-input').value = '';
+  chatx.search = '';
+  chatx.hit = -1;
+  renderMessages(true);
+}
+function updateSearchHits() {
+  const hits = [...document.querySelectorAll('#messages .msg.hit')];
+  $('#chat-search-count').textContent = chatx.search ? (hits.length ? `${Math.max(0, chatx.hit) + 1}/${hits.length}` : 'Sonuç yok') : '';
+  return hits;
+}
+function stepSearch(d) {
+  const hits = [...document.querySelectorAll('#messages .msg.hit')];
+  if (!hits.length) return updateSearchHits();
+  chatx.hit = chatx.hit < 0 ? hits.length - 1 : (chatx.hit + d + hits.length) % hits.length;
+  hits.forEach((h, i) => h.classList.toggle('hit-cur', i === chatx.hit));
+  hits[chatx.hit].scrollIntoView({ block: 'center' });
+  updateSearchHits();
+}
+$('#chat-search').onclick = () => ($('#chat-searchbar').hidden ? openSearch() : closeSearch());
+$('#chat-search-close').onclick = closeSearch;
+$('#chat-search-next').onclick = () => stepSearch(1);
+$('#chat-search-prev').onclick = () => stepSearch(-1);
+$('#chat-search-input').addEventListener('input', (e) => {
+  chatx.search = e.target.value.trim();
+  chatx.hit = -1;
+  renderMessages();
+  stepSearch(0);
+});
+$('#chat-search-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); stepSearch(e.shiftKey ? -1 : 1); }
+});
+
+// ── @bahsetme ──
+function mentionQuery() {
+  const ta = $('#composer');
+  const pos = ta.selectionStart;
+  const m = ta.value.slice(0, pos).match(/(^|\s)@([\p{L}\p{N}._-]{0,30})$/u);
+  return m ? { start: pos - m[2].length - 1, end: pos, q: m[2] } : null;
+}
+function updateMentionPop() {
+  const pop = $('#mention-pop');
+  const g = groupOf(state.openChat);
+  const mq = g && !chatx.edit ? mentionQuery() : null;
+  if (!mq) { pop.hidden = true; chatx.mention = null; return; }
+  const q = mq.q.toLocaleLowerCase('tr');
+  const names = [...g.members.filter((x) => x.fingerprint !== myFp()).map((x) => x.name), 'herkes'];
+  const opts = names.filter((n) => n.toLocaleLowerCase('tr').includes(q)).slice(0, 6);
+  if (!opts.length) { pop.hidden = true; chatx.mention = null; return; }
+  const sel = Math.min(chatx.mention?.sel || 0, opts.length - 1);
+  chatx.mention = { ...mq, opts, sel };
+  pop.innerHTML = opts.map((n, i) => `<button data-mention="${esc(n)}" class="${i === sel ? 'on' : ''}">${n === 'herkes' ? '📣 @herkes' : `@${esc(n)}`}</button>`).join('');
+  pop.hidden = false;
+}
+function insertMention(name) {
+  const ta = $('#composer');
+  const { start, end } = chatx.mention;
+  ta.value = `${ta.value.slice(0, start)}@${name} ${ta.value.slice(end)}`;
+  const p = start + name.length + 2;
+  ta.setSelectionRange(p, p);
+  $('#mention-pop').hidden = true;
+  chatx.mention = null;
+  ta.focus();
+  autoGrow();
+}
+$('#mention-pop').addEventListener('mousedown', (e) => {
+  const b = e.target.closest('[data-mention]');
+  if (!b) return;
+  e.preventDefault();
+  insertMention(b.dataset.mention);
+});
+$('#composer').addEventListener('input', updateMentionPop);
+$('#composer').addEventListener('click', updateMentionPop);
+// Yakalama aşamasında: Enter gönderiminden önce çalışsın.
+$('#composer').addEventListener('keydown', (e) => {
+  const mm = chatx.mention;
+  if (mm && !$('#mention-pop').hidden) {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      mm.sel = (mm.sel + (e.key === 'ArrowDown' ? 1 : -1) + mm.opts.length) % mm.opts.length;
+      updateMentionPop();
+      return;
+    }
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      insertMention(mm.opts[mm.sel]);
+      return;
+    }
+  }
+  if (e.key === 'ArrowUp' && !$('#composer').value && !chatx.edit) {
+    // Boş kutuda ↑: son mesajımı düzenle
+    const last = [...(state.history.get(state.openChat) || [])].reverse().find((x) => x.outgoing && !x.file && !x.system && !x.deleted);
+    if (last) { e.preventDefault(); startEdit(last); }
+  }
+}, true);
+
+// ── Dürtme ──
+$('#chat-nudge').onclick = async () => {
+  const fp = state.openChat;
+  try {
+    await call('chat_nudge', { fingerprint: fp });
+    $('#chat-nudge').classList.add('waved');
+    setTimeout(() => $('#chat-nudge').classList.remove('waved'), 700);
+  } catch { /* toast gösterildi */ }
+};
+function onNudge({ fingerprint, name }) {
+  document.body.classList.remove('nudged');
+  void document.body.offsetWidth;
+  document.body.classList.add('nudged');
+  setTimeout(() => document.body.classList.remove('nudged'), 700);
+  if (state.openChat !== fingerprint || !chatOpen()) {
+    toast(`👋 ${name} sizi dürttü`, { action: 'Aç', timeout: 8000, onAction: () => openChat(fingerprint, name) });
+  }
+}
+
+// ── Çevrimdışı kişiye dosya ──
+async function queueFiles(fp, paths) {
+  const name = state.chats.get(fp)?.name || '';
+  try {
+    await call('chat_queue_files', { fingerprint: fp, name, paths });
+    toast(`${name || 'Kişi'} çevrimiçi olunca dosya kendiliğinden gönderilecek`, { type: 'success' });
+  } catch { /* toast gösterildi */ }
+}
+
+function onChatRemove({ fingerprint, id }) {
+  const hist = state.history.get(fingerprint);
+  if (hist) {
+    const i = hist.findIndex((m) => m.id === id);
+    if (i >= 0) hist.splice(i, 1);
+  }
+  if (state.openChat === fingerprint && chatOpen()) renderMessages();
+}
+
+// ───────────────────────────── Ekran görüntüsü: al, çiz, gönder ─────────────────────────────
+
+let shotBusy = false;
+async function startShot(target = null) {
+  if (shotBusy || lockVisible()) return;
+  shotBusy = true;
+  // Uygulama içinden başlatıldıysa pencere görüntüde çıkmasın.
+  if (T && document.hasFocus()) {
+    try { await T.window.getCurrentWindow().minimize(); } catch { /* yok say */ }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  let buf;
+  try {
+    buf = await api.invoke('screen_clip');
+  } catch (e) {
+    if (!/İptal|alınmadı/.test(String(e))) toast(String(e), { type: 'error' });
+    shotBusy = false;
+    return;
+  }
+  shotBusy = false;
+  openShotEditor(new Blob([buf], { type: 'image/png' }), target);
+}
+
+function shotTargets() {
+  const out = [];
+  const seen = new Set();
+  for (const p of state.peers) {
+    if (!p.fingerprint || seen.has(p.fingerprint) || isBlocked(p.fingerprint)) continue;
+    seen.add(p.fingerprint);
+    out.push({ key: p.fingerprint, label: p.name });
+  }
+  for (const c of state.chats.values()) {
+    if (c.group && !c.left && !c.group.deleted) out.push({ key: c.fingerprint, label: `👥 ${c.name}` });
+    else if (!c.group && !seen.has(c.fingerprint) && !isBlocked(c.fingerprint)) {
+      seen.add(c.fingerprint);
+      out.push({ key: c.fingerprint, label: `${c.name} (çevrimiçi olunca)` });
+    }
+  }
+  return out;
+}
+
+function openShotEditor(blob, target) {
+  const url = URL.createObjectURL(blob);
+  const img = new Image();
+  img.onerror = () => { URL.revokeObjectURL(url); toast('Görüntü açılamadı', { type: 'error' }); };
+  img.onload = () => {
+    const targets = shotTargets();
+    const pre = target?.key || (chatOpen() ? state.openChat : '');
+    const colors = ['#ef4444', '#f59e0b', '#22c55e', '#3b82f6', '#ffffff', '#111827'];
+    const tools = [['pen', '✏️', 'Kalem'], ['arrow', '➡️', 'Ok'], ['rect', '▭', 'Kutu'], ['mark', '🖍️', 'Vurgula'], ['text', 'T', 'Yazı']];
+    const m = openModal('shot', `
+      <div class="shot-head">
+        <h3>Ekran görüntüsü</h3>
+        <div class="shot-tools">
+          ${tools.map(([k, i, t], n) => `<button class="tool${n === 1 ? ' on' : ''}" data-tool="${k}" title="${t}">${i}</button>`).join('')}
+          <span class="tsep"></span>
+          ${colors.map((c, n) => `<button class="color${n === 0 ? ' on' : ''}" data-color="${c}" style="--c:${c}" title="${c}"></button>`).join('')}
+          <span class="tsep"></span>
+          <button class="tool" data-undo title="Geri al (Ctrl+Z)">↶</button>
+        </div>
+      </div>
+      <div class="shot-stage"><canvas id="shot-canvas"></canvas><input class="shot-text" id="shot-text" hidden placeholder="Yazı + Enter"></div>
+      <div class="shot-foot">
+        <label for="shot-to">Kime</label>
+        <select class="input" id="shot-to">
+          <option value="">— seçin —</option>
+          ${targets.map((t) => `<option value="${esc(t.key)}" ${t.key === pre ? 'selected' : ''}>${esc(t.label)}</option>`).join('')}
+        </select>
+        <span class="spacer"></span>
+        <button class="btn ghost" data-copyimg>Panoya kopyala</button>
+        <button class="btn ghost" data-cancel>Vazgeç</button>
+        <button class="btn" data-send>Gönder</button>
+      </div>`, { onClose: () => URL.revokeObjectURL(url) });
+    m.classList.add('shot-modal');
+    const cv = m.querySelector('#shot-canvas');
+    cv.width = img.naturalWidth;
+    cv.height = img.naturalHeight;
+    const ctx = cv.getContext('2d');
+    const lw = Math.max(4, Math.round(Math.max(cv.width, cv.height) / 240));
+    const shapes = [];
+    let tool = 'arrow';
+    let color = colors[0];
+    let cur = null;
+    const draw = (s) => {
+      ctx.save();
+      ctx.strokeStyle = s.color;
+      ctx.fillStyle = s.color;
+      ctx.lineWidth = lw;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      if (s.type === 'pen' || s.type === 'mark') {
+        if (s.type === 'mark') { ctx.globalAlpha = 0.35; ctx.lineWidth = lw * 6; }
+        ctx.beginPath();
+        s.pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+        ctx.stroke();
+      } else if (s.type === 'rect') {
+        ctx.strokeRect(Math.min(s.x1, s.x2), Math.min(s.y1, s.y2), Math.abs(s.x2 - s.x1), Math.abs(s.y2 - s.y1));
+      } else if (s.type === 'arrow') {
+        const a = Math.atan2(s.y2 - s.y1, s.x2 - s.x1);
+        const h = lw * 5;
+        ctx.beginPath();
+        ctx.moveTo(s.x1, s.y1);
+        ctx.lineTo(s.x2 - Math.cos(a) * h * 0.6, s.y2 - Math.sin(a) * h * 0.6);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(s.x2, s.y2);
+        ctx.lineTo(s.x2 - h * Math.cos(a - 0.45), s.y2 - h * Math.sin(a - 0.45));
+        ctx.lineTo(s.x2 - h * Math.cos(a + 0.45), s.y2 - h * Math.sin(a + 0.45));
+        ctx.closePath();
+        ctx.fill();
+      } else if (s.type === 'text') {
+        ctx.font = `600 ${lw * 7}px "Segoe UI", system-ui, sans-serif`;
+        ctx.textBaseline = 'top';
+        ctx.lineWidth = lw * 1.2;
+        ctx.strokeStyle = s.color === '#ffffff' ? '#000' : '#fff';
+        ctx.strokeText(s.text, s.x, s.y);
+        ctx.fillText(s.text, s.x, s.y);
+      }
+      ctx.restore();
+    };
+    const redraw = () => {
+      ctx.drawImage(img, 0, 0);
+      shapes.forEach(draw);
+      if (cur) draw(cur);
+    };
+    redraw();
+    const pt = (e) => {
+      const r = cv.getBoundingClientRect();
+      return [((e.clientX - r.left) / r.width) * cv.width, ((e.clientY - r.top) / r.height) * cv.height];
+    };
+    const textBox = m.querySelector('#shot-text');
+    const commitText = () => {
+      const v = textBox.value.trim();
+      if (v && textBox.dataset.x) shapes.push({ type: 'text', color, text: v, x: Number(textBox.dataset.x), y: Number(textBox.dataset.y) });
+      textBox.hidden = true;
+      textBox.value = '';
+      redraw();
+    };
+    textBox.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commitText(); }
+      if (e.key === 'Escape') { e.stopPropagation(); textBox.hidden = true; textBox.value = ''; }
+    });
+    textBox.addEventListener('blur', commitText);
+    cv.addEventListener('pointerdown', (e) => {
+      const [x, y] = pt(e);
+      if (tool === 'text') {
+        const r = cv.getBoundingClientRect();
+        const stage = m.querySelector('.shot-stage').getBoundingClientRect();
+        textBox.style.left = `${e.clientX - stage.left}px`;
+        textBox.style.top = `${e.clientY - stage.top}px`;
+        textBox.style.color = color;
+        textBox.dataset.x = String(x);
+        textBox.dataset.y = String(y);
+        textBox.hidden = false;
+        setTimeout(() => textBox.focus(), 0);
+        void r;
+        return;
+      }
+      cv.setPointerCapture(e.pointerId);
+      cur = tool === 'pen' || tool === 'mark' ? { type: tool, color: tool === 'mark' ? '#facc15' : color, pts: [[x, y]] } : { type: tool, color, x1: x, y1: y, x2: x, y2: y };
+    });
+    cv.addEventListener('pointermove', (e) => {
+      if (!cur) return;
+      const [x, y] = pt(e);
+      if (cur.pts) cur.pts.push([x, y]);
+      else { cur.x2 = x; cur.y2 = y; }
+      redraw();
+    });
+    cv.addEventListener('pointerup', () => {
+      if (!cur) return;
+      const tiny = cur.pts ? cur.pts.length < 2 : Math.hypot(cur.x2 - cur.x1, cur.y2 - cur.y1) < 4;
+      if (!tiny) shapes.push(cur);
+      cur = null;
+      redraw();
+    });
+    m.addEventListener('click', async (e) => {
+      const t = e.target.closest('[data-tool]');
+      if (t) {
+        tool = t.dataset.tool;
+        m.querySelectorAll('[data-tool]').forEach((b) => b.classList.toggle('on', b === t));
+        cv.style.cursor = tool === 'text' ? 'text' : 'crosshair';
+        return;
+      }
+      const c = e.target.closest('[data-color]');
+      if (c) {
+        color = c.dataset.color;
+        m.querySelectorAll('[data-color]').forEach((b) => b.classList.toggle('on', b === c));
+        return;
+      }
+      if (e.target.closest('[data-undo]')) { shapes.pop(); redraw(); return; }
+      if (e.target.closest('[data-cancel]')) return closeModal();
+      const out = () => new Promise((res) => cv.toBlob(res, 'image/png'));
+      if (e.target.closest('[data-copyimg]')) {
+        try {
+          await navigator.clipboard.write([new ClipboardItem({ 'image/png': await out() })]);
+          toast('Panoya kopyalandı', { type: 'success', timeout: 2000 });
+        } catch { toast('Panoya kopyalanamadı', { type: 'error' }); }
+        return;
+      }
+      if (e.target.closest('[data-send]')) {
+        const key = m.querySelector('#shot-to').value;
+        if (!key) return toast('Önce kime gönderileceğini seçin', { type: 'error' });
+        const btn = e.target.closest('[data-send]');
+        btn.disabled = true;
+        try {
+          const bytes = new Uint8Array(await (await out()).arrayBuffer());
+          await api.invokeRaw('send_png', bytes, { 'x-key': key, 'x-stamp': clipStamp() });
+          closeModal();
+          toast(`Ekran görüntüsü gönderiliyor → ${shotTargets().find((t) => t.key === key)?.label || ''}`, { type: 'success' });
+        } catch (err) {
+          btn.disabled = false;
+          toast(String(err), { type: 'error' });
+        }
+      }
+    });
+    m.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); shapes.pop(); redraw(); }
+    });
+  };
+  img.src = url;
+}
+$('#chat-shot').onclick = () => startShot({ key: state.openChat });
+
+// ───────────────────────────── Hızlı gönderim paleti ─────────────────────────────
+// Ctrl+Shift+Boşluk (her yerden) ya da uygulamada Ctrl+K: isim yaz, Enter → panodakini gönder.
+
+function paletteItems(q) {
+  const ql = q.toLocaleLowerCase('tr');
+  const match = (s) => !ql || s.toLocaleLowerCase('tr').includes(ql);
+  const lastAt = (key) => state.chats.get(key)?.last?.at || 0;
+  const items = [];
+  const seen = new Set();
+  [...state.peers]
+    .filter((p) => p.fingerprint && !isBlocked(p.fingerprint))
+    .sort((a, b) => lastAt(b.fingerprint) - lastAt(a.fingerprint))
+    .forEach((p) => {
+      if (seen.has(p.fingerprint) || !match(p.name)) return;
+      seen.add(p.fingerprint);
+      items.push({ kind: 'peer', key: p.fingerprint, label: p.name, sub: p.status ? `${statusOf(p.status).icon} ${statusOf(p.status).label}` : 'çevrimiçi', peer: p });
+    });
+  [...state.chats.values()]
+    .filter((c) => c.group && !c.left && !c.group.deleted && match(c.name))
+    .sort((a, b) => lastAt(b.fingerprint) - lastAt(a.fingerprint))
+    .forEach((c) => items.push({ kind: 'group', key: c.fingerprint, label: c.name, sub: `${c.group.members.length} kişilik grup` }));
+  const actions = [
+    { kind: 'action', id: 'shot', label: '📸 Ekran görüntüsü al, çiz, gönder', sub: 'Ctrl+Shift+PrtSc' },
+    { kind: 'action', id: 'phone', label: '📱 Telefon bağla (QR)', sub: 'Telefondan bilgisayara, bilgisayardan telefona' },
+    { kind: 'action', id: 'office', label: '🏢 Ofisi aç', sub: '3B görünüm' },
+  ].filter((a) => match(a.label));
+  return q ? [...items, ...actions] : [...actions, ...items];
+}
+
+function openPalette() {
+  if (lockVisible() || modalKind === 'incoming' || modalKind === 'welcome') return;
+  let sel = 0;
+  let items = [];
+  const m = openModal('palette', `
+    <div class="palette">
+      <input class="input pal-input" id="pal-q" placeholder="Kime gönderilsin? İsim yazın…" autocomplete="off" spellcheck="false" autofocus />
+      <div class="pal-list" id="pal-list"></div>
+      <div class="pal-foot"><b>Enter</b> panodakini gönder · <b>Shift+Enter</b> sohbeti aç · <b>Esc</b> kapat</div>
+    </div>`);
+  m.classList.add('palette-modal');
+  const render = () => {
+    items = paletteItems(m.querySelector('#pal-q').value.trim());
+    sel = Math.min(sel, Math.max(0, items.length - 1));
+    m.querySelector('#pal-list').innerHTML = items.length
+      ? items.map((it, i) => `<button class="pal-item${i === sel ? ' on' : ''}" data-i="${i}">
+          ${it.kind === 'action' ? '' : `<span class="avatar xs" style="background:${grad(it.key)}">${it.kind === 'group' ? ic.users : face(it.key, it.label)}</span>`}
+          <span class="pal-main"><b>${esc(it.label)}</b><small>${esc(it.sub || '')}</small></span>
+          ${it.kind === 'peer' ? '<kbd>Enter ↵</kbd>' : ''}</button>`).join('')
+      : '<div class="pal-empty">Kimse bulunamadı</div>';
+    m.querySelector('.pal-item.on')?.scrollIntoView({ block: 'nearest' });
+  };
+  const run = (it, openOnly) => {
+    if (!it) return;
+    closeModal();
+    if (it.kind === 'action') {
+      if (it.id === 'shot') return startShot(null);
+      if (it.id === 'phone') return openPhone();
+      if (it.id === 'office') return openOffice();
+    }
+    if (it.kind === 'group' || openOnly) {
+      if (officeOpen()) closeOffice();
+      return openChat(it.key, it.label);
+    }
+    sendClipboard([it.peer.id]);
+  };
+  m.querySelector('#pal-q').addEventListener('input', () => { sel = 0; render(); });
+  m.querySelector('#pal-q').addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      sel = items.length ? (sel + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length : 0;
+      render();
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      run(items[sel], e.shiftKey);
+    }
+  });
+  m.querySelector('#pal-list').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-i]');
+    if (b) run(items[Number(b.dataset.i)], e.shiftKey);
+  });
+  render();
+}
+
+// ───────────────────────────── Telefon ─────────────────────────────
+
+state.phoneRecv = [];
+async function openPhone() {
+  if (lockVisible()) return;
+  let info;
+  try {
+    info = await call('phone_start');
+  } catch { return; }
+  const m = openModal('phone', `
+    <h3>📱 Telefonla dosya alışverişi</h3>
+    <div class="phone-grid">
+      <div class="qr"><img alt="QR kod" draggable="false" src="data:image/svg+xml;charset=utf-8,${encodeURIComponent(info.svg)}"></div>
+      <div class="phone-side">
+        <ol class="phone-steps">
+          <li>Telefon bu bilgisayarla <b>aynı Wi-Fi</b>'a bağlı olsun.</li>
+          <li>Telefonun kamerasıyla QR kodu okutun.</li>
+          <li>Açılan sayfadan fotoğraf, video ya da dosya seçin. Uygulama kurmaya gerek yok.</li>
+        </ol>
+        <div class="phone-url"><code>${esc(info.url)}</code><button class="icon-btn sm" data-copyurl title="Adresi kopyala">${ic.copy}</button></div>
+        <div class="phone-state" id="phone-state">Telefon bekleniyor…</div>
+      </div>
+    </div>
+    <div class="phone-sec">
+      <div class="ps-head"><b>Telefondan gelenler</b></div>
+      <div class="phone-list" id="phone-recv"></div>
+    </div>
+    <div class="phone-sec">
+      <div class="ps-head"><b>Telefona gönder</b><button class="btn soft small" data-offer>${ic.file}Dosya seç</button></div>
+      <div class="phone-list" id="phone-offered"></div>
+    </div>
+    <div class="foot"><span class="muted small">Bağlantı yerel ağda kalır, internete çıkmaz. Pencere kapanınca adres geçersiz olur.</span><span class="spacer"></span><button class="btn" data-close>Kapat</button></div>`, {
+    onClose: () => api.invoke('phone_stop').catch(() => {}),
+  });
+  m.classList.add('phone-modal');
+  renderPhoneLists(info.offered || []);
+  m.addEventListener('click', async (e) => {
+    if (e.target.closest('[data-close]')) return closeModal();
+    if (e.target.closest('[data-copyurl]')) {
+      try { await navigator.clipboard.writeText(info.url); toast('Adres kopyalandı', { type: 'success', timeout: 2000 }); } catch { /* yok say */ }
+      return;
+    }
+    if (e.target.closest('[data-offer]')) {
+      const picked = await api.pick({ multiple: true, directory: false, title: 'Telefona gönderilecek dosyalar' }).catch(() => null);
+      const paths = Array.isArray(picked) ? picked : picked ? [picked] : [];
+      if (!paths.length) return;
+      try {
+        const r = await call('phone_offer', { paths });
+        renderPhoneLists(r.offered);
+        toast('Dosyalar telefonda "Bilgisayardan al" bölümünde görünüyor', { type: 'success' });
+      } catch { /* toast gösterildi */ }
+      return;
+    }
+    const un = e.target.closest('[data-unoffer]');
+    if (un) renderPhoneLists((await call('phone_unoffer', { index: Number(un.dataset.unoffer) })).offered);
+    const rv = e.target.closest('[data-reveal]');
+    if (rv) call('reveal_path', { path: rv.dataset.reveal }).catch(() => {});
+  });
+}
+function renderPhoneLists(offered) {
+  const recv = $('#phone-recv');
+  if (!recv) return;
+  recv.innerHTML = state.phoneRecv.length
+    ? state.phoneRecv.map((f) => `<div class="pl-row"><span class="pl-ic">${ic.file}</span><span class="pl-name">${esc(f.name)}</span><span class="pl-size">${fmtBytes(f.size)}</span>
+        <button class="icon-btn sm" data-reveal="${esc(f.path)}" title="Klasörde göster">${ic.reveal}</button></div>`).join('')
+    : '<div class="pl-empty">Henüz bir şey gelmedi. Dosyalar İndirilenler\\FastFiles\\Telefon klasörüne kaydedilir.</div>';
+  if (offered) {
+    $('#phone-offered').innerHTML = offered.length
+      ? offered.map((f) => `<div class="pl-row"><span class="pl-ic">${ic.file}</span><span class="pl-name">${esc(f.name)}</span><span class="pl-size">${fmtBytes(f.size)}</span>
+          <button class="icon-btn sm" data-unoffer="${f.i}" title="Listeden çıkar">${ic.x}</button></div>`).join('')
+      : '<div class="pl-empty">Telefona göndermek istediğiniz dosyaları seçin; telefonda "İndir" ile alınır.</div>';
+  }
+}
+function onPhone(p) {
+  if (p.kind === 'received') {
+    state.phoneRecv.unshift({ name: p.name, size: p.size, path: p.path });
+    state.phoneRecv = state.phoneRecv.slice(0, 50);
+    renderPhoneLists();
+    toast(`📱 Telefondan geldi: ${p.name}`, { type: 'success', action: 'Göster', timeout: 7000, onAction: () => call('reveal_path', { path: p.path }) });
+  } else if (p.kind === 'connected') {
+    const st = $('#phone-state');
+    if (st) { st.textContent = '✓ Telefon bağlandı'; st.classList.add('ok'); }
+  } else if (p.kind === 'downloaded') {
+    toast(`📱 Telefona indirildi: ${p.name}`, { type: 'success', timeout: 3000 });
+  } else if (p.kind === 'closed' && modalKind === 'phone') {
+    const st = $('#phone-state');
+    if (st) { st.textContent = 'Bağlantı süresi doldu, pencereyi kapatıp yeniden açın'; st.classList.remove('ok'); }
+  }
+}
+$('#btn-phone').onclick = openPhone;
+
+// ───────────────────────────── Ekran paylaşımı ─────────────────────────────
+
+const screenState = { offers: new Map(), watching: null, url: null, actual: false };
+
+$('#chat-screen').onclick = async () => {
+  const key = state.openChat;
+  if (!key) return;
+  try {
+    await call('screen_share_start', { key });
+    toast('Ekran paylaşımı başladı; davet edilenler "İzle" deyince ekranınızı görür', { type: 'success', timeout: 6000 });
+  } catch { /* toast gösterildi */ }
+};
+$('#share-bar-stop').onclick = () => api.invoke('screen_share_stop').catch(() => {});
+
+function onScreenSharing(p) {
+  document.body.classList.toggle('sharing', !!p.active);
+  $('#share-bar').hidden = !p.active;
+  if (!p.active) return;
+  $('#share-bar-text').textContent = p.viewers?.length
+    ? `Ekranınız paylaşılıyor · İzleyen: ${p.viewers.join(', ')}`
+    : `Ekranınız paylaşılıyor · ${p.invited} kişi davet edildi, izlemeleri bekleniyor`;
+}
+
+function onScreenOffer({ session, fingerprint, name }) {
+  screenState.offers.set(session, { fingerprint, name });
+  if (screenState.watching) return;
+  toast(`🖥️ ${name} ekranını paylaşıyor`, { action: 'İzle', timeout: 30000, onAction: () => watchScreen(session) });
+}
+function onScreenEnd({ session }) {
+  const offer = screenState.offers.get(session);
+  screenState.offers.delete(session);
+  if (screenState.watching?.session === session) {
+    closeScreenViewer(false);
+    toast(`${offer?.name || 'Paylaşan'} ekran paylaşımını bitirdi`);
+  }
+}
+
+function showFrame(buf) {
+  const url = URL.createObjectURL(new Blob([buf], { type: 'image/jpeg' }));
+  const prev = screenState.url;
+  screenState.url = url;
+  const img = $('#sv-img');
+  img.src = url;
+  $('#sv-wait').hidden = true;
+  if (prev) setTimeout(() => URL.revokeObjectURL(prev), 500);
+}
+
+async function watchScreen(session) {
+  const offer = screenState.offers.get(session);
+  if (!offer) return toast('Bu paylaşım artık yok', { type: 'error' });
+  if (screenState.watching) closeScreenViewer();
+  if (modalKind && modalKind !== 'incoming') closeModal();
+  screenState.watching = { session, name: offer.name };
+  $('#sv-title').textContent = `${offer.name} ekranı`;
+  $('#sv-info').textContent = '';
+  $('#sv-wait').hidden = false;
+  $('#sv-wait').textContent = 'Bağlanılıyor…';
+  $('#sv-img').removeAttribute('src');
+  $('#screen-viewer').hidden = false;
+  document.body.classList.add('screen-open');
+  if (!T) return previewScreen(session);
+  const ch = new T.core.Channel();
+  ch.onmessage = (msg) => {
+    if (screenState.watching?.session !== session) return;
+    if (msg instanceof ArrayBuffer) showFrame(msg);
+    else if (msg && msg.width) $('#sv-info').textContent = `${msg.width} × ${msg.height}`;
+  };
+  try {
+    await api.invoke('screen_watch', { session, onFrame: ch });
+    if (screenState.watching?.session === session) {
+      closeScreenViewer(false);
+      toast(`${offer.name} ekran paylaşımını bitirdi`);
+    }
+  } catch (e) {
+    if (screenState.watching?.session === session) {
+      closeScreenViewer(false);
+      toast(String(e), { type: 'error' });
+    }
+  }
+}
+
+function closeScreenViewer(stop = true) {
+  const w = screenState.watching;
+  screenState.watching = null;
+  if (w && stop) api.invoke('screen_watch_stop', { session: w.session }).catch(() => {});
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  $('#screen-viewer').hidden = true;
+  document.body.classList.remove('screen-open');
+  if (screenState.url) URL.revokeObjectURL(screenState.url);
+  screenState.url = null;
+  $('#sv-img').removeAttribute('src');
+}
+$('#sv-close').onclick = () => closeScreenViewer();
+$('#sv-full').onclick = () => (document.fullscreenElement ? document.exitFullscreen() : $('#screen-viewer').requestFullscreen()).catch?.(() => {});
+$('#sv-fit').onclick = () => {
+  screenState.actual = !screenState.actual;
+  $('#sv-stage').classList.toggle('actual', screenState.actual);
+  $('#sv-fit').textContent = screenState.actual ? 'Sığdır' : 'Gerçek boyut';
+};
+$('#sv-img').addEventListener('dblclick', () => $('#sv-full').click());
+
+// ───────────────────────────── Kısayollar ─────────────────────────────
+
+document.addEventListener('keydown', (e) => {
+  if (lockVisible()) return;
+  const k = e.key.toLowerCase();
+  if ((e.ctrlKey || e.metaKey) && k === 'k' && !modalKind) { e.preventDefault(); openPalette(); }
+  if ((e.ctrlKey || e.metaKey) && k === 'f' && chatOpen() && !modalKind) { e.preventDefault(); openSearch(); }
+  if (k === 'f' && !e.ctrlKey && !$('#screen-viewer').hidden && !e.target.closest('input, textarea')) $('#sv-full').click();
+});
+
+// Sohbet başlığındaki "Diğer" menüsü
+$('#chat-more').onclick = (e) => {
+  e.stopPropagation();
+  $('#chat-more-menu').hidden = !$('#chat-more-menu').hidden;
+};
+$('#chat-more-menu').addEventListener('click', () => { $('#chat-more-menu').hidden = true; });
+document.addEventListener('mousedown', (e) => {
+  if (!e.target.closest('.chat-more')) $('#chat-more-menu').hidden = true;
+});
+
+// ───────────────────────────── Sanal ofis ─────────────────────────────
+// Masanın 3B görünümü (office.js). Three.js yalnızca ekran ilk açıldığında yüklenir.
+// Herkes Ofis ekranından kendi koltuğunu seçer; seçim keşif duyurusuyla diğer cihazlara gider.
+
+const OFFICE_KNOWN_KEY = 'ff.office.known';
+const officeState = {
+  mod: null,
+  loading: null,
+  failed: false,
+  seen: new Set(),     // ofiste uçurulan mesajlar (aynı mesajın durum güncellemeleri tekrar uçmasın)
+  feed: [],            // son olaylar: { icon, html, at }
+  known: (() => { try { return JSON.parse(localStorage.getItem(OFFICE_KNOWN_KEY) || '{}') || {}; } catch { return {}; } })(),
+  askedSeat: false,
+};
+const officeOpen = () => !$('#office-screen').hidden;
+
+function saveOfficeKnown() {
+  try { localStorage.setItem(OFFICE_KNOWN_KEY, JSON.stringify(officeState.known)); } catch { /* önemli değil */ }
+}
+
+function officeName(fp) {
+  if (fp === myFp()) return 'Siz';
+  const p = peerByFp(fp);
+  if (p) return p.name;
+  if (state.chats.get(fp)?.name) return state.chats.get(fp).name;
+  if (officeState.known[fp]) return officeState.known[fp].name;
+  for (const c of state.chats.values()) {
+    const m = c.group?.members?.find((x) => x.fingerprint === fp);
+    if (m) return m.name;
+  }
+  return 'Biri';
+}
+
+/** Masadakiler: ben, çevrimiçi cihazlar ve koltuğu bilinen çevrimdışı kişiler. */
+function officePeople() {
+  const me = myFp();
+  const list = [];
+  if (me && state.settings) list.push({ fp: me, name: state.settings.deviceName, seat: state.settings.seat || 0, online: true, me: true, status: myStatus() });
+  const online = new Set([me]);
+  const now = Date.now();
+  let dirty = false;
+  for (const p of state.peers) {
+    if (!p.fingerprint || online.has(p.fingerprint)) continue;
+    online.add(p.fingerprint);
+    const seat = p.seat || 0;
+    list.push({ fp: p.fingerprint, name: p.name, seat, online: true, me: false, status: p.status || '' });
+    // Çevrimdışı olunca da yeri boş görünsün diye koltuğu hatırlanır.
+    const k = officeState.known[p.fingerprint];
+    if (seat && (!k || k.seat !== seat || k.name !== p.name || now - k.at > 3600e3)) {
+      officeState.known[p.fingerprint] = { name: p.name, seat, at: now };
+      dirty = true;
+    } else if (!seat && k) {
+      delete officeState.known[p.fingerprint];
+      dirty = true;
+    }
+  }
+  for (const [fp, k] of Object.entries(officeState.known)) {
+    if (online.has(fp)) continue;
+    if (now - k.at > 30 * 86400e3) { delete officeState.known[fp]; dirty = true; continue; }
+    list.push({ fp, name: k.name, seat: k.seat, online: false, me: false });
+  }
+  if (dirty) saveOfficeKnown();
+  return list.map((p) => ({ ...p, faceHtml: face(p.fp, p.name), faceBg: grad(p.fp) }));
+}
+
+function officeSyncPeople() {
+  const list = officePeople();
+  if (!officeState.mod) return;
+  const { overflow } = officeState.mod.setPeople(list);
+  const online = list.filter((p) => p.online).length;
+  $('#office-sub').textContent = `${online} kişi çevrimiçi${overflow.length ? ` · masada yer yok: ${overflow.map((p) => p.name).join(', ')}` : ''}`;
+  const seat = state.settings?.seat;
+  $('#office-seat').lastChild.textContent = seat ? `Koltuk ${seat}` : 'Koltuğumu seç';
+}
+
+function officeTransfers() {
+  if (!officeState.mod) return;
+  const me = myFp();
+  const list = [];
+  for (const t of state.transfers.values()) {
+    const fp = state.peers.find((p) => p.id === t.peerId)?.fingerprint;
+    if (!fp) continue;
+    const send = t.direction === 'send';
+    list.push({ id: t.id, from: send ? me : fp, to: send ? fp : me, status: t.status, done: t.done, total: t.total, speed: t.speed, title: t.title });
+  }
+  officeState.mod.syncTransfers(list);
+}
+
+function officeOnTransfer(prev, t) {
+  officeTransfers();
+  if (prev?.status === t.status) return;
+  const fp = state.peers.find((p) => p.id === t.peerId)?.fingerprint;
+  const who = (f) => `<b>${esc(f ? officeName(f) : t.peerName)}</b>`;
+  const send = t.direction === 'send';
+  const pair = send ? `${who(myFp())} → ${who(fp)}` : `${who(fp)} → ${who(myFp())}`;
+  const title = esc(t.title.length > 28 ? `${t.title.slice(0, 27)}…` : t.title);
+  if (!prev && ['waiting', 'active'].includes(t.status)) officeFeed('📎', `${pair} · ${title}`);
+  else if (t.status === 'done') officeFeed('✅', `${pair} · ${title} ${send ? 'gönderildi' : 'alındı'}`);
+  else if (t.status === 'declined') officeFeed('✖️', `${pair} · ${title} reddedildi`);
+  else if (t.status === 'failed') officeFeed('⚠️', `${pair} · ${title} başarısız`);
+}
+
+function officeGames() {
+  if (!officeState.mod) return;
+  officeState.mod.setGames(state.games
+    .filter((g) => g.status === 'active' && g.game === 'chess' && g.players.length === 2)
+    .map((g) => ({ id: g.id, a: g.players[0].fingerprint, b: g.players[1].fingerprint })));
+}
+
+function officeOnChat(key, incoming, m) {
+  if (!m || m.system || m.file) return;
+  const id = `${key}|${m.id}`;
+  if (officeState.seen.has(id)) return;
+  if (officeState.seen.size > 3000) officeState.seen.clear();
+  officeState.seen.add(id);
+  // Uzun süre sonra toplu gelen eski mesajlar (çevrimdışı kuyruğu) uçurulmaz.
+  if (Math.abs(Date.now() - (m.at || 0)) > 120e3) return;
+  const me = myFp();
+  const group = groupOf(key);
+  const members = group ? group.members.map((x) => x.fingerprint) : [];
+  const from = incoming ? (group ? m.sender : key) : me;
+  if (!from) return;
+  const to = group ? members.filter((f) => f !== from) : [incoming ? me : key];
+  if (!to.length) return;
+  const gname = state.chats.get(key)?.name || group?.name || 'grup';
+  officeFeed('💬', group
+    ? `<b>${esc(officeName(from))}</b> → ${esc(gname)}`
+    : `<b>${esc(officeName(from))}</b> → <b>${esc(officeName(to[0]))}</b>`);
+  officeState.mod?.message(from, to, group ? gname : 'Mesaj');
+}
+
+function officeFeed(icon, html) {
+  officeState.feed.push({ icon, html, at: Date.now() });
+  if (officeState.feed.length > 5) officeState.feed.shift();
+  if (officeOpen()) renderOfficeFeed();
+}
+
+function renderOfficeFeed() {
+  const now = Date.now();
+  $('#office-feed').innerHTML = officeState.feed
+    .filter((f) => now - f.at < 10 * 60e3)
+    .map((f) => `<div class="fe${now - f.at > 20e3 ? ' old' : ''}"><span class="fe-ic">${f.icon}</span><span>${f.html}</span><time>${fmtTime(f.at)}</time></div>`)
+    .join('');
+}
+
+function setOfficePick(on) {
+  officeState.mod?.setPickMode(on);
+  $('#office-pick').hidden = !on;
+  $('#office-unseat').hidden = !state.settings?.seat;
+}
+
+async function officePickSeat(n) {
+  const s = await call('update_settings', { seat: n }).catch(() => null);
+  if (!s) return;
+  state.settings = s;
+  setOfficePick(false);
+  officeSyncPeople();
+  toast(n ? `Koltuk ${n} artık sizin. Diğer bilgisayarlarda da burada görüneceksiniz.` : 'Koltuktan kalktınız', { type: 'success' });
+}
+
+async function openOffice() {
+  if (gamesOpen()) closeGames();
+  closeEmoji();
+  closeViewer();
+  $('#office-screen').hidden = false;
+  document.body.classList.add('office-open');
+  renderOfficeFeed();
+  if (!officeState.mod && !officeState.failed) {
+    try {
+      officeState.loading ||= import('./office.js');
+      const { createOffice } = await officeState.loading;
+      officeState.mod ||= createOffice($('#office-stage'), {
+        onPerson: (fp) => { closeOffice(); openChat(fp, officeName(fp)); },
+        onSeat: (n) => officePickSeat(n),
+      });
+    } catch (e) {
+      officeState.failed = true;
+      const err = $('#office-error');
+      err.hidden = false;
+      err.innerHTML = `<h3>3B görünüm açılamadı</h3><p>Bu bilgisayarın ekran kartı sürücüsü WebGL'i desteklemiyor olabilir.</p><p class="small">${esc(e?.message || e)}</p>`;
+    }
+  }
+  if (!officeState.mod || !officeOpen()) return;
+  officeSyncPeople();
+  officeTransfers();
+  officeGames();
+  officeState.mod.start();
+  if (!state.settings?.seat && !officeState.askedSeat) {
+    officeState.askedSeat = true;
+    toast('Masada nerede oturduğunuzu seçin, herkes sizi orada görsün', { action: 'Koltuk seç', timeout: 9000, onAction: () => setOfficePick(true) });
+  }
+}
+
+function closeOffice() {
+  setOfficePick(false);
+  $('#office-screen').hidden = true;
+  document.body.classList.remove('office-open');
+  officeState.mod?.stop();
+}
+
+$('#btn-office').onclick = () => (officeOpen() ? closeOffice() : openOffice());
+$('#office-close').onclick = closeOffice;
+$('#office-home').onclick = () => officeState.mod?.resetCamera();
+$('#office-seat').onclick = () => setOfficePick(!officeState.mod?.pickMode);
+$('#office-pick-done').onclick = () => setOfficePick(false);
+$('#office-unseat').onclick = () => officePickSeat(0);
+setInterval(() => { if (officeOpen()) renderOfficeFeed(); }, 10e3);
+
 // ───────────────────────────── Sürükle-bırak ─────────────────────────────
 
 function peerIdAt(pos) {
   if (!pos) return null;
   const r = window.devicePixelRatio || 1;
+  if (officeOpen() && officeState.mod) {
+    const fp = officeState.mod.fpAt(pos.x / r, pos.y / r);
+    return (fp && peerByFp(fp)?.id) || null;
+  }
   const el = document.elementFromPoint(pos.x / r, pos.y / r);
   return el?.closest('.peer')?.dataset.id || null;
 }
 
 function updateDragTarget(pos) {
   const id = peerIdAt(pos);
+  officeState.mod?.setDropTarget(state.peers.find((p) => p.id === id)?.fingerprint);
   document.querySelectorAll('.peer.drop-target').forEach((el) => el.dataset.id !== id && el.classList.remove('drop-target'));
   const msg = $('#drop-msg');
   if (id) {
@@ -3718,13 +5358,14 @@ function updateDragTarget(pos) {
 
 // Bırakma noktası açık sohbet panelinin üzerinde mi?
 function chatDropAt(pos) {
-  if (!pos || !chatOpen() || $('#composer').disabled) return false;
+  if (!pos || !chatOpen() || $('#chat-attach').disabled) return false;
   const r = window.devicePixelRatio || 1;
   const el = document.elementFromPoint(pos.x / r, pos.y / r);
   return !!el?.closest('#chat-view');
 }
 
 function endDrag() {
+  officeState.mod?.setDropTarget(null);
   document.body.classList.remove('dragging');
   document.querySelectorAll('.peer.drop-target').forEach((el) => el.classList.remove('drop-target'));
 }
@@ -3853,6 +5494,7 @@ async function init() {
   api.listen('shares', (e) => onShares(e.payload));
   api.listen('polls', (e) => onPolls(e.payload));
   api.listen('games', (e) => onGames(e.payload));
+  api.listen('game', (e) => onGame(e.payload));
   api.listen('game-error', (e) => toast(e.payload.message, { type: 'error', timeout: 6000 }));
   api.listen('share-files', (e) => { if (state.openShare === e.payload.id) loadShareFiles(); });
   api.listen('conversation', (e) => onConversation(e.payload));
@@ -3865,6 +5507,15 @@ async function init() {
   api.listen('transfer', (e) => onTransfer(e.payload));
   api.listen('transfers', (e) => setTransfers(e.payload));
   api.listen('typing', (e) => onTyping(e.payload));
+  api.listen('my-status', (e) => { state.myStatus = e.payload.status; renderMyStatus(); officeSyncPeople(); });
+  api.listen('nudge', (e) => onNudge(e.payload));
+  api.listen('chat-remove', (e) => onChatRemove(e.payload));
+  api.listen('quick-send', () => openPalette());
+  api.listen('quick-shot', () => startShot(null));
+  api.listen('phone', (e) => onPhone(e.payload));
+  api.listen('screen-offer', (e) => onScreenOffer(e.payload));
+  api.listen('screen-end', (e) => onScreenEnd(e.payload));
+  api.listen('screen-sharing', (e) => onScreenSharing(e.payload));
   // Karşı taraf gönderimi elle onayladı.
   api.listen('accepted', (e) => toast(`${e.payload.peerName} kabul etti · "${e.payload.title}" gönderiliyor`, { type: 'success' }));
   // Gezgin'de sağ tık → "FastFiles ile gönder".
@@ -4034,11 +5685,53 @@ function createPreviewApi() {
       createdAt: now - 2 * 86400e3, updatedAt: now - 2 * 86400e3 + 600e3,
       info: { fen: 'r1bqkb1r/pppp1Qpp/2n2n2/4p3/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 0 4', check: true, lastMove: 'h5f7', san: ['e4', 'e5', 'Qh5', 'Nc6', 'Bc4', 'Nf6', 'Qxf7#'] } }),
   ];
+  // Örnek mini golf (gerçek arka uç çıktısı): Ahmet deliği 2 vuruşta bitirdi, sıra bizde.
+  snap.gameCatalog.push({ id: 'golf', name: 'Mini golf', description: '2–6 kişilik, 6 delikli mini golf. Sırayla vurulur; duvar, kum, su ve engeller var. En az vuruşla bitiren kazanır.', minPlayers: 2, maxPlayers: 6, seats: [] });
+  const golfHoles = JSON.parse('[{"blocks":[],"bounds":[[80,150],[720,150],[720,350],[80,350]],"cup":[650,250],"name":"Isınma","par":2,"posts":[],"sand":[],"tee":[150,250],"water":[]},{"blocks":[[[385,80],[415,80],[415,320],[385,320]]],"bounds":[[60,80],[740,80],[740,420],[60,420]],"cup":[640,160],"name":"Duvar","par":3,"posts":[],"sand":[],"tee":[160,160],"water":[]},{"blocks":[],"bounds":[[60,60],[360,60],[360,290],[740,290],[740,440],[60,440]],"cup":[660,365],"name":"Dönemeç","par":3,"posts":[],"sand":[[430,380,120,60]],"tee":[200,130],"water":[]},{"blocks":[],"bounds":[[60,90],[740,90],[740,410],[60,410]],"cup":[670,190],"name":"Göl","par":3,"posts":[],"sand":[[330,350,140,60]],"tee":[130,250],"water":[[330,90,140,200]]},{"blocks":[],"bounds":[[60,70],[740,70],[740,430],[60,430]],"cup":[690,250],"name":"Direkler","par":3,"posts":[[300,180,22],[300,320,22],[450,250,28],[590,165,20],[590,335,20]],"sand":[],"tee":[120,250],"water":[]},{"blocks":[[[230,60],[260,60],[260,330],[230,330]],[[480,170],[510,170],[510,440],[480,440]]],"bounds":[[60,60],[740,60],[740,440],[60,440]],"cup":[650,380],"name":"Zikzak","par":4,"posts":[],"sand":[[560,60,180,60]],"tee":[140,120],"water":[]}]');
+  const golfPlayers = [{ fingerprint: fp1, name: 'Ahmet' }, { fingerprint: me, name: 'Nur' }, { fingerprint: fp2, name: 'Elif (Tasarım)' }];
+  snap.games.unshift(gameMock({ id: 'gm3', game: 'golf', title: 'Mini golf', host: me, hostName: 'Nur', isHost: true, players: golfPlayers,
+    joined: golfPlayers.map((p) => p.fingerprint), status: 'active', mySeat: 1, turn: 1, myTurn: true, needsMe: true,
+    moves: ['a0p55', 'a3550p50', 'a50p45', 'a0p20'], createdAt: now - 10 * 60e3, updatedAt: now - 20e3,
+    info: { width: 800, height: 500, ballR: 7, cupR: 11, maxStrokes: 8, holes: golfHoles, hole: 0, quit: [false, false, false],
+      balls: [{ x: 650, y: 250, strokes: 2, done: true }, { x: 534.6, y: 216.4, strokes: 1, done: false }, { x: 475.8, y: 278.5, strokes: 1, done: false }],
+      scores: [[], [], []], totals: [0, 0, 0],
+      lastShot: { seat: 0, hole: 0, result: 'in', strokes: 2, end: [650, 250], path: [[597.7, 250], [610, 250], [622, 250], [632.5, 250], [650, 250]] } } }));
+  // Önizleme: vuruş düz bir çizgide, güce göre yol alır (gerçek fizik arka uçtadır).
+  const golfMockShot = (g, seat, mv) => {
+    const [, a, p] = mv.match(/^a(\d+)p(\d+)$/).map(Number);
+    const b = g.info.balls[seat];
+    const ang = (a / 10) * Math.PI / 180;
+    const dist = p * 6;
+    const steps = Math.max(2, Math.round(p / 3));
+    const path = Array.from({ length: steps }, (_, i) => {
+      const t = 1 - (1 - i / (steps - 1)) ** 2;
+      return [Math.max(90, Math.min(710, b.x + Math.cos(ang) * dist * t)), Math.max(160, Math.min(340, b.y + Math.sin(ang) * dist * t))];
+    });
+    const [x, y] = path.at(-1);
+    const holed = Math.hypot(x - 650, y - 250) < 14;
+    Object.assign(b, { x: holed ? 650 : x, y: holed ? 250 : y, strokes: b.strokes + 1, done: holed });
+    g.moves = [...g.moves, mv];
+    g.info.lastShot = { seat, hole: 0, result: holed ? 'in' : 'stop', strokes: b.strokes, end: [b.x, b.y], path };
+    const next = [1, 2, 0].map((k) => (seat + k) % 3).find((s) => !g.info.balls[s].done);
+    Object.assign(g, { turn: next ?? null, myTurn: next === g.mySeat, needsMe: next === g.mySeat, updatedAt: Date.now() });
+  };
   const fenPlacement = (b) => [7, 6, 5, 4, 3, 2, 1, 0].map((r) => b.slice(r * 8, r * 8 + 8)
     .reduce((s, p) => (p ? s + p : s.replace(/(\d?)$/, (d) => String(Number(d || 0) + 1))), '')).join('/');
   const gameAct = (g, a) => {
     const opp = g.players.find((p) => p.fingerprint !== me).fingerprint;
     const end = (result) => Object.assign(g, { status: 'finished', result, drawOffer: null, myTurn: false, needsMe: false, legal: [], turn: null });
+    if (a.kind === 'move' && g.game === 'golf') {
+      golfMockShot(g, g.mySeat, a.mv);
+      // Diğer oyuncular da sırayla vurur.
+      const others = () => {
+        if (g.turn == null || g.turn === g.mySeat) return;
+        golfMockShot(g, g.turn, `a${[3400, 100, 0, 3550][Math.floor(Math.random() * 4)]}p${30 + Math.floor(Math.random() * 30)}`);
+        emit('games', structuredClone(snap.games));
+        setTimeout(others, 1800);
+      };
+      setTimeout(others, 1800);
+      return;
+    }
     if (a.kind === 'move') {
       if (!g.legal.includes(a.mv)) throw 'Kurallara aykırı hamle';
       Object.assign(g, { pending: true, myTurn: false, needsMe: false, legal: [] });
@@ -4070,9 +5763,42 @@ function createPreviewApi() {
     : { current: '1.2.0', ready: null, serving: null };
   snap.peers[0].version = '1.2.0';
   snap.peers[1].version = '1.1.0';
+  snap.peers[0].status = 'focus';
+  snap.peers[2].status = 'busy';
+  // Sanal ofis önizlemesi: çizimdeki gibi alt sağ köşe bizim; Mehmet çevrimdışı ama koltuğu biliniyor.
+  snap.settings.seat = 7;
+  snap.peers[0].seat = 2;
+  snap.peers[1].seat = 5;
+  try {
+    localStorage.setItem('ff.office.known', JSON.stringify({ [fpM]: { name: 'Mehmet (İzinde)', seat: 3, at: Date.now() } }));
+  } catch { /* önizleme */ }
   const emit = (ev, payload) => (listeners[ev] || []).forEach((cb) => cb({ payload }));
   // Önizlemede olay tetiklemek için: __preview.emit('peers', [...])
   window.__preview = { emit, snap };
+  // Sanal ofis gösterimi: mesajlar, yazıyor, dosya aktarımı ve oyun sırayla oynatılır.
+  window.officeDemo = function officeDemo() {
+    const p = snap.peers;
+    const at = (ms, f) => setTimeout(f, ms);
+    const msg = (from, text, key = from.fingerprint) => emit('chat', { fingerprint: key, name: from.name, unread: 1, incoming: true,
+      message: { id: `d${Math.random()}`, outgoing: false, text, at: Date.now(), status: 'received', sender: key.startsWith('g:') ? from.fingerprint : undefined, senderName: key.startsWith('g:') ? from.name : undefined } });
+    at(300, () => emit('typing', { key: p[1].fingerprint, fingerprint: p[1].fingerprint, name: p[1].name }));
+    at(2200, () => msg(p[1], 'Logo hazır mı?'));
+    at(3500, () => emit('chat', { fingerprint: p[0].fingerprint, name: p[0].name, unread: 0, incoming: false, message: { id: `o${Date.now()}`, outgoing: true, text: 'Geliyorum', at: Date.now(), status: 'sent' } }));
+    const tr = { id: 'demo-t', direction: 'send', peerId: p[1].id, peerName: p[1].name, title: 'Sunum_Final.pptx', fileCount: 1, total: 240e6, done: 0, speed: 0, status: 'waiting', createdAt: Date.now() };
+    at(4500, () => emit('transfer', { ...tr }));
+    let done = 0;
+    at(6000, () => {
+      const iv = setInterval(() => {
+        done = Math.min(tr.total, done + 9e6);
+        emit('transfer', { ...tr, status: done >= tr.total ? 'done' : 'active', done, speed: 90e6, finishedAt: done >= tr.total ? Date.now() : undefined });
+        if (done >= tr.total) clearInterval(iv);
+      }, 250);
+    });
+    at(7000, () => emit('chat', { fingerprint: 'g:grp-1', name: 'Proje Ekibi', unread: 1, incoming: true, message: { id: `dg${Date.now()}`, outgoing: false, text: 'Toplantı 15:00', at: Date.now(), status: 'received', sender: p[0].fingerprint, senderName: p[0].name } }));
+    const tr2 = { id: 'demo-r', direction: 'receive', peerId: p[2].id, peerName: p[2].name, title: 'render_v2.mp4', fileCount: 1, total: 1.2e9, done: 0.3e9, speed: 110e6, status: 'active', createdAt: Date.now() };
+    at(8000, () => emit('transfer', tr2));
+    at(9000, () => { snap.games[0].status = 'active'; emit('games', structuredClone(snap.games)); });
+  };
   setTimeout(() => {
     if (location.hash.includes('chat')) document.querySelector('.peer[data-id="p2"] [data-act="chat"]')?.click();
     if (location.hash.includes('group')) openChat(gkey);
@@ -4083,7 +5809,13 @@ function createPreviewApi() {
     if (location.hash.includes('game-play')) openRoom('gm1');
     if (location.hash.includes('game-invite')) openRoom('gm2');
     if (location.hash.includes('game-over')) openRoom('gm0');
+    if (location.hash.includes('game-golf')) openRoom('gm3');
     if (location.hash.includes('game-new')) showGameCreate();
+    if (location.hash.includes('palette')) openPalette();
+    if (location.hash.includes('phone')) openPhone();
+    if (location.hash.includes('shot')) startShot(null);
+    if (location.hash.includes('screen')) { emit('screen-offer', { session: 'v1', fingerprint: fp2, name: 'Elif (Tasarım)' }); }
+    if (location.hash.includes('office')) openOffice().then(() => { if (location.hash.includes('office-demo')) officeDemo(); });
     if (location.hash.includes('batch')) {
       showBatch(['C:\\Projeler\\Sunum_v4.pptx', 'C:\\Projeler\\Marka Kiti', 'D:\\Render\\final_cut.mp4'], ['p1', 'p2']);
     }
@@ -4174,7 +5906,11 @@ function createPreviewApi() {
         const others = args.players.map((f) => ({ fingerprint: f, name: snap.peers.find((p) => p.fingerprint === f)?.name || 'Kişi' }));
         const seat = args.seat ?? Math.round(Math.random());
         const players = seat === 0 ? [{ fingerprint: me, name: 'Nur' }, ...others] : [...others, { fingerprint: me, name: 'Nur' }];
-        const g = gameMock({ id: `gm${Date.now()}`, host: me, hostName: 'Nur', isHost: true, players, joined: [me], status: 'invited', mySeat: seat, createdAt: Date.now(), updatedAt: Date.now() });
+        const golf = args.game === 'golf';
+        const tee = golfHoles[0].tee;
+        const g = gameMock({ id: `gm${Date.now()}`, host: me, hostName: 'Nur', isHost: true, players, joined: [me], status: 'invited', mySeat: seat, createdAt: Date.now(), updatedAt: Date.now(),
+          ...(golf ? { game: 'golf', title: 'Mini golf', info: { width: 800, height: 500, ballR: 7, cupR: 11, maxStrokes: 8, holes: golfHoles, hole: 0, quit: players.map(() => false),
+            balls: players.map(() => ({ x: tee[0], y: tee[1], strokes: 0, done: false })), scores: players.map(() => []), totals: players.map(() => 0), lastShot: null } } : {}) });
         snap.games.unshift(g);
         setTimeout(() => emit('games', structuredClone(snap.games)), 40);
         return structuredClone(g);
@@ -4238,10 +5974,90 @@ function createPreviewApi() {
       if (cmd === 'take_pending_send') return location.hash.includes('sendto') ? ['C:\\Projeler\\Teklif.docx', 'C:\\Projeler\\Görseller'] : [];
       if (cmd === 'group_send_files') return null;
       if (cmd === 'send_clipboard') return { kind: 'image', count: args.peerIds.length };
+      if (cmd === 'set_status') {
+        snap.settings.status = args.status;
+        snap.device.status = args.status;
+        setTimeout(() => emit('my-status', { status: args.status, auto: false }), 20);
+        return structuredClone(snap.settings);
+      }
+      if (['chat_react', 'chat_edit', 'chat_delete'].includes(cmd)) {
+        const m = (history[args.key] || []).find((x) => x.id === args.id);
+        if (!m) throw 'Mesaj bulunamadı';
+        if (cmd === 'chat_react') {
+          m.reactions = (m.reactions || []).filter((r) => r.fp !== me);
+          if (args.emoji) m.reactions.push({ fp: me, emoji: args.emoji });
+        }
+        if (cmd === 'chat_edit') Object.assign(m, { text: args.text, edited: true });
+        if (cmd === 'chat_delete') Object.assign(m, { text: '', deleted: true, reactions: [] });
+        const conv = snap.conversations.find((c) => c.fingerprint === args.key);
+        setTimeout(() => emit('chat', { fingerprint: args.key, name: conv?.name || '', unread: 0, incoming: false, message: structuredClone(m) }), 20);
+        return structuredClone(m);
+      }
+      if (cmd === 'chat_nudge') return null;
+      if (cmd === 'chat_queue_files') {
+        const name = args.paths[0].split(/[\\/]/).pop();
+        const msg = { id: `q${Date.now()}`, outgoing: true, text: `📎 ${name}`, at: Date.now(), status: 'sending', pending: [args.fingerprint], recipients: 1,
+          file: { title: name, count: 1, total: 1.2e6, transfers: [], sources: args.paths } };
+        (history[args.fingerprint] ||= []).push(msg);
+        setTimeout(() => emit('chat', { fingerprint: args.fingerprint, name: args.name, unread: 0, incoming: false, message: msg }), 20);
+        return null;
+      }
+      if (cmd === 'phone_start') {
+        const cells = Array.from({ length: 21 * 21 }, (_, i) => ((i * 7919) % 11 < 5 ? `<rect x="${i % 21}" y="${Math.floor(i / 21)}" width="1" height="1"/>` : '')).join('');
+        return { url: 'http://192.168.1.107:51234/p/3f9c2a7be1d04c6a9b0e5d7f12ab34cd', offered: [],
+          svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="-2 -2 25 25" width="240" height="240"><rect x="-2" y="-2" width="25" height="25" fill="#fff"/><g fill="#000">${cells}</g></svg>` };
+      }
+      if (cmd === 'phone_offer') return { offered: args.paths.map((p, i) => ({ i, name: p.split(/[\\/]/).pop(), size: 2.4e6 })), skipped: 0 };
+      if (cmd === 'phone_unoffer') return { offered: [] };
+      if (cmd === 'screen_share_start') {
+        setTimeout(() => emit('screen-sharing', { active: true, session: 's1', viewers: [], invited: 1 }), 50);
+        setTimeout(() => emit('screen-sharing', { active: true, session: 's1', viewers: ['Elif (Tasarım)'], invited: 1 }), 1500);
+        return 's1';
+      }
+      if (cmd === 'screen_share_stop') { setTimeout(() => emit('screen-sharing', { active: false }), 20); return null; }
+      if (cmd === 'screen_clip') {
+        const c = document.createElement('canvas');
+        c.width = 1200; c.height = 700;
+        const x = c.getContext('2d');
+        x.fillStyle = '#f4f5fa'; x.fillRect(0, 0, 1200, 700);
+        x.fillStyle = '#5b55f6'; x.fillRect(0, 0, 1200, 64);
+        x.fillStyle = '#fff'; x.font = 'bold 28px sans-serif'; x.fillText('Örnek ekran görüntüsü', 24, 42);
+        x.fillStyle = '#171a2b'; x.font = '22px sans-serif';
+        ['Satış raporu — Kasım', 'Toplam: 1.284.500 ₺', 'Hedef: %92'].forEach((t, i) => x.fillText(t, 40, 140 + i * 48));
+        const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+        return blob.arrayBuffer();
+      }
+      if (['screen_clip_cancel', 'screen_watch_stop', 'screen_dismiss', 'phone_stop', 'show_window'].includes(cmd)) return null;
+      if (cmd === 'update_settings') {
+        if ('seat' in args) snap.settings.seat = args.seat;
+        return structuredClone(snap.settings);
+      }
       return snap.settings;
     },
     listen: async (ev, cb) => { (listeners[ev] ||= []).push(cb); },
+    invokeRaw: async (cmd, body, headers) => { console.log('[önizleme]', cmd, body.length, 'bayt', headers); return null; },
     onDragDrop: () => {},
     pick: async () => null,
   };
+}
+
+// Önizleme: sahte ekran kareleri.
+function previewScreen(session) {
+  const c = document.createElement('canvas');
+  c.width = 1280; c.height = 720;
+  const x = c.getContext('2d');
+  $('#sv-info').textContent = '1280 × 720';
+  const tick = async () => {
+    if (screenState.watching?.session !== session) return;
+    const t = Date.now() / 1000;
+    x.fillStyle = '#1e1f2e'; x.fillRect(0, 0, 1280, 720);
+    x.fillStyle = '#2b2d42'; x.fillRect(0, 0, 1280, 44);
+    x.fillStyle = '#fff'; x.font = '20px sans-serif'; x.fillText('Figma — Ana sayfa tasarımı', 20, 29);
+    for (let i = 0; i < 6; i++) { x.fillStyle = `hsl(${(i * 50 + t * 20) % 360} 60% 55%)`; x.fillRect(80 + i * 190, 160 + Math.sin(t + i) * 30, 160, 260); }
+    x.fillStyle = '#fff'; x.beginPath(); x.arc(640 + Math.cos(t) * 300, 560, 10, 0, 7); x.fill();
+    const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.7));
+    showFrame(await blob.arrayBuffer());
+    setTimeout(tick, 150);
+  };
+  setTimeout(tick, 400);
 }

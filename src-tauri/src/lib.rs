@@ -44,7 +44,12 @@ struct Snapshot {
 }
 
 #[tauri::command]
-fn get_snapshot(node: NodeState) -> Snapshot {
+// async: ana iş parçacığında (pencere) çalışmasın; liste hesaplanırken arayüz donmasın.
+async fn get_snapshot(node: NodeState<'_>) -> Result<Snapshot, String> {
+    Ok(snapshot_of(&node))
+}
+
+fn snapshot_of(node: &Node) -> Snapshot {
     Snapshot {
         device: node.device_info(),
         ips: discovery::local_ips(),
@@ -63,6 +68,7 @@ fn get_snapshot(node: NodeState) -> Snapshot {
 
 #[tauri::command]
 fn update_settings(
+    app: AppHandle,
     node: NodeState,
     device_name: Option<String>,
     download_dir: Option<String>,
@@ -74,6 +80,8 @@ fn update_settings(
     theme: Option<String>,
     appearance: Option<String>,
     lock_minutes: Option<u32>,
+    seat: Option<u8>,
+    hotkeys: Option<bool>,
 ) -> Result<Settings, String> {
     if let Some(name) = &device_name {
         if name.trim().is_empty() {
@@ -110,6 +118,13 @@ fn update_settings(
         }
         if let Some(v) = lock_minutes {
             s.lock_minutes = v.min(24 * 60);
+        }
+        if let Some(v) = seat {
+            s.seat = if v > protocol::MAX_SEAT { 0 } else { v };
+        }
+        if let Some(v) = hotkeys {
+            s.hotkeys = v;
+            apply_hotkeys(&app, v);
         }
         if let Some(v) = shell_menu {
             s.shell_menu = v;
@@ -160,6 +175,195 @@ fn forget_pin(lock: LockState, node: NodeState) -> applock::LockState {
 async fn send_typing(node: NodeState<'_>, key: String) -> Result<(), String> {
     node.inner().send_typing(&key);
     Ok(())
+}
+
+// ───────────────────────────── Durum ve sohbet olayları ─────────────────────────────
+// Arka planda görev başlatanlar `async`: Tokio çalışma ortamında çalışmaları gerekir.
+
+#[tauri::command]
+fn set_status(node: NodeState, status: String) -> Result<Settings, String> {
+    node.set_status(&status)
+}
+
+#[tauri::command]
+async fn chat_react(node: NodeState<'_>, key: String, id: String, emoji: String) -> Result<ChatMessage, String> {
+    node.inner().chat_react(&key, &id, &emoji)
+}
+
+#[tauri::command]
+async fn chat_edit(node: NodeState<'_>, key: String, id: String, text: String) -> Result<ChatMessage, String> {
+    node.inner().chat_edit(&key, &id, &text)
+}
+
+#[tauri::command]
+async fn chat_delete(node: NodeState<'_>, key: String, id: String) -> Result<ChatMessage, String> {
+    node.inner().chat_delete(&key, &id)
+}
+
+#[tauri::command]
+async fn chat_nudge(node: NodeState<'_>, fingerprint: String) -> Result<(), String> {
+    node.inner().chat_nudge(&fingerprint)
+}
+
+/// Çevrimdışı kişiye dosya bırakır (çevrimiçi olunca gider).
+#[tauri::command]
+async fn chat_queue_files(node: NodeState<'_>, fingerprint: String, name: String, paths: Vec<String>) -> Result<(), String> {
+    node.inner().chat_queue_files(&fingerprint, &name, paths).await
+}
+
+// ───────────────────────────── Ekran görüntüsü ─────────────────────────────
+
+/// Ekran alıntısı aracını açar; seçilen alanı PNG olarak döndürür ve pencereyi öne getirir.
+#[tauri::command]
+async fn screen_clip(app: AppHandle, node: NodeState<'_>) -> Result<tauri::ipc::Response, String> {
+    let png = node.inner().screen_clip().await;
+    show_main(&app);
+    Ok(tauri::ipc::Response::new(png?))
+}
+
+#[tauri::command]
+fn screen_clip_cancel(node: NodeState) {
+    node.screen_clip_cancel();
+}
+
+/// Üzerine çizilmiş resmi gönderir. Gövde ham PNG; hedef başlıklarda:
+/// `x-key` (sohbet anahtarı) ya da `x-peers` (virgülle ayrılmış cihaz kimlikleri), `x-stamp`.
+#[tauri::command]
+async fn send_png(node: NodeState<'_>, request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let tauri::ipc::InvokeBody::Raw(data) = request.body() else {
+        return Err("Resim verisi yok".into());
+    };
+    let header = |k: &str| request.headers().get(k).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let key = header("x-key");
+    let peers: Vec<String> = header("x-peers").split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
+    let stamp = header("x-stamp");
+    node.inner().send_png(data, (!key.is_empty()).then_some(key.as_str()), &peers, &stamp).await
+}
+
+// ───────────────────────────── Ekran paylaşımı ─────────────────────────────
+
+#[tauri::command]
+async fn screen_share_start(node: NodeState<'_>, key: String) -> Result<String, String> {
+    node.inner().screen_share_start(&key)
+}
+
+#[tauri::command]
+async fn screen_share_stop(node: NodeState<'_>) -> Result<(), String> {
+    node.inner().screen_share_stop();
+    Ok(())
+}
+
+/// Paylaşımı izler: kareler (JPEG) kanaldan ham bayt olarak gelir; ilk mesaj boyutlardır.
+/// Paylaşım bitince ya da izleme durdurulunca döner.
+#[tauri::command]
+async fn screen_watch(
+    node: NodeState<'_>,
+    session: String,
+    on_frame: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+) -> Result<(), String> {
+    let start_channel = on_frame.clone();
+    node.inner()
+        .screen_watch(
+            &session,
+            move |w, h| {
+                let _ = start_channel.send(tauri::ipc::InvokeResponseBody::Json(format!("{{\"width\":{w},\"height\":{h}}}")));
+            },
+            move |jpeg| on_frame.send(tauri::ipc::InvokeResponseBody::Raw(jpeg)).is_ok(),
+        )
+        .await
+}
+
+#[tauri::command]
+fn screen_watch_stop(node: NodeState, session: String) {
+    node.screen_watch_stop(&session);
+}
+
+#[tauri::command]
+fn screen_dismiss(node: NodeState, session: String) {
+    node.screen_dismiss(&session);
+}
+
+// ───────────────────────────── Telefon ─────────────────────────────
+
+#[tauri::command]
+async fn phone_start(node: NodeState<'_>) -> Result<serde_json::Value, String> {
+    node.inner().phone_start().await
+}
+
+#[tauri::command]
+fn phone_stop(node: NodeState) {
+    node.phone_stop();
+}
+
+#[tauri::command]
+fn phone_offer(node: NodeState, paths: Vec<String>) -> Result<serde_json::Value, String> {
+    node.phone_offer(paths)
+}
+
+#[tauri::command]
+fn phone_unoffer(node: NodeState, index: usize) -> serde_json::Value {
+    node.phone_unoffer(index)
+}
+
+/// Pencereyi öne getirir (kısayolla açılan hızlı gönderim için).
+#[tauri::command]
+fn show_window(app: AppHandle) {
+    show_main(&app);
+}
+
+/// Pencereyi kısa süre sağa sola sallar (dürtme).
+fn shake_window(app: &AppHandle) {
+    let Some(w) = app.get_webview_window("main") else { return };
+    if w.is_maximized().unwrap_or(false) || w.is_fullscreen().unwrap_or(false) {
+        return;
+    }
+    let Ok(pos) = w.outer_position() else { return };
+    std::thread::spawn(move || {
+        for (i, dx) in [14, -14, 11, -11, 8, -8, 4, -4, 0].iter().enumerate() {
+            let dy = if i % 2 == 0 { 3 } else { -3 };
+            let _ = w.set_position(tauri::PhysicalPosition::new(pos.x + dx, pos.y + if *dx == 0 { 0 } else { dy }));
+            std::thread::sleep(Duration::from_millis(38));
+        }
+        let _ = w.set_position(pos);
+    });
+}
+
+fn quick_send_shortcut() -> tauri_plugin_global_shortcut::Shortcut {
+    use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
+    Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space)
+}
+
+fn quick_shot_shortcut() -> tauri_plugin_global_shortcut::Shortcut {
+    use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
+    Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::PrintScreen)
+}
+
+/// Genel kısayolları kaydeder ya da kaldırır. Başka bir program aynı kısayolu tutuyorsa
+/// (ör. aynı bilgisayarda ikinci FastFiles) sessizce atlanır.
+fn apply_hotkeys(app: &AppHandle, on: bool) {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    let gs = app.global_shortcut();
+    for sc in [quick_send_shortcut(), quick_shot_shortcut()] {
+        let result = if on {
+            if gs.is_registered(sc) {
+                Ok(())
+            } else {
+                gs.register(sc)
+            }
+        } else if gs.is_registered(sc) {
+            gs.unregister(sc)
+        } else {
+            Ok(())
+        };
+        if let Err(e) = result {
+            eprintln!("[fastfiles] kısayol {sc:?}: {e}");
+        }
+    }
+}
+
+/// "Odakta" durumunda mı? (Bildirimler susar.)
+fn do_not_disturb(app: &AppHandle) -> bool {
+    app.try_state::<Arc<Node>>().is_some_and(|n| n.do_not_disturb())
 }
 
 // ───────────────────────────── Gezgin'den gönderme ─────────────────────────────
@@ -227,8 +431,8 @@ fn chat_history(node: NodeState, fingerprint: String) -> Vec<ChatMessage> {
 }
 
 #[tauri::command]
-async fn chat_send(node: NodeState<'_>, peer_id: String, text: String) -> Result<ChatMessage, String> {
-    node.inner().chat_send(&peer_id, &text)
+async fn chat_send(node: NodeState<'_>, peer_id: String, text: String, reply_to: Option<String>) -> Result<ChatMessage, String> {
+    node.inner().chat_send(&peer_id, &text, reply_to.as_deref())
 }
 
 #[tauri::command]
@@ -393,8 +597,8 @@ async fn group_leave(node: NodeState<'_>, key: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn group_send(node: NodeState<'_>, key: String, text: String) -> Result<ChatMessage, String> {
-    node.inner().group_send(&key, &text)
+async fn group_send(node: NodeState<'_>, key: String, text: String, reply_to: Option<String>) -> Result<ChatMessage, String> {
+    node.inner().group_send(&key, &text, reply_to.as_deref())
 }
 
 #[tauri::command]
@@ -522,6 +726,38 @@ fn open_path(node: NodeState, path: String) -> Result<(), String> {
     let cmd = "xdg-open";
     std::process::Command::new(cmd).arg(&path).spawn().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Sohbetteki bağlantıyı varsayılan tarayıcıda açar. Yalnızca http(s) adresleri; `www.` ile
+/// başlayanlara `https://` eklenir. Boşluk, tırnak ve kontrol karakteri içeren adres reddedilir
+/// (komut satırına başka bir şey karışmasın).
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    let url = safe_url(&url).ok_or("Bu bağlantı açılamıyor")?;
+    #[cfg(target_os = "windows")]
+    std::process::Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", &url]).spawn().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open").arg(&url).spawn().map_err(|e| e.to_string())?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    std::process::Command::new("xdg-open").arg(&url).spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn safe_url(raw: &str) -> Option<String> {
+    let url = raw.trim();
+    let lower = url.to_ascii_lowercase();
+    let url = if lower.starts_with("http://") || lower.starts_with("https://") {
+        url.to_string()
+    } else if lower.starts_with("www.") {
+        format!("https://{url}")
+    } else {
+        return None;
+    };
+    let host = url.split_once("://")?.1.split(['/', '?', '#']).next().unwrap_or("");
+    let ok = url.len() <= 2048
+        && !host.is_empty()
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '<' | '>' | '`' | '^' | '|' | '\\'));
+    ok.then_some(url)
 }
 
 fn show_main(app: &AppHandle) {
@@ -741,6 +977,23 @@ pub fn run() {
     let app = builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    use tauri_plugin_global_shortcut::ShortcutState;
+                    if event.state() != ShortcutState::Pressed {
+                        return;
+                    }
+                    if *shortcut == quick_send_shortcut() {
+                        show_main(app);
+                        let _ = app.emit("quick-send", ());
+                    } else if *shortcut == quick_shot_shortcut() {
+                        // Pencere öne gelmez: ekran görüntüsünde görünmesin. Arayüz alıntıyı başlatır.
+                        let _ = app.emit("quick-shot", ());
+                    }
+                })
+                .build(),
+        )
         .setup(|app| {
             let handle = app.handle().clone();
 
@@ -778,8 +1031,8 @@ pub fn run() {
                             let _ = w.request_user_attention(Some(tauri::UserAttentionType::Critical));
                         }
                     }
-                    // Gelen mesaj
-                    "chat" if payload["incoming"] == true => {
+                    // Gelen mesaj ("Odakta" iken yalnızca adımın geçtiği grup mesajları bildirilir)
+                    "chat" if payload["incoming"] == true && (payload["mention"] == true || !do_not_disturb(&emit_handle)) => {
                         let name = payload["name"].as_str().unwrap_or("FastFiles");
                         let text: String = payload["message"]["text"].as_str().unwrap_or("").chars().take(140).collect();
                         // Grup mesajında gönderenin adı da görünsün.
@@ -790,8 +1043,34 @@ pub fn run() {
                         let key = payload["fingerprint"].clone();
                         notify_background(&emit_handle, name, &body, serde_json::json!({ "view": "chat", "key": key }));
                     }
-                    // Dosya alımı başladı (güvenilir cihaz) / bitti / başarısız
-                    "notify" => {
+                    // Dürtme: pencere titrer (odaktayken yalnızca sohbete not düşer)
+                    "nudge" if !do_not_disturb(&emit_handle) => {
+                        let name = payload["name"].as_str().unwrap_or("Biri");
+                        if let Some(w) = emit_handle.get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.unminimize();
+                            let _ = w.request_user_attention(Some(tauri::UserAttentionType::Critical));
+                        }
+                        shake_window(&emit_handle);
+                        notify_background(
+                            &emit_handle,
+                            &format!("👋 {name} sizi dürttü"),
+                            "Yanıtlamak için tıklayın",
+                            serde_json::json!({ "view": "chat", "key": payload["fingerprint"] }),
+                        );
+                    }
+                    // Ekran paylaşımı daveti
+                    "screen-offer" if !do_not_disturb(&emit_handle) => {
+                        let name = payload["name"].as_str().unwrap_or("Biri");
+                        notify_background(
+                            &emit_handle,
+                            &format!("{name} ekranını paylaşıyor"),
+                            "İzlemek için tıklayın",
+                            serde_json::json!({ "view": "screen", "session": payload["session"] }),
+                        );
+                    }
+                    // Dosya alımı başladı (güvenilir cihaz) / bitti / başarısız ("Odakta" iken sessiz)
+                    "notify" if !do_not_disturb(&emit_handle) => {
                         notify_background(
                             &emit_handle,
                             payload["title"].as_str().unwrap_or("FastFiles"),
@@ -830,6 +1109,9 @@ pub fn run() {
                         let _ = h.emit("updated", serde_json::json!({ "from": previous, "to": update::CURRENT_VERSION }));
                     });
                 }
+            }
+            if node.settings().hotkeys {
+                apply_hotkeys(&handle, true);
             }
             // Gezgin menüsü ayara göre eklenir/kaldırılır (kayıt defteri; arayüzü bekletmesin).
             let shell_menu = node.settings().shell_menu;
@@ -947,6 +1229,26 @@ pub fn run() {
             postpone_update,
             reveal_path,
             open_path,
+            open_url,
+            set_status,
+            chat_react,
+            chat_edit,
+            chat_delete,
+            chat_nudge,
+            chat_queue_files,
+            screen_clip,
+            screen_clip_cancel,
+            send_png,
+            screen_share_start,
+            screen_share_stop,
+            screen_watch,
+            screen_watch_stop,
+            screen_dismiss,
+            phone_start,
+            phone_stop,
+            phone_offer,
+            phone_unoffer,
+            show_window,
         ])
         .build(tauri::generate_context!())
         .expect("FastFiles başlatılamadı");
@@ -958,4 +1260,19 @@ pub fn run() {
             discovery::send_bye(&node);
         }
     });
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::safe_url;
+
+    #[test]
+    fn only_plain_web_links_open() {
+        assert_eq!(safe_url("https://twinup.io/a?b=1&c=2#x").as_deref(), Some("https://twinup.io/a?b=1&c=2#x"));
+        assert_eq!(safe_url("www.example.com/yol").as_deref(), Some("https://www.example.com/yol"));
+        assert_eq!(safe_url("HTTP://Example.com").as_deref(), Some("HTTP://Example.com"));
+        for bad in ["file:///C:/Windows/system32/calc.exe", "javascript:alert(1)", "ms-settings:", "https://", "https://a.com/\" & calc", "https://a.com/x y", r"\\server\share", "https://a.com\\..\\x", "https://a.com/|calc"] {
+            assert_eq!(safe_url(bad), None, "{bad}");
+        }
+    }
 }

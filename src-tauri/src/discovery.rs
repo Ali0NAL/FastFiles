@@ -176,6 +176,7 @@ pub async fn run(node: Arc<Node>) {
         node.flush_polls();
         node.flush_games();
         node.check_avatars();
+        node.status_tick();
         if tick % 600 == 0 {
             node.prune_resume();
         }

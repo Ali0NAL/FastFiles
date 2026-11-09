@@ -13,6 +13,12 @@ pub mod share;
 pub mod poll;
 #[path = "game.rs"]
 pub mod game;
+#[path = "extras.rs"]
+pub mod extras;
+#[path = "screen.rs"]
+pub mod screen;
+#[path = "phone.rs"]
+pub mod phone;
 
 use crate::chat::{ChatMessage, ChatStore, ConversationSummary, FileRef, FileTransferRef, MsgStatus};
 use crate::config::{fingerprint, Identity, Settings, TrustedDevice};
@@ -75,6 +81,10 @@ pub struct Peer {
     pub pkg: String,
     /// Karşı cihazın profil resmi özeti (yoksa boş).
     pub avatar: String,
+    /// Sanal ofiste seçtiği koltuk (0 = seçmedi).
+    pub seat: u8,
+    /// Durum: "" | "busy" | "focus" | "away".
+    pub status: String,
     #[serde(skip)]
     last_seen: Option<Instant>,
     /// Cihazın son görüldüğü tüm adresler (Wi-Fi + ethernet + VPN gibi birden fazla olabilir).
@@ -267,6 +277,10 @@ pub struct Node {
     polls_path: PathBuf,
     games: Mutex<HashMap<String, game::RoomState>>,
     games_path: PathBuf,
+    /// Cihaz başına (parmak izi) son başarılı bağlantı adresi: sonraki bağlantılar önce onu dener.
+    good_addr: Mutex<HashMap<String, SocketAddr>>,
+    /// Durum, sohbet olayları, ekran paylaşımı ve telefon bağlantısı.
+    pub extras: extras::State,
     pub shutdown: CancellationToken,
 }
 
@@ -347,6 +361,8 @@ impl Node {
             polls_path: config_dir.join("polls.json"),
             games: Mutex::new(HashMap::new()),
             games_path: config_dir.join("games.json"),
+            good_addr: Mutex::new(HashMap::new()),
+            extras: extras::State::default(),
             shutdown: CancellationToken::new(),
         });
         node.load_cached_package();
@@ -391,7 +407,10 @@ impl Node {
             }
         }
         let current = peer.ip.clone();
-        ips.sort_by_key(|a| std::cmp::Reverse((self.addr_score(a), a.to_string() == current)));
+        // En son başarıyla bağlanılan adres en öne: ulaşılamayan bir adres (ör. VPN ya da sanal
+        // ağ kartı) her bağlantıda yeniden denenip bekletmesin.
+        let good = self.good_addr.lock().unwrap().get(&peer.fingerprint).map(|a| a.ip());
+        ips.sort_by_key(|a| std::cmp::Reverse((Some(*a) == good, self.addr_score(a), a.to_string() == current)));
         ips.into_iter().map(|ip| SocketAddr::new(ip, peer.port)).collect()
     }
 
@@ -416,15 +435,23 @@ impl Node {
     }
 
     pub fn device_info(&self) -> DeviceInfo {
+        // Ayarlar tek seferde okunur: yapı ifadesindeki kilit geçicileri ifade bitene kadar
+        // yaşar, aynı kilidi ikinci kez almak kilitlenmeye yol açar.
+        let (name, seat) = {
+            let s = self.settings.lock().unwrap();
+            (s.device_name.clone(), s.seat)
+        };
         DeviceInfo {
             id: self.identity.id.clone(),
-            name: self.settings.lock().unwrap().device_name.clone(),
+            name,
             port: self.port(),
             fingerprint: self.identity.fingerprint.clone(),
             os: std::env::consts::OS.to_string(),
             version: CURRENT_VERSION.to_string(),
             pkg: self.update_pkg.lock().unwrap().as_ref().map(|h| h.version.clone()).unwrap_or_default(),
             avatar: self.my_avatar_hash(),
+            seat,
+            status: self.extras.status_now(),
         }
     }
 
@@ -744,6 +771,12 @@ impl Node {
         if !avatar::valid_avatar_hash(&d.avatar) {
             d.avatar.clear();
         }
+        if d.seat > crate::protocol::MAX_SEAT {
+            d.seat = 0;
+        }
+        if !valid_status(&d.status) {
+            d.status.clear();
+        }
         let now = Instant::now();
         let changed = {
             let mut peers = self.peers.lock().unwrap();
@@ -772,8 +805,12 @@ impl Node {
                         || p.fingerprint != d.fingerprint
                         || p.version != d.version
                         || p.pkg != d.pkg
-                        || p.avatar != d.avatar;
+                        || p.avatar != d.avatar
+                        || p.seat != d.seat
+                        || p.status != d.status;
                     p.avatar = d.avatar;
+                    p.seat = d.seat;
+                    p.status = d.status;
                     p.version = d.version;
                     p.pkg = d.pkg;
                     p.name = d.name;
@@ -803,6 +840,8 @@ impl Node {
                             version: d.version,
                             pkg: d.pkg,
                             avatar: d.avatar,
+                            seat: d.seat,
+                            status: d.status,
                             last_seen: Some(now),
                             addrs: vec![(ip, now)],
                         },
@@ -1183,11 +1222,11 @@ impl Node {
                 let reply = self.accept_group_update(&client_fp, group);
                 write_msg(&mut wr, &reply).await.map_err(|e| e.to_string())
             }
-            Message::GroupChat { device, group_id, id, text, sent_at } => {
+            Message::GroupChat { device, group_id, id, text, sent_at, reply: quoted } => {
                 if device.fingerprint != client_fp {
                     return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
                 }
-                let reply = match self.accept_group_chat(device, addr.ip(), &group_id, &id, &text, sent_at) {
+                let reply = match self.accept_group_chat(device, addr.ip(), &group_id, &id, &text, sent_at, quoted) {
                     Ok(()) => Message::ChatAck { id },
                     Err(reason) => Message::ChatReject { reason: reason.into() },
                 };
@@ -1200,15 +1239,43 @@ impl Node {
                 self.accept_group_leave(&client_fp, &group_id);
                 write_msg(&mut wr, &Message::GroupAck).await.map_err(|e| e.to_string())
             }
-            Message::Chat { device, id, text } => {
+            Message::Chat { device, id, text, reply: quoted } => {
                 if device.fingerprint != client_fp {
                     return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
                 }
-                let reply = match self.accept_chat(device, addr.ip(), &id, &text) {
+                let reply = match self.accept_chat(device, addr.ip(), &id, &text, quoted) {
                     Ok(()) => Message::ChatAck { id },
                     Err(reason) => Message::ChatReject { reason: reason.into() },
                 };
                 write_msg(&mut wr, &reply).await.map_err(|e| e.to_string())
+            }
+            Message::ChatEvent { device, group_id, event } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                self.accept_chat_event(&device, addr.ip(), group_id.as_deref(), event);
+                write_msg(&mut wr, &Message::GroupAck).await.map_err(|e| e.to_string())
+            }
+            Message::ScreenOffer { device, session } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                self.accept_screen_offer(&device, &session);
+                write_msg(&mut wr, &Message::GroupAck).await.map_err(|e| e.to_string())
+            }
+            Message::ScreenEnd { device, session } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                self.accept_screen_end(&device.fingerprint, &session);
+                write_msg(&mut wr, &Message::GroupAck).await.map_err(|e| e.to_string())
+            }
+            Message::ScreenWatch { device, session } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                let (_rd, wr) = (rd, wr);
+                self.serve_screen(device.fingerprint.clone(), session, wr).await
             }
             _ => Err("beklenmeyen mesaj".into()),
         }
@@ -1628,7 +1695,7 @@ impl Node {
     }
 
     /// Gelen mesajı doğrular ve kaydeder. Hata durumunda karşı tarafa gidecek ret kodu döner.
-    fn accept_chat(&self, device: DeviceInfo, ip: IpAddr, id: &str, text: &str) -> Result<(), &'static str> {
+    fn accept_chat(&self, device: DeviceInfo, ip: IpAddr, id: &str, text: &str, reply: Option<crate::chat::ReplyRef>) -> Result<(), &'static str> {
         let fp = device.fingerprint.clone();
         if self.is_blocked(&fp) {
             return Err("blocked");
@@ -1656,7 +1723,16 @@ impl Node {
         if self.chats.lock().unwrap().contains(&fp, id) {
             return Ok(());
         }
-        let msg = ChatMessage { id: id.to_string(), outgoing: false, text, at: now_ms(), status: MsgStatus::Received, error: None, ..Default::default() };
+        let msg = ChatMessage {
+            id: id.to_string(),
+            outgoing: false,
+            text,
+            at: now_ms(),
+            status: MsgStatus::Received,
+            error: None,
+            reply: reply.map(extras::clean_reply),
+            ..Default::default()
+        };
         self.store_chat(&fp, &name, msg);
         Ok(())
     }
@@ -1879,7 +1955,7 @@ impl Node {
     }
 
     /// Mesajı kaydeder ve arka planda iletir. Durum değişiklikleri "chat" olayıyla bildirilir.
-    pub fn chat_send(self: &Arc<Self>, peer_id: &str, text: &str) -> Result<ChatMessage, String> {
+    pub fn chat_send(self: &Arc<Self>, peer_id: &str, text: &str, reply_to: Option<&str>) -> Result<ChatMessage, String> {
         let peer = self.peer(peer_id).ok_or("Bu cihaz çevrimdışı, mesaj gönderilemez")?;
         if self.is_blocked(&peer.fingerprint) {
             return Err("Bu cihazı engellediniz".into());
@@ -1891,6 +1967,7 @@ impl Node {
         if text.is_empty() {
             return Err("Mesaj boş".into());
         }
+        let reply = reply_to.and_then(|id| self.reply_ref(&peer.fingerprint, id));
         let msg = ChatMessage {
             id: uuid::Uuid::new_v4().to_string(),
             outgoing: true,
@@ -1898,6 +1975,7 @@ impl Node {
             at: now_ms(),
             status: MsgStatus::Sending,
             error: None,
+            reply,
             ..Default::default()
         };
         self.store_chat(&peer.fingerprint, &peer.name, msg.clone());
@@ -1933,7 +2011,7 @@ impl Node {
 
     async fn deliver_chat(&self, peer: &Peer, msg: &ChatMessage) -> Result<(), String> {
         let mut stream = self.connect(&self.candidates(peer), Some(peer.fingerprint.clone())).await?;
-        write_msg(&mut stream, &Message::Chat { device: self.device_info(), id: msg.id.clone(), text: msg.text.clone() })
+        write_msg(&mut stream, &Message::Chat { device: self.device_info(), id: msg.id.clone(), text: msg.text.clone(), reply: msg.reply.clone() })
             .await
             .map_err(|_| "Bağlantı koptu".to_string())?;
         let reply = timeout(Duration::from_secs(8), read_msg(&mut stream))
@@ -1997,7 +2075,7 @@ impl Node {
                 let mut sent = 0;
                 let mut last_err = None;
                 for id in peer_ids {
-                    match self.chat_send(id, &text) {
+                    match self.chat_send(id, &text, None) {
                         Ok(_) => sent += 1,
                         Err(e) => last_err = Some(e),
                     }
@@ -2169,19 +2247,36 @@ impl Node {
 
     /// Adresleri sırayla dener; ilk TCP bağlantısı kurulan adres üzerinden TLS el sıkışması yapar.
     async fn connect(&self, addrs: &[SocketAddr], expected_fp: Option<String>) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
-        let per_try = if addrs.len() > 1 { Duration::from_secs(3) } else { Duration::from_secs(6) };
+        // Adresler sırayla ama beklemeden denenir: ilki 250 ms'de bağlanamazsa sıradaki de
+        // başlar, ilk başaran kazanır. Eskiden ulaşılamayan her adres 3 sn bekletiyordu.
+        let per_try = Duration::from_secs(6);
         let mut last_err = "Adres yok".to_string();
+        let mut tries = tokio::task::JoinSet::new();
+        for (i, addr) in addrs.iter().copied().enumerate() {
+            tries.spawn(async move {
+                sleep(Duration::from_millis(250 * i as u64)).await;
+                match timeout(per_try, TcpStream::connect(addr)).await {
+                    Ok(Ok(s)) => Ok((addr, s)),
+                    Ok(Err(e)) => Err(format!("Bağlanılamadı ({addr}): {e}")),
+                    Err(_) => Err(format!("Bağlantı zaman aşımına uğradı ({addr})")),
+                }
+            });
+        }
         let mut tcp = None;
-        for addr in addrs {
-            match timeout(per_try, TcpStream::connect(addr)).await {
-                Ok(Ok(s)) => {
+        while let Some(res) = tries.join_next().await {
+            match res {
+                Ok(Ok((addr, s))) => {
+                    if let Some(fp) = &expected_fp {
+                        self.good_addr.lock().unwrap().insert(fp.clone(), addr);
+                    }
                     tcp = Some(s);
                     break;
                 }
-                Ok(Err(e)) => last_err = format!("Bağlanılamadı ({addr}): {e}"),
-                Err(_) => last_err = format!("Bağlantı zaman aşımına uğradı ({addr})"),
+                Ok(Err(e)) => last_err = e,
+                Err(_) => {}
             }
         }
+        tries.abort_all();
         let tcp = tcp.ok_or(last_err)?;
         tcp.set_nodelay(true).ok();
         set_keepalive(&tcp);
@@ -3491,7 +3586,7 @@ mod tests {
         let afp = alice.identity.fingerprint.clone();
         let bfp = bob.identity.fingerprint.clone();
 
-        let sent = alice.chat_send(&bob.identity.id, "  Selam Bob!\r\nNasılsın?  ").unwrap();
+        let sent = alice.chat_send(&bob.identity.id, "  Selam Bob!\r\nNasılsın?  ", None).unwrap();
         assert_eq!(sent.text, "Selam Bob!\nNasılsın?");
         wait_until(|| last_status(&alice, &bfp) == Some(MsgStatus::Sent)).await;
 
@@ -3513,8 +3608,8 @@ mod tests {
         assert_eq!(bob2.chat_history(&afp).len(), 1);
 
         // Boş ve çok uzun mesajlar gönderilmez.
-        assert!(alice.chat_send(&bob2.identity.id, " \u{200B} ").is_err());
-        assert!(alice.chat_send(&bob2.identity.id, &"a".repeat(MAX_CHAT_CHARS + 1)).is_err());
+        assert!(alice.chat_send(&bob2.identity.id, " \u{200B} ", None).is_err());
+        assert!(alice.chat_send(&bob2.identity.id, &"a".repeat(MAX_CHAT_CHARS + 1), None).is_err());
     }
 
     #[tokio::test]
@@ -3526,18 +3621,18 @@ mod tests {
 
         // Ağdan doğrudan gelen tehlikeli karakterler temizlenir.
         assert!(bob
-            .accept_chat(alice.device_info(), IpAddr::V4(Ipv4Addr::LOCALHOST), "m1", "fatura\u{202E}fdp.exe\u{0000}")
+            .accept_chat(alice.device_info(), IpAddr::V4(Ipv4Addr::LOCALHOST), "m1", "fatura\u{202E}fdp.exe\u{0000}", None)
             .is_ok());
         assert_eq!(bob.chat_history(&afp)[0].text, "faturafdp.exe");
         // Aynı kimlikli mesaj iki kez eklenmez.
-        assert!(bob.accept_chat(alice.device_info(), IpAddr::V4(Ipv4Addr::LOCALHOST), "m1", "x").is_ok());
+        assert!(bob.accept_chat(alice.device_info(), IpAddr::V4(Ipv4Addr::LOCALHOST), "m1", "x", None).is_ok());
         assert_eq!(bob.chat_history(&afp).len(), 1);
         // Geçersiz kimlik reddedilir.
-        assert_eq!(bob.accept_chat(alice.device_info(), IpAddr::V4(Ipv4Addr::LOCALHOST), "../x", "y"), Err("invalid"));
+        assert_eq!(bob.accept_chat(alice.device_info(), IpAddr::V4(Ipv4Addr::LOCALHOST), "../x", "y", None), Err("invalid"));
 
         // Engellenen cihazın mesajı reddedilir, gönderen "başarısız" görür.
         bob.set_blocked(&afp, "alice", true);
-        alice.chat_send(&bob.identity.id, "orada mısın?").unwrap();
+        alice.chat_send(&bob.identity.id, "orada mısın?", None).unwrap();
         wait_until(|| last_status(&alice, &bfp) == Some(MsgStatus::Failed)).await;
         assert_eq!(bob.chat_history(&afp).len(), 1);
         // Engellenen cihazın dosya teklifi de reddedilir.
@@ -3605,8 +3700,8 @@ mod tests {
         assert_eq!(bob.chat_summaries()[0].name, "Proje Ekibi");
 
         // Herkes yazar, herkes alır.
-        alice.group_send(&key, "Merhaba ekip").unwrap();
-        bob.group_send(&key, "Selam!").unwrap();
+        alice.group_send(&key, "Merhaba ekip", None).unwrap();
+        bob.group_send(&key, "Selam!", None).unwrap();
         let all = [&alice, &bob, &carol];
         wait_flushing(&all, || group_texts(&carol, &key).len() == 2).await;
         wait_flushing(&all, || group_texts(&alice, &key).len() == 2).await;
@@ -3632,7 +3727,7 @@ mod tests {
 
         // Carol "çevrimdışı": Alice'in listesinden düşsün.
         alice.remove_peer(&carol_id);
-        alice.group_send(&key, "Carol yokken yazıldı").unwrap();
+        alice.group_send(&key, "Carol yokken yazıldı", None).unwrap();
         wait_flushing(&[&alice], || group_texts(&bob, &key).len() == 1).await;
         let pending = alice.chat_history(&key).into_iter().find(|m| m.outgoing).unwrap().pending;
         assert_eq!(pending, vec![carol_fp.clone()], "Carol için beklemeli");
@@ -3790,7 +3885,7 @@ mod tests {
 
         // PIN unutulunca: mesajlar gider, grup üyeliği kalır.
         bob.set_blocked(&afp, "alice", false);
-        alice.chat_send(&bob.identity.id, "gizli").unwrap();
+        alice.chat_send(&bob.identity.id, "gizli", None).unwrap();
         wait_until(|| !bob.chat_history(&afp).is_empty()).await;
         bob.wipe_private_data();
         assert!(bob.chat_history(&afp).is_empty());
@@ -3898,12 +3993,12 @@ mod tests {
         assert_eq!(bob.group_of(&key).unwrap().0.name, "Gizli");
         // Üye olmayan Mallory gruba mesaj yazamaz.
         assert_eq!(
-            bob.accept_group_chat(mallory.device_info(), IpAddr::V4(Ipv4Addr::LOCALHOST), &group.id, "m1", "selam", 0),
+            bob.accept_group_chat(mallory.device_info(), IpAddr::V4(Ipv4Addr::LOCALHOST), &group.id, "m1", "selam", 0, None),
             Err("sender_not_member")
         );
         // Bilinmeyen grup.
         assert_eq!(
-            carol.accept_group_chat(alice.device_info(), IpAddr::V4(Ipv4Addr::LOCALHOST), &group.id, "m2", "x", 0),
+            carol.accept_group_chat(alice.device_info(), IpAddr::V4(Ipv4Addr::LOCALHOST), &group.id, "m2", "x", 0, None),
             Err("unknown_group")
         );
 
@@ -3913,7 +4008,7 @@ mod tests {
             .unwrap();
         wait_until(|| carol.group_of(&key).map_or(false, |(g, _)| g.name == "Yeni Ad")).await;
         wait_until(|| bob.group_of(&key).map_or(false, |(_, left)| left)).await;
-        assert!(bob.group_send(&key, "hâlâ burada mıyım?").is_err());
+        assert!(bob.group_send(&key, "hâlâ burada mıyım?", None).is_err());
     }
 
     #[tokio::test]
@@ -3944,7 +4039,7 @@ mod tests {
         // Yönetici grubu siler → Carol için grup kapanır.
         alice.group_leave(&key).unwrap();
         wait_until(|| carol.group_of(&key).map_or(false, |(g, left)| g.deleted && left)).await;
-        assert!(carol.group_send(&key, "x").is_err());
+        assert!(carol.group_send(&key, "x", None).is_err());
     }
 
     #[tokio::test]
@@ -4270,6 +4365,124 @@ mod tests {
         game_ticks(&all, || game_of(&bob, &id).is_some_and(|v| v.room.status == RoomStatus::Finished && !v.pending)).await;
     }
 
+    /// Hamle gecikmesi: keşif döngüsü (flush_games çağrısı) olmadan, hamle karşıya hemen gitmeli.
+    /// Rakibin hamlesi sahibe, sahibin hamlesi rakibe bir bağlantı süresinde ulaşır.
+    #[tokio::test]
+    async fn game_moves_arrive_without_waiting_for_discovery_tick() {
+        use game::{GameAction, RoomStatus};
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        introduce_all(&[&alice, &bob]);
+        let all = [&alice, &bob];
+        let id = alice.game_invite("chess", &[bob.identity.fingerprint.clone()], Some(0)).unwrap().room.id;
+        game_ticks(&all, || game_of(&bob, &id).is_some()).await;
+        bob.game_act(&id, GameAction::Join).unwrap();
+        game_ticks(&all, || game_of(&alice, &id).is_some_and(|v| v.room.status == RoomStatus::Active)).await;
+
+        // Artık flush_games'i elle çağırmıyoruz: yalnızca hamlenin kendisi iletimi başlatmalı.
+        async fn wait(cond: impl Fn() -> bool) -> Duration {
+            let t = Instant::now();
+            while !cond() {
+                assert!(t.elapsed() < Duration::from_secs(2), "hamle 2 sn içinde ulaşmadı");
+                sleep(Duration::from_millis(2)).await;
+            }
+            t.elapsed()
+        }
+        let mut worst = Duration::ZERO;
+        for (i, (who, other, m)) in [(&alice, &bob, "e2e4"), (&bob, &alice, "e7e5"), (&alice, &bob, "g1f3"), (&bob, &alice, "b8c6")].into_iter().enumerate() {
+            who.game_act(&id, GameAction::Move { mv: m.into() }).unwrap();
+            let d = wait(|| game_of(other, &id).is_some_and(|v| v.room.moves.len() == i + 1) && game_of(who, &id).is_some_and(|v| v.room.moves.len() == i + 1 && !v.pending)).await;
+            eprintln!("hamle {m}: {d:?}");
+            worst = worst.max(d);
+        }
+        assert!(worst < Duration::from_millis(1500), "en yavaş hamle {worst:?}");
+    }
+
+    /// Cihazın bilinen adreslerinden biri cevap vermiyorsa (VPN, sanal ağ kartı) bağlantı onu
+    /// beklemez; çalışan adres hatırlanır ve sonraki bağlantılar doğrudan ona gider.
+    #[tokio::test]
+    async fn unreachable_address_does_not_delay_connections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        // Önce sahte (yanıt vermeyen) özel ağ adresi, sonra gerçek adres.
+        alice.upsert_peer(bob.device_info(), IpAddr::V4(Ipv4Addr::new(10, 255, 255, 1)), None);
+        alice.upsert_peer(bob.device_info(), IpAddr::V4(Ipv4Addr::LOCALHOST), None);
+        let peer = alice.peers().into_iter().find(|p| p.fingerprint == bob.identity.fingerprint).unwrap();
+        let addrs = alice.candidates(&peer);
+        assert_eq!(addrs[0].ip(), IpAddr::V4(Ipv4Addr::new(10, 255, 255, 1)), "test: sahte adres önce denenmeli");
+        let t = Instant::now();
+        alice.connect(&addrs, Some(bob.identity.fingerprint.clone())).await.unwrap();
+        let first = t.elapsed();
+        assert!(first < Duration::from_millis(1500), "ilk bağlantı {first:?}");
+        assert_eq!(alice.candidates(&peer)[0].ip(), IpAddr::V4(Ipv4Addr::LOCALHOST), "çalışan adres hatırlanmalı");
+        let t = Instant::now();
+        alice.connect(&alice.candidates(&peer), Some(bob.identity.fingerprint.clone())).await.unwrap();
+        assert!(t.elapsed() < Duration::from_millis(300), "ikinci bağlantı {:?}", t.elapsed());
+    }
+
+    /// Çok oyunculu golf: biri reddeder (oyun diğerleriyle başlar), sırayla vuruş, çekilme,
+    /// sahibin oyuncu adına vuruş uyduramaması.
+    #[tokio::test]
+    async fn golf_multiplayer_decline_turns_and_quit() {
+        use game::{GameAction, RoomStatus};
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        let carol = make_node(tmp.path(), "carol").await;
+        let dave = make_node(tmp.path(), "dave").await;
+        introduce_all(&[&alice, &bob, &carol, &dave]);
+        let all = [&alice, &bob, &carol, &dave];
+        let (afp, bfp, cfp, dfp) = (
+            alice.identity.fingerprint.clone(),
+            bob.identity.fingerprint.clone(),
+            carol.identity.fingerprint.clone(),
+            dave.identity.fingerprint.clone(),
+        );
+        let shot = |m: &str| GameAction::Move { mv: m.into() };
+
+        let id = alice.game_invite("golf", &[bfp.clone(), cfp.clone(), dfp.clone()], Some(0)).unwrap().room.id;
+        game_ticks(&all, || [&bob, &carol, &dave].iter().all(|n| game_of(n, &id).is_some())).await;
+        assert!(alice.game_act(&id, GameAction::OfferDraw).is_err(), "golfte beraberlik teklifi yok");
+        bob.game_act(&id, GameAction::Join).unwrap();
+        carol.game_act(&id, GameAction::Join).unwrap();
+        dave.game_act(&id, GameAction::Decline).unwrap();
+        game_ticks(&all, || game_of(&alice, &id).is_some_and(|v| v.room.status == RoomStatus::Active)).await;
+        assert_eq!(game_of(&alice, &id).unwrap().room.players.len(), 3);
+        game_ticks(&all, || game_of(&dave, &id).is_some_and(|v| v.room.status == RoomStatus::Declined && !v.pending)).await;
+
+        // Sıra: Alice (0) → Bob (1) → Carol (2).
+        let order = [(&alice, "a0p30"), (&bob, "a100p40"), (&carol, "a3500p35")];
+        for (i, (who, m)) in order.iter().enumerate() {
+            game_ticks(&all, || game_of(who, &id).is_some_and(|v| v.my_turn)).await;
+            who.game_act(&id, shot(m)).unwrap();
+            game_ticks(&all, || [&alice, &bob, &carol].iter().all(|n| game_of(n, &id).is_some_and(|v| v.room.moves.len() == i + 1))).await;
+        }
+        let v = game_of(&carol, &id).unwrap();
+        assert_eq!(v.info["balls"][1]["strokes"], 1);
+        assert_eq!(v.info["lastShot"]["seat"], 2);
+        assert!(!v.info["lastShot"]["path"].as_array().unwrap().is_empty());
+
+        // Sahip, Bob adına vuruş uyduramaz.
+        let mut forged = game_of(&bob, &id).unwrap().room;
+        forged.moves.extend(["a0p50".to_string(), "a0p50".to_string()]);
+        forged.rev += 1;
+        assert!(matches!(bob.accept_game_update(&afp, forged, "alice"), Message::GameReply { ok: false, .. }));
+
+        // Carol çekilir: oyun Alice ile Bob arasında sürer; sırası gelmeden de çekilebilir.
+        carol.game_act(&id, GameAction::Resign).unwrap();
+        game_ticks(&all, || game_of(&alice, &id).is_some_and(|v| v.info["quit"][2] == true)).await;
+        assert_eq!(game_of(&alice, &id).unwrap().room.status, RoomStatus::Active);
+        game_ticks(&all, || game_of(&bob, &id).is_some_and(|v| v.info["quit"][2] == true)).await;
+        // Bob da çekilince Alice kazanır.
+        bob.game_act(&id, GameAction::Resign).unwrap();
+        game_ticks(&all, || game_of(&bob, &id).is_some_and(|v| v.room.status == RoomStatus::Finished && !v.pending)).await;
+        game_ticks(&all, || game_of(&carol, &id).is_some_and(|v| v.room.status == RoomStatus::Finished)).await;
+        let res = game_of(&alice, &id).unwrap().room.result.unwrap();
+        assert_eq!((res.winner.as_deref(), res.reason.as_str()), (Some(afp.as_str()), "forfeit"));
+    }
+
     // ───────────── Oylama testleri ─────────────
 
     fn poll_of(node: &Node, id: &str) -> Option<poll::PollView> {
@@ -4402,9 +4615,9 @@ mod tests {
         let (alice, bob, _events) = chat_pair(tmp.path()).await;
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         for i in 0..CHAT_RATE_MAX {
-            assert!(bob.accept_chat(alice.device_info(), ip, &format!("m{i}"), "spam").is_ok());
+            assert!(bob.accept_chat(alice.device_info(), ip, &format!("m{i}"), "spam", None).is_ok());
         }
-        assert_eq!(bob.accept_chat(alice.device_info(), ip, "fazla", "spam"), Err("rate"));
+        assert_eq!(bob.accept_chat(alice.device_info(), ip, "fazla", "spam", None), Err("rate"));
         assert_eq!(bob.chat_history(&alice.identity.fingerprint).len(), CHAT_RATE_MAX);
     }
 
@@ -4427,6 +4640,17 @@ mod tests {
         assert_eq!(*count.lock().unwrap(), 1, "aynı duyuru tekrar tekrar olay üretmemeli");
         node.upsert_peer(DeviceInfo { name: "Taha Y.".into(), ..dev.clone() }, ip, None);
         assert_eq!(*count.lock().unwrap(), 2, "isim değişince olay gelmeli");
+
+        // Sanal ofis koltuğu: değişince olay gelir, geçersiz numara "seçilmedi" sayılır.
+        node.upsert_peer(DeviceInfo { name: "Taha Y.".into(), seat: 4, ..dev.clone() }, ip, None);
+        assert_eq!(*count.lock().unwrap(), 3, "koltuk değişince olay gelmeli");
+        assert_eq!(node.peers()[0].seat, 4);
+        node.upsert_peer(DeviceInfo { name: "Taha Y.".into(), seat: 200, ..dev.clone() }, ip, None);
+        assert_eq!(node.peers()[0].seat, 0);
+
+        // Kendi koltuğumuz duyuruya girer.
+        node.update_settings(|s| s.seat = 7);
+        assert_eq!(node.device_info().seat, 7);
     }
 
     #[tokio::test]
@@ -4441,5 +4665,167 @@ mod tests {
         assert!(bob.peers().iter().any(|p| p.id == alice.identity.id));
         // Kendine bağlanma reddedilir.
         assert!(alice.add_manual_peer(&format!("127.0.0.1:{}", alice.port())).await.is_err());
+    }
+
+    // ───────────── Durum, sohbet olayları, çevrimiçi olunca gönder, telefon ─────────────
+
+    #[tokio::test]
+    async fn reactions_edits_deletes_replies_and_nudges() {
+        use crate::chat::ChatEventKind;
+        let tmp = tempfile::tempdir().unwrap();
+        let (alice, bob, _events) = chat_pair(tmp.path()).await;
+        let afp = alice.identity.fingerprint.clone();
+        let bfp = bob.identity.fingerprint.clone();
+
+        let sent = alice.chat_send(&bob.identity.id, "selam", None).unwrap();
+        wait_until(|| last_status(&alice, &bfp) == Some(MsgStatus::Sent)).await;
+        let id = sent.id.clone();
+        let msg_of = |n: &Node, key: &str| n.chat_history(key).into_iter().find(|m| m.id == id).unwrap();
+
+        // Tepki: Bob'un tepkisi Alice'te Bob adına görünür; listede olmayan emoji reddedilir.
+        bob.chat_react(&afp, &id, "👍").unwrap();
+        wait_until(|| msg_of(&alice, &bfp).reactions.iter().any(|r| r.fp == bfp && r.emoji == "👍")).await;
+        assert!(bob.chat_react(&afp, &id, "<script>").is_err());
+        bob.chat_react(&afp, &id, "").unwrap();
+        wait_until(|| msg_of(&alice, &bfp).reactions.is_empty()).await;
+
+        // Düzenleme: yalnızca yazan düzenler.
+        alice.chat_edit(&bfp, &id, "selam, nasılsın?").unwrap();
+        wait_until(|| msg_of(&bob, &afp).text == "selam, nasılsın?").await;
+        assert!(msg_of(&bob, &afp).edited);
+        assert!(bob.chat_edit(&afp, &id, "taklit").is_err(), "başkasının mesajı düzenlenemez");
+        // Bob ağdan doğrudan "düzenleme" gönderse bile Alice'teki (Alice'in yazdığı) mesaj değişmez.
+        bob.broadcast_event(&afp, ChatEventKind::Edit { id: id.clone(), text: "ele geçirildi".into() }).unwrap();
+        sleep(Duration::from_millis(400)).await;
+        assert_eq!(msg_of(&alice, &bfp).text, "selam, nasılsın?");
+
+        // Yanıt: alıntı karşı tarafa da gider.
+        let reply = bob.chat_send(&alice.identity.id, "iyiyim", Some(&id)).unwrap();
+        assert_eq!(reply.reply.as_ref().unwrap().id, id);
+        wait_until(|| alice.chat_history(&bfp).iter().any(|m| m.text == "iyiyim" && m.reply.as_ref().is_some_and(|r| r.id == id && r.name == "alice"))).await;
+
+        // Silme: herkesten silinir.
+        alice.chat_delete(&bfp, &id).unwrap();
+        wait_until(|| msg_of(&bob, &afp).deleted).await;
+        assert!(msg_of(&bob, &afp).text.is_empty());
+
+        // Dürtme: karşıda not düşer, art arda dürtme engellenir.
+        alice.chat_nudge(&bfp).unwrap();
+        wait_until(|| bob.chat_history(&afp).iter().any(|m| m.system && m.text.contains("dürttü"))).await;
+        assert!(alice.chat_nudge(&bfp).is_err());
+    }
+
+    #[tokio::test]
+    async fn queued_file_is_sent_when_peer_comes_online() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        bob.set_trusted(&alice.identity.fingerprint, "alice", true);
+        let bfp = bob.identity.fingerprint.clone();
+        let src = tmp.path().join("rapor.txt");
+        std::fs::write(&src, b"bekleyen dosya").unwrap();
+
+        // Bob çevrimdışı: dosya sohbette bekler.
+        alice.chat_queue_files(&bfp, "bob", vec![src.to_string_lossy().into_owned()]).await.unwrap();
+        let queued = alice.chat_history(&bfp);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].pending, vec![bfp.clone()]);
+        alice.flush_outbox();
+        sleep(Duration::from_millis(200)).await;
+        assert!(alice.transfers().is_empty());
+
+        // Bob çevrimiçi oldu: dosya kendiliğinden gider, bekleyen balon aktarım balonuna dönüşür.
+        introduce(&alice, &bob);
+        alice.flush_outbox();
+        let dest = PathBuf::from(bob.settings().download_dir).join("rapor.txt");
+        for _ in 0..200 {
+            if dest.exists() && std::fs::read(&dest).map_or(false, |b| b == b"bekleyen dosya") {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(std::fs::read(&dest).unwrap(), b"bekleyen dosya");
+        let hist = alice.chat_history(&bfp);
+        assert!(hist.iter().all(|m| m.pending.is_empty()));
+        assert!(hist.iter().any(|m| m.id.starts_with("f-")));
+    }
+
+    #[tokio::test]
+    async fn status_is_announced_and_validated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        assert!(alice.set_status("tatil").is_err());
+        alice.set_status("focus").unwrap();
+        assert!(alice.do_not_disturb());
+        assert_eq!(alice.device_info().status, "focus");
+        introduce(&bob, &alice);
+        assert_eq!(bob.peers()[0].status, "focus");
+        // Bilinmeyen durum değeri "müsait" sayılır.
+        bob.upsert_peer(DeviceInfo { status: "kötü".into(), ..alice.device_info() }, IpAddr::V4(Ipv4Addr::LOCALHOST), None);
+        assert_eq!(bob.peers()[0].status, "");
+        alice.set_status("").unwrap();
+        assert!(!alice.do_not_disturb());
+    }
+
+    async fn http(port: u16, req: &[u8]) -> (String, Vec<u8>) {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(req).await.unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.unwrap();
+        let split = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        (String::from_utf8_lossy(&out[..split]).into_owned(), out[split + 4..].to_vec())
+    }
+
+    #[tokio::test]
+    async fn phone_upload_and_download() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let info = alice.phone_start().await.unwrap();
+        let url = info["url"].as_str().unwrap().to_string();
+        assert!(info["svg"].as_str().unwrap().contains("<svg"));
+        let (host, path) = url.trim_start_matches("http://").split_once('/').unwrap();
+        let port: u16 = host.rsplit_once(':').unwrap().1.parse().unwrap();
+        let path = format!("/{path}");
+
+        // Yanlış anahtar: hiçbir şey yok.
+        let (head, _) = http(port, b"GET /p/yanlis HTTP/1.1\r\n\r\n").await;
+        assert!(head.starts_with("HTTP/1.1 404"));
+        // Sayfa açılır.
+        let (head, body) = http(port, format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes()).await;
+        assert!(head.starts_with("HTTP/1.1 200"));
+        assert!(String::from_utf8_lossy(&body).contains("alice"));
+
+        // Yükleme: zararlı ad temizlenir, Telefon klasörüne yazılır.
+        let data = b"telefondan gelen veri";
+        let req = format!("PUT {path}/up?name=..%2F..%2Ffoto%20%C3%A7.jpg HTTP/1.1\r\nContent-Length: {}\r\n\r\n", data.len());
+        let mut bytes = req.into_bytes();
+        bytes.extend_from_slice(data);
+        let (head, _) = http(port, &bytes).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let saved = PathBuf::from(alice.settings().download_dir).join("Telefon").join("foto ç.jpg");
+        assert_eq!(std::fs::read(&saved).unwrap(), data);
+
+        // İndirme: yalnızca sunulan dosyalar, sıra numarasıyla.
+        let (head, _) = http(port, format!("GET {path}/f/0 HTTP/1.1\r\n\r\n").as_bytes()).await;
+        assert!(head.starts_with("HTTP/1.1 404"));
+        let src = tmp.path().join("sunum.pdf");
+        std::fs::write(&src, b"PDF!").unwrap();
+        alice.phone_offer(vec![src.to_string_lossy().into_owned(), tmp.path().to_string_lossy().into_owned()]).unwrap();
+        let (head, body) = http(port, format!("GET {path}/f/0 HTTP/1.1\r\n\r\n").as_bytes()).await;
+        assert!(head.starts_with("HTTP/1.1 200"));
+        assert!(head.contains("sunum.pdf"));
+        assert_eq!(body, b"PDF!");
+        let (_, list) = http(port, format!("GET {path}/list HTTP/1.1\r\n\r\n").as_bytes()).await;
+        let list: Value = serde_json::from_slice(&list).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1, "klasör sunulmaz");
+
+        // Kapatılınca erişim biter.
+        alice.phone_stop();
+        sleep(Duration::from_millis(100)).await;
+        assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err() || {
+            let (h, _) = http(port, format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes()).await;
+            h.starts_with("HTTP/1.1 404")
+        });
     }
 }

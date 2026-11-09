@@ -100,6 +100,14 @@ pub fn save_png(dir: &Path, stamp: &str, width: u32, height: u32, rgba: &[u8]) -
     Ok(path)
 }
 
+/// Hazır PNG verisini (ör. üzerine çizilmiş ekran görüntüsü) kaydeder.
+pub fn save_png_bytes(dir: &Path, stamp: &str, data: &[u8]) -> Result<PathBuf, String> {
+    prepare_dir(dir)?;
+    let path = free_path(dir, &format!("Ekran görüntüsü {}", clean_stamp(stamp)), "png");
+    std::fs::write(&path, data).map_err(|e| format!("Görüntü kaydedilemedi: {e}"))?;
+    Ok(path)
+}
+
 /// Mesaja sığmayan metni .txt dosyası olarak kaydeder (Windows satır sonlarıyla).
 pub fn save_text(dir: &Path, stamp: &str, text: &str) -> Result<PathBuf, String> {
     prepare_dir(dir)?;

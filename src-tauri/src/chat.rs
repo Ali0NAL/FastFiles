@@ -44,6 +44,77 @@ pub struct ChatMessage {
     /// Dosya balonu: bu mesaj bir (veya grupta birden fazla) dosya aktarımını temsil eder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<FileRef>,
+    /// Alıntılanarak yanıtlanan mesaj.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<ReplyRef>,
+    /// Tepkiler: kişi başına en fazla bir emoji.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<Reaction>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub edited: bool,
+    /// Gönderen herkesten sildi (metin boşaltılır).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
+    /// Grupta bu cihazdan (adıyla ya da @herkes ile) bahsedildi.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mention: bool,
+}
+
+/// Yanıtlanan mesajın kısa özeti (alıntı satırında gösterilir).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplyRef {
+    pub id: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+pub const REPLY_SNIPPET_CHARS: usize = 120;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Reaction {
+    pub fp: String,
+    pub emoji: String,
+}
+
+/// Kabul edilen tepki emojileri (uydurma/uzun metin tepki olarak kabul edilmez).
+pub const REACTIONS: [&str; 8] = ["👍", "❤️", "😂", "😮", "😢", "🙏", "🎉", "🔥"];
+
+/// Sohbet olayı (ağ üzerinden). Yalnızca mesajın sahibi düzenleyip silebilir.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ChatEventKind {
+    /// `emoji` boşsa tepki kaldırılır.
+    React { id: String, emoji: String },
+    Edit { id: String, text: String },
+    Delete { id: String },
+    /// Dürtme: karşının penceresi titrer.
+    Nudge,
+}
+
+/// Metinde `@ad` ya da `@herkes` geçiyor mu? (Büyük/küçük harf duyarsız, ad bir kelime sınırında bitmeli.)
+pub fn mentions(text: &str, my_name: &str) -> bool {
+    let lower = text.to_lowercase();
+    if lower.contains("@herkes") || lower.contains("@everyone") {
+        return true;
+    }
+    let name = my_name.trim().to_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    let needle = format!("@{name}");
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find(&needle) {
+        let end = from + pos + needle.len();
+        if lower[end..].chars().next().map_or(true, |c| !c.is_alphanumeric()) {
+            return true;
+        }
+        from = end;
+    }
+    false
 }
 
 /// Sohbetteki dosya balonu. Durum ve ilerleme bağlı aktarım kayıtlarından okunur.
@@ -185,6 +256,8 @@ pub enum OutboxItem {
     File { key: String, to: String, group_id: String, msg: ChatMessage },
     /// Üye → yönetici: ayrılıyorum
     Leave { key: String, to: String, group_id: String },
+    /// Birebir sohbette çevrimdışı kişiye bırakılan dosya: kişi çevrimiçi olunca gönderilir.
+    DirectFile { key: String, to: String, msg: ChatMessage },
 }
 
 /// Bekleyen grup mesajlarından bu kadar eskiyse vazgeçilir.
@@ -361,7 +434,20 @@ impl ChatStore {
         self.convs.retain(|_, c| !(c.hidden && !c.leave_pending && c.sync_pending.is_empty()));
         let mut changed = self.convs.len() != before;
         for conv in self.convs.values_mut() {
-            let Some(group) = conv.group.clone() else { continue };
+            let Some(group) = conv.group.clone() else {
+                // Birebir sohbet: "çevrimiçi olunca gönder" dosyaları.
+                for m in conv.messages.iter_mut().filter(|m| m.outgoing && m.file.is_some() && !m.pending.is_empty()) {
+                    if now.saturating_sub(m.at) > OUTBOX_MAX_AGE_MS {
+                        m.status = MsgStatus::Failed;
+                        m.error = Some("3 gün içinde gönderilemedi".into());
+                        m.pending.clear();
+                        changed = true;
+                        continue;
+                    }
+                    items.push(OutboxItem::DirectFile { key: conv.fingerprint.clone(), to: conv.fingerprint.clone(), msg: m.clone() });
+                }
+                continue;
+            };
             if group.admin == my_fp {
                 for to in &conv.sync_pending {
                     items.push(OutboxItem::GroupSync { key: conv.fingerprint.clone(), to: to.clone(), group: group.clone() });

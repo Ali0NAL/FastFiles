@@ -94,6 +94,13 @@ pub struct Settings {
     /// yeniden açılırsa sonsuz "kur → yeniden başlat" döngüsüne girilmesin.
     pub install_attempt: String,
     pub install_attempt_at: u64,
+    /// Sanal ofiste oturulan koltuk (0 = seçilmedi). Keşif duyurusuyla diğer cihazlara gider.
+    pub seat: u8,
+    /// Elle seçilen durum: "" (müsait) | "busy" | "focus" | "away". Boşken 10 dk işlem
+    /// yapılmazsa kendiliğinden "away" olur.
+    pub status: String,
+    /// Genel kısayollar: Ctrl+Shift+Space hızlı gönderim, Ctrl+Shift+PrtSc ekran görüntüsü.
+    pub hotkeys: bool,
 }
 
 impl Default for Settings {
@@ -115,6 +122,9 @@ impl Default for Settings {
             lock_minutes: 0,
             install_attempt: String::new(),
             install_attempt_at: 0,
+            seat: 0,
+            status: String::new(),
+            hotkeys: true,
         }
     }
 }

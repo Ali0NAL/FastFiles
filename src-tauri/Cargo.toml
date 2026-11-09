@@ -1,6 +1,6 @@
 [package]
 name = "fastfiles"
-version = "1.4.3"
+version = "1.7.0"
 description = "Aynı ağdaki bilgisayarlar arasında hızlı ve güvenli dosya transferi"
 authors = ["Twinup"]
 edition = "2021"
@@ -40,6 +40,13 @@ zstd = "0.13"
 # "Panoyu gönder": metin, ekran görüntüsü ve kopyalanan dosyalar.
 arboard = "3"
 png = "0.18"
+# Her yerden hızlı gönderim ve ekran görüntüsü kısayolları.
+tauri-plugin-global-shortcut = "2"
+# Telefon bağlantısı: QR kod (SVG).
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# Ekran paylaşımı: ekranı yakala, JPEG olarak sıkıştırıp gönder.
+xcap = "0.9"
+jpeg-encoder = { version = "0.7", features = ["simd"] }
 
 [target.'cfg(windows)'.dependencies]
 # Bildirime tıklanınca uygulamayı açabilmek için (notification eklentisi tıklamayı bildirmiyor).

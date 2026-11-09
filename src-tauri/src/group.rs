@@ -253,7 +253,7 @@ impl Node {
     }
 
     /// Gruba mesaj gönderir. Çevrimdışı üyelere sonra otomatik iletilir.
-    pub fn group_send(self: &Arc<Self>, key: &str, text: &str) -> Result<ChatMessage, String> {
+    pub fn group_send(self: &Arc<Self>, key: &str, text: &str, reply_to: Option<&str>) -> Result<ChatMessage, String> {
         let me = self.my_fp();
         let (g, left) = self.group_of(key).ok_or("Grup bulunamadı")?;
         if left || g.deleted || !g.has(&me) {
@@ -278,6 +278,7 @@ impl Node {
             status: MsgStatus::Sending,
             recipients: others.len() as u32,
             pending: others,
+            reply: reply_to.and_then(|id| self.reply_ref(key, id)),
             ..Default::default()
         };
         self.chats.lock().unwrap().push(key, &g.name, msg.clone());
@@ -375,6 +376,7 @@ impl Node {
                     (to.clone(), format!("file:{key}:{to}:{}", msg.id))
                 }
                 OutboxItem::Leave { key, to, .. } => (to.clone(), format!("leave:{key}:{to}")),
+                OutboxItem::DirectFile { key, to, msg } => (to.clone(), format!("file:{key}:{to}:{}", msg.id)),
             };
             let Some(peer) = online.get(&to).cloned() else { continue };
             if self.outbox_backoff.lock().unwrap().get(&flight).map_or(false, |until| Instant::now() < *until) {
@@ -433,7 +435,14 @@ impl Node {
                 }
             }
             OutboxItem::Message { key, to, group_id, msg } => {
-                let request = Message::GroupChat { device, group_id, id: msg.id.clone(), text: msg.text.clone(), sent_at: msg.at };
+                let request = Message::GroupChat {
+                    device,
+                    group_id,
+                    id: msg.id.clone(),
+                    text: msg.text.clone(),
+                    sent_at: msg.at,
+                    reply: msg.reply.clone(),
+                };
                 let (done, unknown_group) = match self.group_request(peer, &request).await {
                     Ok(Message::ChatAck { id }) if id == msg.id => (true, false),
                     Ok(Message::ChatReject { reason }) => match reason.as_str() {
@@ -505,6 +514,33 @@ impl Node {
                 });
                 if let Some(m) = updated {
                     self.emit_chat_message(&key, &m, false);
+                }
+                Delivery::Done
+            }
+            OutboxItem::DirectFile { key, to, msg } => {
+                // Kişi çevrimiçi oldu: bekleyen dosya normal bir gönderim olarak başlar.
+                let Some(file) = msg.file.clone() else { return Delivery::Done };
+                let started = match scan_sources(&file.sources).await {
+                    Ok((entries, title)) => Ok(self.start_send(peer.clone(), entries, title, file.sources.clone(), None, None)),
+                    Err(e) => Err(e),
+                };
+                match started {
+                    // Aktarım kendi dosya balonunu ekler: bekleyen balon kaldırılır.
+                    Ok(_) => {
+                        self.chats.lock().unwrap().with(&key, |c| c.messages.retain(|m| m.id != msg.id));
+                        self.emit("chat-remove", json!({ "fingerprint": key, "id": msg.id }));
+                        let _ = to;
+                    }
+                    Err(e) => {
+                        let updated = self.chats.lock().unwrap().update_message(&key, &msg.id, |m| {
+                            m.pending.clear();
+                            m.status = MsgStatus::Failed;
+                            m.error = Some(e.clone());
+                        });
+                        if let Some(m) = updated {
+                            self.emit_chat_message(&key, &m, false);
+                        }
+                    }
                 }
                 Delivery::Done
             }
@@ -605,6 +641,7 @@ impl Node {
         id: &str,
         text: &str,
         sent_at: u64,
+        reply: Option<crate::chat::ReplyRef>,
     ) -> Result<(), &'static str> {
         let sender = device.fingerprint.clone();
         if self.is_blocked(&sender) {
@@ -643,6 +680,7 @@ impl Node {
         // Gecikmeli teslimatta gönderilme saati gösterilir; gelecekteki saatlere güvenilmez.
         let now = now_ms();
         let at = if sent_at > 0 && sent_at <= now { sent_at } else { now };
+        let mention = crate::chat::mentions(&text, &self.settings().device_name);
         let msg = ChatMessage {
             id: id.to_string(),
             text,
@@ -650,10 +688,12 @@ impl Node {
             status: MsgStatus::Received,
             sender: Some(sender),
             sender_name: Some(sender_name),
+            reply: reply.map(extras::clean_reply),
+            mention,
             ..Default::default()
         };
         let unread = self.chats.lock().unwrap().push(&key, &group.name, msg.clone());
-        self.emit("chat", json!({ "fingerprint": key, "name": group.name, "unread": unread, "incoming": true, "message": msg }));
+        self.emit("chat", json!({ "fingerprint": key, "name": group.name, "unread": unread, "incoming": true, "message": msg, "mention": mention }));
         Ok(())
     }
 
