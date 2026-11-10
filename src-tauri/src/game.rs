@@ -152,7 +152,7 @@ impl RoomState {
     fn eval(&mut self) -> Option<&games::Eval> {
         let key = (self.room.players.len(), self.room.moves.len());
         if self.memo.as_ref().map(|m| (m.0, m.1)) != Some(key) {
-            let e = games::evaluate(&self.room.game, key.0, &self.room.moves).ok();
+            let e = games::evaluate(&self.room.game, &self.room.id, key.0, &self.room.moves).ok();
             self.memo = Some((key.0, key.1, e));
         }
         self.memo.as_ref().and_then(|m| m.2.as_ref())
@@ -287,7 +287,7 @@ fn apply(room: &GameRoom, sender: &str, action: &GameAction) -> Result<Option<Ga
             if let Some(at) = *at {
                 for i in at..r.moves.len() {
                     if r.moves[i] == *mv {
-                        let before = games::evaluate(&r.game, n, &r.moves[..i]).map_err(|_| "invalid")?;
+                        let before = games::evaluate(&r.game, &r.id, n, &r.moves[..i]).map_err(|_| "invalid")?;
                         if games::move_actor(&r.game, &before, mv) == Some(seat) {
                             return Ok(None);
                         }
@@ -300,7 +300,7 @@ fn apply(room: &GameRoom, sender: &str, action: &GameAction) -> Result<Option<Ga
             if !games::valid_move_text(mv) {
                 return Err("illegal");
             }
-            let now = games::evaluate(&r.game, n, &r.moves).map_err(|_| "invalid")?;
+            let now = games::evaluate(&r.game, &r.id, n, &r.moves).map_err(|_| "invalid")?;
             if now.turn != Some(seat) {
                 return Err("not_your_turn");
             }
@@ -312,7 +312,7 @@ fn apply(room: &GameRoom, sender: &str, action: &GameAction) -> Result<Option<Ga
             if r.draw_offer.as_deref().is_some_and(|d| d != sender) {
                 r.draw_offer = None;
             }
-            let after = games::evaluate(&r.game, n, &r.moves).map_err(|_| "illegal")?;
+            let after = games::evaluate(&r.game, &r.id, n, &r.moves).map_err(|_| "illegal")?;
             if let Some(o) = after.outcome {
                 let winner = winner_fp(&r, o.winner);
                 finish(&mut r, winner, o.reason, None);
@@ -323,7 +323,7 @@ fn apply(room: &GameRoom, sender: &str, action: &GameAction) -> Result<Option<Ga
                 // Çok oyunculu oyun: oyuncu çekilir, oyun diğerleriyle sürer.
                 Some(q) => {
                     r.moves.push(q);
-                    let after = games::evaluate(&r.game, n, &r.moves).map_err(|_| "closed")?;
+                    let after = games::evaluate(&r.game, &r.id, n, &r.moves).map_err(|_| "closed")?;
                     if let Some(o) = after.outcome {
                         let winner = winner_fp(&r, o.winner);
                         finish(&mut r, winner, o.reason, Some(sender.to_string()));
@@ -809,7 +809,7 @@ impl Node {
             return Message::GameReply { ok: true, reason: String::new(), room: None, host_name: String::new() };
         };
         let n = room.players.len();
-        let Ok(eval) = games::evaluate(&room.game, n, &room.moves) else { return reject("invalid") };
+        let Ok(eval) = games::evaluate(&room.game, &room.id, n, &room.moves) else { return reject("invalid") };
         // Durum hamlelerle tutarlı olmalı: bitmiş oyun "sürüyor", başlamamış oyun "hamleli" olamaz.
         if (room.status == RoomStatus::Active && eval.outcome.is_some())
             || (room.status == RoomStatus::Invited && !room.moves.is_empty())
@@ -841,7 +841,7 @@ impl Node {
                     let mut mine = st.outbox_moves.iter().enumerate().filter_map(|(i, m)| m.as_ref().map(|m| (i, m)));
                     let mut confirmed = Vec::new();
                     for ply in st.room.moves.len()..room.moves.len() {
-                        let Ok(before) = games::evaluate(&room.game, n, &room.moves[..ply]) else { return reject("invalid") };
+                        let Ok(before) = games::evaluate(&room.game, &room.id, n, &room.moves[..ply]) else { return reject("invalid") };
                         if games::move_actor(&room.game, &before, &room.moves[ply]) == Some(my_seat) {
                             match mine.next() {
                                 Some((i, m)) if *m == room.moves[ply] => confirmed.push(i),
@@ -991,7 +991,7 @@ impl Node {
             GameAction::Resign => Some((format!("{who} oyundan çekildi"), title.into())),
             GameAction::OfferDraw => Some(("Beraberlik teklifi".into(), format!("{who} beraberlik teklif ediyor"))),
             GameAction::Move { .. } => {
-                let eval = games::evaluate(&new.game, new.players.len(), &new.moves).ok()?;
+                let eval = games::evaluate(&new.game, &new.id, new.players.len(), &new.moves).ok()?;
                 (eval.turn == new.seat_of(me)).then(|| (format!("Sıra sizde · {title}"), last_move_text(new, &eval)))
             }
             _ => None,
@@ -1087,7 +1087,7 @@ mod tests {
         let next = apply(&r, &b, &shot).unwrap().unwrap();
         assert_eq!(next.moves.len(), 16);
         // Bob deliği bitirdi; 2. delik Bob ile başlar: sıra yine onda.
-        let e = games::evaluate("golf", 2, &next.moves).unwrap();
+        let e = games::evaluate("golf", &next.id, 2, &next.moves).unwrap();
         assert_eq!(e.turn, Some(1));
         assert_eq!(apply(&next, &b, &shot), Ok(None), "aynı vuruş yinelendi, yeniden işlenmemeli");
         // Yeni bir vuruş (yeni sıra numarasıyla) normal işlenir.

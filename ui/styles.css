@@ -907,10 +907,16 @@ body.games-open .layout { display: none; }
 .golf-flash {
   position: absolute; left: 50%; top: 14px; transform: translateX(-50%); pointer-events: none;
   padding: 7px 16px; border-radius: 999px; font-weight: 700; color: #fff; background: rgba(20, 30, 25, .78);
-  box-shadow: var(--shadow-lg); animation: rise .2s ease-out; white-space: nowrap;
+  box-shadow: var(--shadow-lg); animation: rise .2s ease-out; width: max-content; max-width: calc(100% - 24px); text-align: center;
 }
 .golf-flash.in { background: color-mix(in srgb, var(--success) 85%, #000); }
 .golf-flash.water { background: #2a6fb0; }
+.golf-flash.pup { background: color-mix(in srgb, #8e4ec6 80%, #000); }
+.gh-level { margin-left: 6px; padding: 1px 7px; border-radius: 999px; font-size: 11.5px; font-weight: 600; background: var(--surface); border: 1px solid var(--border); }
+.gh-pups { display: inline-flex; flex-wrap: wrap; gap: 8px; margin-left: 10px; vertical-align: middle; }
+.gh-pup { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; cursor: help; }
+.gh-pup i { width: 18px; height: 18px; border-radius: 50%; display: grid; place-items: center; font-size: 11px; font-style: normal; border: 1.5px solid #fff; box-shadow: 0 0 0 1px rgba(0, 0, 0, .15); }
+.gh-fx { font-style: normal; font-size: 12px; letter-spacing: 1px; }
 .golf-scores { width: 100%; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; }
 .golf-scores th, .golf-scores td { padding: 5px 3px; text-align: center; border-bottom: 1px solid var(--border); }
 .golf-scores th { color: var(--muted); font-weight: 700; }

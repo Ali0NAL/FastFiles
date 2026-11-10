@@ -3497,7 +3497,7 @@ function renderRoomPanel(g) {
   $('#room-name').textContent = `${g.title} · ${vsName(g)}`;
   if (isGolf && g.info?.holes) {
     const h = g.info.holes[g.info.hole];
-    $('#room-sub').textContent = `${g.info.hole + 1}/${g.info.holes.length}. delik · ${h.name} · Par ${h.par}`;
+    $('#room-sub').textContent = `${g.info.hole + 1}/${g.info.holes.length}. delik · ${h.name}${h.no ? ` (seviye ${h.no})` : ''} · Par ${h.par}`;
   } else {
     $('#room-sub').textContent = seatName ? `Siz ${seatName} taşlarla oynuyorsunuz` : '';
   }
@@ -3598,6 +3598,16 @@ const GOLF_PULL = 220;           // bu kadar geri çekince %100 güç (saha biri
 const GOLF_POINT_MS = 25;        // yol noktaları arası süre (1/40 sn)
 const golfColor = (fp) => `hsl(${hue(fp)} 78% 52%)`;
 const shotCount = (g) => g.moves.filter((m) => m[0] === 'a').length;
+// Power-up'lar (kuralları games/golf.rs içindedir). `foe`: rakiplere etki eder.
+const GOLF_PUPS = {
+  slow: { icon: '🐌', name: 'Yavaşlat', color: '#e5484d', foe: true, desc: 'Rakiplerin sonraki vuruşu %40 zayıf', now: 'vuruşunuz %40 zayıf' },
+  shaky: { icon: '🌪️', name: 'Rüzgâr', color: '#8e4ec6', foe: true, desc: 'Rakiplerin sonraki vuruşu birkaç derece sapar', now: 'vuruşunuz birkaç derece sapacak' },
+  ice: { icon: '🧊', name: 'Buz', color: '#3ab8e0', foe: true, desc: 'Rakiplerin topu sonraki vuruşta buzda gibi kayar', now: 'topunuz buzda gibi kayacak' },
+  turbo: { icon: '⚡', name: 'Turbo', color: '#f5a524', foe: false, desc: 'Sonraki vuruşunuz %35 sert, kum etkilemez', now: '%35 daha sert, kum etkilemez' },
+  ghost: { icon: '👻', name: 'Hayalet', color: '#7d8590', foe: false, desc: 'Sonraki vuruşunuz iç duvar ve direklerden geçer', now: 'iç duvar ve direklerden geçer' },
+  magnet: { icon: '🧲', name: 'Mıknatıs', color: '#2fbf71', foe: false, desc: 'Sonraki vuruşunuzda delik topu kendine çeker', now: 'delik topu kendine çeker' },
+};
+const pupIcons = (list) => (list || []).map((k) => GOLF_PUPS[k]?.icon || '').join('');
 
 function renderGolf(g) {
   if (!g.info?.holes) return;
@@ -3624,14 +3634,22 @@ function renderGolfHud(g) {
     const quit = info.quit[seat];
     const cur = g.status === 'active' && g.turn === seat;
     const state = quit ? 'çekildi' : b.done ? `⛳ ${b.strokes}` : b.strokes ? `${b.strokes} vuruş` : 'başlamadı';
-    return `<span class="gh-chip${cur ? ' cur' : ''}${quit ? ' quit' : ''}" title="${esc(p.name)}">
-      <i style="background:${golfColor(p.fingerprint)}"></i>${esc(p.fingerprint === myFp() ? 'Siz' : p.name)}<small>${esc(state)}</small></span>`;
+    const fx = quit ? [] : info.effects?.[seat] || [];
+    const fxTitle = fx.map((k) => `${GOLF_PUPS[k]?.icon} ${GOLF_PUPS[k]?.name}`).join(', ');
+    return `<span class="gh-chip${cur ? ' cur' : ''}${quit ? ' quit' : ''}" title="${esc(p.name)}${fxTitle ? ` · sonraki vuruş: ${esc(fxTitle)}` : ''}">
+      <i style="background:${golfColor(p.fingerprint)}"></i>${esc(p.fingerprint === myFp() ? 'Siz' : p.name)}<small>${esc(state)}</small>${fx.length ? `<em class="gh-fx">${pupIcons(fx)}</em>` : ''}</span>`;
   }).join('');
-  $('#golf-hud').innerHTML = `<div class="gh-hole"><b>${info.hole + 1}. delik</b> · ${esc(h.name)} · Par ${h.par}</div><div class="gh-chips">${chips}</div>`;
+  const level = h.no ? ` <span class="gh-level">Seviye ${h.no}/${info.levels || 25}</span>` : '';
+  // Bu delikteki power-up'ların kısa açıklaması.
+  const kinds = [...new Set((h.pups || []).map((p) => p[2]))].filter((k) => GOLF_PUPS[k]);
+  const legend = kinds.map((k) => `<span class="gh-pup" title="${esc(GOLF_PUPS[k].desc)}"><i style="background:${GOLF_PUPS[k].color}">${GOLF_PUPS[k].icon}</i>${esc(GOLF_PUPS[k].name)}</span>`).join('');
+  $('#golf-hud').innerHTML = `<div class="gh-hole"><b>${info.hole + 1}. delik</b> · ${esc(h.name)} · Par ${h.par}${level}${legend ? `<span class="gh-pups">${legend}</span>` : ''}</div><div class="gh-chips">${chips}</div>`;
   let hint = '';
+  const mine = info.effects?.[g.mySeat] || [];
   if (g.status === 'finished') hint = gameResultText(g);
   else if (g.status !== 'active') hint = 'Herkes katılınca oyun başlar.';
-  else if (g.myTurn) hint = 'Topu tutup geriye doğru çekin ve bırakın: ne kadar çekerseniz o kadar sert vurur. (Esc: vazgeç)';
+  else if (g.myTurn && mine.length) hint = `Bu vuruşunuzda: ${mine.map((k) => `${GOLF_PUPS[k]?.icon} ${GOLF_PUPS[k]?.now || ''}`).join(' · ')}`;
+  else if (g.myTurn) hint = 'Topu tutup geriye doğru çekin ve bırakın. Toplanan power-up\'lar sonraki vuruşu etkiler. (Esc: vazgeç)';
   else if (g.pending) hint = 'Vuruşunuz iletiliyor…';
   else hint = `${g.players[g.turn]?.name || ''} vuruyor…`;
   $('#golf-hint').textContent = hint;
@@ -3642,9 +3660,28 @@ function golfLoop() {
 }
 function golfTick(now) {
   golfView.raf = 0;
-  if (drawGolf(now)) golfView.raf = requestAnimationFrame(golfTick);
+  let more = false;
+  // Çizimde bir hata olursa tuval yarım (boş) kalmasın: hata yutulur, sonraki kare yeniden dener.
+  try { more = drawGolf(now); } catch (err) { console.error('golf çizimi', err); }
+  if (more) golfView.raf = requestAnimationFrame(golfTick);
 }
 new ResizeObserver(() => golfLoop()).observe(golfCanvas);
+// Saha yalnızca bir şey değişince çizilir. Pencere küçültülüp/gizlenip geri gelince ya da GPU
+// sıfırlanınca (WebView2) tuvalin içeriği silinebiliyor ve geriye yalnızca arka plan kalıyordu;
+// boyut değişmediği için de yeniden çizilmiyordu (pencereyi boyutlandırınca düzeliyordu).
+// Bu olaylarda ve güvenlik için düzenli aralıklarla saha yeniden çizilir.
+golfCanvas.addEventListener('contextrestored', () => golfLoop());
+document.addEventListener('visibilitychange', () => { if (!document.hidden) golfLoop(); });
+window.addEventListener('focus', () => golfLoop());
+window.addEventListener('pageshow', () => golfLoop());
+(function watchDpr() {
+  // Pencere başka bir ekrana (farklı ölçek) taşınınca da tuval yeniden boyutlanmalı.
+  const mq = matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+  mq.addEventListener('change', () => { golfLoop(); watchDpr(); }, { once: true });
+})();
+setInterval(() => {
+  if (!document.hidden && gamesOpen() && gameById(gameState.open)?.game === 'golf') golfLoop();
+}, 1500);
 
 /** Yol üzerinde t (0–1) anındaki nokta. */
 function pointAlong(path, t) {
@@ -3687,6 +3724,14 @@ function drawGolf(now) {
     }
   }
   drawCourse(ctx, info.holes[holeIdx], info);
+  // Power-up'lar: canlandırma sürerken vuruştan önceki hâl, top üstünden geçince kaybolur.
+  let avail = info.pupAvail || [];
+  if (animPos) {
+    const f = Math.min(1, (now - a.start) / Math.max(250, (a.shot.path.length - 1) * GOLF_POINT_MS)) * (a.shot.path.length - 1);
+    avail = (a.shot.avail || []).slice();
+    for (const [i, , at] of a.shot.picked || []) if (f >= at - 1) avail[i] = false;
+  } else if (holeIdx !== info.hole) avail = [];
+  drawPups(ctx, info.holes[holeIdx], avail, info);
   const sameHole = holeIdx === info.hole;
   const order = g.players.map((p, seat) => seat).sort((x, y) => (x === g.turn) - (y === g.turn));
   let waiting = 0;
@@ -3784,6 +3829,31 @@ function drawCourse(ctx, hole, info) {
   ctx.beginPath(); ctx.moveTo(cx + 2, cy - 46); ctx.lineTo(cx + 26, cy - 38); ctx.lineTo(cx + 2, cy - 30); ctx.closePath(); ctx.fill();
 }
 
+function drawPups(ctx, hole, avail, info) {
+  const r = info.pupR || 13;
+  (hole.pups || []).forEach(([x, y, kind], i) => {
+    const p = GOLF_PUPS[kind];
+    if (!p || !avail[i]) return;
+    ctx.beginPath(); ctx.arc(x, y, r + 5, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255, 255, 255, .22)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = p.color; ctx.fill();
+    ctx.lineWidth = 2.5; ctx.strokeStyle = '#fff'; ctx.stroke();
+    // Rakibe etki edenler kırmızı kesik halkayla işaretlenir.
+    if (p.foe) {
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.arc(x, y, r + 5, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(229, 72, 77, .9)'; ctx.lineWidth = 2; ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.font = `${Math.round(r * 1.25)}px "Segoe UI Emoji", "Apple Color Emoji", sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#fff';
+    ctx.fillText(p.icon, x, y + 1);
+    ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';
+  });
+}
+
 function drawBall(ctx, [x, y], r, color, active, now) {
   if (active) {
     // Sırası gelen top: sabit çift halka (yanıp sönme sürekli çizim gerektirirdi).
@@ -3826,9 +3896,11 @@ function drawAim(ctx, info) {
   ctx.lineTo(ex - dy * 7, ey + dx * 7);
   ctx.lineTo(ex + dy * 7, ey - dx * 7);
   ctx.closePath(); ctx.fill();
-  ctx.font = 'bold 16px "Segoe UI", sans-serif';
+  ctx.font = 'bold 16px "Segoe UI", "Segoe UI Emoji", sans-serif';
   ctx.fillStyle = '#fff'; ctx.strokeStyle = 'rgba(0, 0, 0, .55)'; ctx.lineWidth = 3;
-  const label = `%${Math.max(1, Math.round(power * 100))}`;
+  const g = gameById(gameState.open);
+  const fx = pupIcons(g?.info?.effects?.[g.mySeat]);
+  const label = `%${Math.max(1, Math.round(power * 100))}${fx ? ` ${fx}` : ''}`;
   ctx.strokeText(label, bx + 14, by - 14);
   ctx.fillText(label, bx + 14, by - 14);
 }
@@ -3885,17 +3957,23 @@ function golfFlash(shot) {
   const g = gameById(gameState.open);
   const who = g?.players[shot.seat];
   const name = who?.fingerprint === myFp() ? 'Siz' : who?.name || '';
-  const text = shot.result === 'in' ? (shot.strokes === 1 ? `${name}: tek vuruşta delik! 🎉` : `${name}: delikte! ⛳ (${shot.strokes} vuruş)`)
+  const parts = [shot.result === 'in' ? (shot.strokes === 1 ? `${name}: tek vuruşta delik! 🎉` : `${name}: delikte! ⛳ (${shot.strokes} vuruş)`)
     : shot.result === 'water' ? `${name}: suya düştü! +1 ceza`
     : shot.result === 'max' ? `${name}: vuruş hakkı doldu`
-    : '';
+    : ''];
+  for (const [, kind] of shot.picked || []) {
+    const p = GOLF_PUPS[kind];
+    if (!p) continue;
+    parts.push(`${name}: ${p.icon} ${p.name}! ${p.foe ? (who?.fingerprint === myFp() ? 'Rakipleriniz etkilendi' : 'Sonraki vuruşunuz etkilenecek') : 'sonraki vuruşta işe yarayacak'}`);
+  }
+  const text = parts.filter(Boolean).join(' · ');
   const el = $('#golf-flash');
   if (!text) return;
   el.textContent = text;
-  el.className = `golf-flash ${shot.result}`;
+  el.className = `golf-flash ${shot.result}${shot.picked?.length && shot.result === 'stop' ? ' pup' : ''}`;
   el.hidden = false;
   clearTimeout(golfView.flashTimer);
-  golfView.flashTimer = setTimeout(() => { el.hidden = true; }, 1800);
+  golfView.flashTimer = setTimeout(() => { el.hidden = true; }, shot.picked?.length ? 2800 : 1800);
 }
 
 function renderScores(g) {
@@ -6406,13 +6484,18 @@ function createPreviewApi() {
       info: { fen: 'r1bqkb1r/pppp1Qpp/2n2n2/4p3/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 0 4', check: true, lastMove: 'h5f7', san: ['e4', 'e5', 'Qh5', 'Nc6', 'Bc4', 'Nf6', 'Qxf7#'] } }),
   ];
   // Örnek mini golf (gerçek arka uç çıktısı): Ahmet deliği 2 vuruşta bitirdi, sıra bizde.
-  snap.gameCatalog.push({ id: 'golf', name: 'Mini golf', description: '2–6 kişilik, 6 delikli mini golf. Sırayla vurulur; duvar, kum, su ve engeller var. En az vuruşla bitiren kazanır.', minPlayers: 2, maxPlayers: 6, seats: [] });
+  snap.gameCatalog.push({ id: 'golf', name: 'Mini golf', description: '2–6 kişilik mini golf: 25 delikten her oyunda rastgele 6 delik. Duvar, kum, su, engeller ve rakipleri yavaşlatan power-up’lar var. En az vuruşla bitiren kazanır.', minPlayers: 2, maxPlayers: 6, seats: [] });
   const golfHoles = JSON.parse('[{"blocks":[],"bounds":[[80,150],[720,150],[720,350],[80,350]],"cup":[650,250],"name":"Isınma","par":2,"posts":[],"sand":[],"tee":[150,250],"water":[]},{"blocks":[[[385,80],[415,80],[415,320],[385,320]]],"bounds":[[60,80],[740,80],[740,420],[60,420]],"cup":[640,160],"name":"Duvar","par":3,"posts":[],"sand":[],"tee":[160,160],"water":[]},{"blocks":[],"bounds":[[60,60],[360,60],[360,290],[740,290],[740,440],[60,440]],"cup":[660,365],"name":"Dönemeç","par":3,"posts":[],"sand":[[430,380,120,60]],"tee":[200,130],"water":[]},{"blocks":[],"bounds":[[60,90],[740,90],[740,410],[60,410]],"cup":[670,190],"name":"Göl","par":3,"posts":[],"sand":[[330,350,140,60]],"tee":[130,250],"water":[[330,90,140,200]]},{"blocks":[],"bounds":[[60,70],[740,70],[740,430],[60,430]],"cup":[690,250],"name":"Direkler","par":3,"posts":[[300,180,22],[300,320,22],[450,250,28],[590,165,20],[590,335,20]],"sand":[],"tee":[120,250],"water":[]},{"blocks":[[[230,60],[260,60],[260,330],[230,330]],[[480,170],[510,170],[510,440],[480,440]]],"bounds":[[60,60],[740,60],[740,440],[60,440]],"cup":[650,380],"name":"Zikzak","par":4,"posts":[],"sand":[[560,60,180,60]],"tee":[140,120],"water":[]}]');
+  // Power-up'lar ve seviye numaraları (arka uç her oyunda 25 delikten 6'sını rastgele seçer).
+  const mockPups = [[[400, 195, 'slow'], [400, 305, 'turbo']], [[400, 375, 'ghost'], [250, 300, 'shaky']], [[210, 360, 'magnet'], [560, 330, 'ice']],
+    [[400, 320, 'turbo'], [560, 330, 'slow']], [[450, 140, 'ice'], [450, 360, 'magnet']], [[370, 120, 'shaky'], [370, 400, 'ghost']]];
+  golfHoles.forEach((h, i) => Object.assign(h, { no: [1, 2, 3, 4, 5, 6][i], pups: mockPups[i] }));
   const golfPlayers = [{ fingerprint: fp1, name: 'Ahmet' }, { fingerprint: me, name: 'Nur' }, { fingerprint: fp2, name: 'Elif (Tasarım)' }];
   snap.games.unshift(gameMock({ id: 'gm3', game: 'golf', title: 'Mini golf', host: me, hostName: 'Nur', isHost: true, players: golfPlayers,
     joined: golfPlayers.map((p) => p.fingerprint), status: 'active', mySeat: 1, turn: 1, myTurn: true, needsMe: true,
     moves: ['a0p55', 'a3550p50', 'a50p45', 'a0p20'], createdAt: now - 10 * 60e3, updatedAt: now - 20e3,
-    info: { width: 800, height: 500, ballR: 7, cupR: 11, maxStrokes: 8, holes: golfHoles, hole: 0, quit: [false, false, false],
+    info: { width: 800, height: 500, ballR: 7, cupR: 11, pupR: 13, levels: 25, maxStrokes: 8, holes: golfHoles, hole: 0, quit: [false, false, false],
+      pupAvail: [true, true], effects: [[], ['magnet'], []],
       balls: [{ x: 650, y: 250, strokes: 2, done: true }, { x: 534.6, y: 216.4, strokes: 1, done: false }, { x: 475.8, y: 278.5, strokes: 1, done: false }],
       scores: [[], [], []], totals: [0, 0, 0],
       lastShot: { seat: 0, hole: 0, result: 'in', strokes: 2, end: [650, 250], path: [[597.7, 250], [610, 250], [622, 250], [632.5, 250], [650, 250]] } } }));
@@ -6431,7 +6514,20 @@ function createPreviewApi() {
     const holed = Math.hypot(x - 650, y - 250) < 14;
     Object.assign(b, { x: holed ? 650 : x, y: holed ? 250 : y, strokes: b.strokes + 1, done: holed });
     g.moves = [...g.moves, mv];
-    g.info.lastShot = { seat, hole: 0, result: holed ? 'in' : 'stop', strokes: b.strokes, end: [b.x, b.y], path };
+    const avail = (g.info.pupAvail || []).slice();
+    const picked = [];
+    g.info.holes[0].pups.forEach(([px, py, kind], i) => {
+      const at = path.findIndex(([qx, qy]) => Math.hypot(qx - px, qy - py) < 24);
+      if (avail[i] && at >= 0) picked.push([i, kind, at]);
+    });
+    const mods = g.info.effects[seat] || [];
+    g.info.effects[seat] = [];
+    for (const [i, kind] of picked) {
+      g.info.pupAvail[i] = false;
+      if (['slow', 'shaky', 'ice'].includes(kind)) g.info.effects.forEach((e, s) => { if (s !== seat && !e.includes(kind)) e.push(kind); });
+      else g.info.effects[seat] = [kind];
+    }
+    g.info.lastShot = { seat, hole: 0, result: holed ? 'in' : 'stop', strokes: b.strokes, end: [b.x, b.y], path, mods, shake: 0, picked, avail };
     const next = [1, 2, 0].map((k) => (seat + k) % 3).find((s) => !g.info.balls[s].done);
     Object.assign(g, { turn: next ?? null, myTurn: next === g.mySeat, needsMe: next === g.mySeat, updatedAt: Date.now() });
   };
@@ -6653,7 +6749,8 @@ function createPreviewApi() {
         const golf = args.game === 'golf';
         const tee = golfHoles[0].tee;
         const g = gameMock({ id: `gm${Date.now()}`, host: me, hostName: 'Nur', isHost: true, players, joined: [me], status: 'invited', mySeat: seat, createdAt: Date.now(), updatedAt: Date.now(),
-          ...(golf ? { game: 'golf', title: 'Mini golf', info: { width: 800, height: 500, ballR: 7, cupR: 11, maxStrokes: 8, holes: golfHoles, hole: 0, quit: players.map(() => false),
+          ...(golf ? { game: 'golf', title: 'Mini golf', info: { width: 800, height: 500, ballR: 7, cupR: 11, pupR: 13, levels: 25, maxStrokes: 8, holes: golfHoles, hole: 0, quit: players.map(() => false),
+            pupAvail: golfHoles[0].pups.map(() => true), effects: players.map(() => []),
             balls: players.map(() => ({ x: tee[0], y: tee[1], strokes: 0, done: false })), scores: players.map(() => []), totals: players.map(() => 0), lastShot: null } } : {}) });
         snap.games.unshift(g);
         setTimeout(() => emit('games', structuredClone(snap.games)), 40);

@@ -49,7 +49,7 @@ pub const CATALOG: &[GameDef] = &[
     GameDef {
         id: "golf",
         name: "Mini golf",
-        description: "2–6 kişilik, 6 delikli mini golf. Sırayla vurulur; duvar, kum, su ve engeller var. En az vuruşla bitiren kazanır.",
+        description: "2–6 kişilik mini golf: 25 delikten her oyunda rastgele 6 delik. Duvar, kum, su, engeller ve rakipleri yavaşlatan power-up'lar var. En az vuruşla bitiren kazanır.",
         min_players: 2,
         max_players: 6,
         seats: &[],
@@ -90,7 +90,10 @@ pub fn valid_move_text(m: &str) -> bool {
 ///
 /// Sonuçlar küçük bir önbellekte tutulur: oyun listesi her değişiklikte yeniden çizilir ve
 /// golfte her vuruşun fiziği yeniden hesaplanırdı.
-pub fn evaluate(game: &str, players: usize, moves: &[String]) -> Result<Eval, String> {
+///
+/// `seed`: oda kimliği. Rastgelelik içeren oyunlar (golfte delik seçimi) bundan türetilir; herkes
+/// aynı oda kimliğini bildiği için herkes aynı sonucu hesaplar.
+pub fn evaluate(game: &str, seed: &str, players: usize, moves: &[String]) -> Result<Eval, String> {
     use std::collections::hash_map::DefaultHasher;
     use std::collections::{HashMap, VecDeque};
     use std::hash::{Hash, Hasher};
@@ -99,14 +102,14 @@ pub fn evaluate(game: &str, players: usize, moves: &[String]) -> Result<Eval, St
     const CACHE_MAX: usize = 256;
 
     let mut h = DefaultHasher::new();
-    (game, players, moves).hash(&mut h);
+    (game, seed, players, moves).hash(&mut h);
     let key = h.finish();
     if let Some((map, _)) = CACHE.lock().unwrap().as_ref() {
         if let Some(hit) = map.get(&key) {
             return hit.clone();
         }
     }
-    let result = evaluate_uncached(game, players, moves);
+    let result = evaluate_uncached(game, seed, players, moves);
     let mut guard = CACHE.lock().unwrap();
     let (map, order) = guard.get_or_insert_with(Default::default);
     if map.insert(key, result.clone()).is_none() {
@@ -120,7 +123,7 @@ pub fn evaluate(game: &str, players: usize, moves: &[String]) -> Result<Eval, St
     result
 }
 
-fn evaluate_uncached(game: &str, players: usize, moves: &[String]) -> Result<Eval, String> {
+fn evaluate_uncached(game: &str, seed: &str, players: usize, moves: &[String]) -> Result<Eval, String> {
     if moves.len() > MAX_MOVES {
         return Err("çok fazla hamle".into());
     }
@@ -129,7 +132,7 @@ fn evaluate_uncached(game: &str, players: usize, moves: &[String]) -> Result<Eva
     }
     match game {
         "chess" => chess::evaluate(moves),
-        "golf" => golf::evaluate(players, moves),
+        "golf" => golf::evaluate(seed, players, moves),
         _ => Err("bilinmeyen oyun".into()),
     }
 }
@@ -169,15 +172,15 @@ mod tests {
         assert_eq!(def("chess").unwrap().max_players, 2);
         assert_eq!(def("golf").unwrap().max_players, 6);
         assert!(def("tavla").is_none());
-        assert!(evaluate("tavla", 2, &[]).is_err());
-        assert!(evaluate("chess", 2, &["e2e4; rm -rf".into()]).is_err());
-        let e = evaluate("chess", 2, &[]).unwrap();
+        assert!(evaluate("tavla", "r", 2, &[]).is_err());
+        assert!(evaluate("chess", "r", 2, &["e2e4; rm -rf".into()]).is_err());
+        let e = evaluate("chess", "r", 2, &[]).unwrap();
         assert_eq!(e.turn, Some(0));
         assert_eq!(e.legal.len(), 20);
         assert!(move_allowed("chess", &e, "e2e4"));
         assert!(!move_allowed("chess", &e, "e2e5"));
         assert_eq!(forfeit_move("chess", 0), None);
-        let g = evaluate("golf", 3, &[]).unwrap();
+        let g = evaluate("golf", "r", 3, &[]).unwrap();
         assert!(move_allowed("golf", &g, "a900p50"));
         assert!(!move_allowed("golf", &g, "q1"), "çekilme bir vuruş değildir");
         assert_eq!(move_actor("golf", &g, "q2"), Some(2));
