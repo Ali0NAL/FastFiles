@@ -19,6 +19,8 @@ pub mod extras;
 pub mod screen;
 #[path = "phone.rs"]
 pub mod phone;
+#[path = "watch.rs"]
+pub mod watch;
 
 use crate::chat::{ChatMessage, ChatStore, ConversationSummary, FileRef, FileTransferRef, MsgStatus};
 use crate::config::{fingerprint, Identity, Settings, TrustedDevice};
@@ -656,6 +658,7 @@ impl Node {
             || !self.pending.lock().unwrap().is_empty()
             || self.extras.phone.busy()
             || self.extras.screen.busy()
+            || self.extras.watch.busy()
     }
 
     /// Kurulum dosyasını geçici klasöre çıkarır (yeniden doğrulayarak) ve yolunu döndürür.
@@ -1277,6 +1280,20 @@ impl Node {
                 }
                 let (_rd, wr) = (rd, wr);
                 self.serve_screen(device.fingerprint.clone(), session, wr).await
+            }
+            Message::WatchUpdate { device, room, host_name, event } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                let reply = self.accept_watch_update(&client_fp, room, &host_name, event);
+                write_msg(&mut wr, &reply).await.map_err(|e| e.to_string())
+            }
+            Message::WatchAction { device, room_id, action } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                let reply = self.accept_watch_action(&client_fp, &room_id, action);
+                write_msg(&mut wr, &reply).await.map_err(|e| e.to_string())
             }
             _ => Err("beklenmeyen mesaj".into()),
         }
@@ -4379,6 +4396,91 @@ mod tests {
         let r = game_of(&alice, &id).unwrap().room.result.unwrap();
         assert_eq!((r.reason.as_str(), r.by.as_deref()), ("resign", Some(bfp.as_str())));
         game_ticks(&all, || game_of(&bob, &id).is_some_and(|v| v.room.status == RoomStatus::Finished && !v.pending)).await;
+    }
+
+    fn watch_of(node: &Node, id: &str) -> Option<watch::WatchView> {
+        node.watch_list().into_iter().find(|w| w.room.id == id)
+    }
+
+    async fn wait_for(what: &str, cond: impl Fn() -> bool) {
+        let t = Instant::now();
+        while !cond() {
+            assert!(t.elapsed() < Duration::from_secs(5), "zamanında olmadı: {what}");
+            sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Birlikte izle: davet, katılma, üyenin duraklatması/sarması herkese yansır, sahip kontrolü
+    /// kendine alabilir, yabancı oda bilgisi/istek kabul edilmez, oda kapanınca herkeste biter.
+    #[tokio::test]
+    async fn watch_party_sync_end_to_end() {
+        use watch::{WatchAction, WatchItem, WatchRoom};
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        let mallory = make_node(tmp.path(), "mallory").await;
+        introduce_all(&[&alice, &bob, &mallory]);
+        let (a, b) = (alice.identity.fingerprint.clone(), bob.identity.fingerprint.clone());
+
+        let id = alice.watch_start(&b, "dQw4w9WgXcQ", "Deneme", 30.0).unwrap().room.id;
+        wait_for("davet", || watch_of(&bob, &id).is_some()).await;
+        let v = watch_of(&bob, &id).unwrap();
+        assert!(!v.joined && !v.is_host && !v.can_control);
+        assert_eq!(v.chat_key, a, "birebir odada sohbet anahtarı sahibin parmak izi");
+        assert!(v.room.playing && v.room.position >= 30.0);
+        assert!(watch_of(&mallory, &id).is_none());
+
+        bob.watch_act(&id, WatchAction::Join).unwrap();
+        wait_for("katılma", || watch_of(&alice, &id).is_some_and(|v| v.room.joined.contains(&b))).await;
+        assert!(watch_of(&bob, &id).unwrap().can_control);
+
+        // Bob duraklatır → Alice'te de durur, konum Bob'unki.
+        bob.watch_act(&id, WatchAction::Pause { position: 75.5 }).unwrap();
+        wait_for("duraklatma", || watch_of(&alice, &id).is_some_and(|v| !v.room.playing && v.room.position == 75.5)).await;
+        wait_for("bob'a geri yansıma", || watch_of(&bob, &id).is_some_and(|v| !v.room.playing && v.room.position == 75.5)).await;
+
+        // Alice sıraya ekler, Bob "sonraki" der.
+        alice.watch_act(&id, WatchAction::Enqueue { video: "aaaaaaaaaaa".into(), title: "İkinci".into() }).unwrap();
+        wait_for("sıra", || watch_of(&bob, &id).is_some_and(|v| v.room.queue.len() == 1)).await;
+        bob.watch_act(&id, WatchAction::Next { from: "dQw4w9WgXcQ".into() }).unwrap();
+        wait_for("sonraki video", || watch_of(&alice, &id).is_some_and(|v| v.room.current.video == "aaaaaaaaaaa" && v.room.playing)).await;
+
+        // Kontrol yalnızca sahipte: Bob'un isteği reddedilir, oda değişmez.
+        alice.watch_act(&id, WatchAction::HostOnly { on: true }).unwrap();
+        wait_for("host_only", || watch_of(&bob, &id).is_some_and(|v| v.room.host_only && !v.can_control)).await;
+        let rev = watch_of(&alice, &id).unwrap().room.rev;
+        bob.watch_act(&id, WatchAction::Pause { position: 1.0 }).unwrap();
+        sleep(Duration::from_millis(300)).await;
+        let v = watch_of(&alice, &id).unwrap();
+        assert!(v.room.playing && v.room.rev == rev, "kontrol yalnızca sahipteyken üye durduramaz");
+
+        // Mallory, Alice adına sahte oda gönderemez; davetli olmadığı odaya istek gönderemez.
+        let fake = WatchRoom {
+            id: id.clone(),
+            host: a.clone(),
+            members: vec![
+                crate::chat::GroupMember { fingerprint: a.clone(), name: "alice".into() },
+                crate::chat::GroupMember { fingerprint: b.clone(), name: "bob".into() },
+            ],
+            joined: vec![a.clone()],
+            current: WatchItem { video: "bbbbbbbbbbb".into(), title: "Sahte".into(), by: a.clone() },
+            playing: false,
+            position: 0.0,
+            rev: 999,
+            ..Default::default()
+        };
+        let m_fp = mallory.identity.fingerprint.clone();
+        assert!(matches!(bob.accept_watch_update(&m_fp, fake, "alice", None), Message::ChatReject { .. }));
+        assert_eq!(watch_of(&bob, &id).unwrap().room.current.video, "aaaaaaaaaaa");
+        assert!(matches!(alice.accept_watch_action(&m_fp, &id, WatchAction::Join), Message::ChatReject { .. }));
+
+        // Bob ayrılır, sonra Alice odayı kapatır → Bob'da da biter.
+        bob.watch_act(&id, WatchAction::Leave).unwrap();
+        wait_for("ayrılma", || watch_of(&alice, &id).is_some_and(|v| !v.room.joined.contains(&b))).await;
+        alice.watch_close(&id);
+        assert!(watch_of(&alice, &id).is_none());
+        wait_for("kapanış", || watch_of(&bob, &id).is_none()).await;
+        assert!(!alice.is_busy() && !bob.is_busy());
     }
 
     /// Hamle gecikmesi: keşif döngüsü (flush_games çağrısı) olmadan, hamle karşıya hemen gitmeli.

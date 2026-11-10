@@ -284,6 +284,30 @@ fn screen_dismiss(node: NodeState, session: String) {
     node.screen_dismiss(&session);
 }
 
+// ───────────────────────────── Birlikte izle ─────────────────────────────
+
+/// Sohbetteki kişilerle YouTube videosu izleme odası açar (ya da açık odada videoyu değiştirir).
+#[tauri::command]
+async fn watch_start(node: NodeState<'_>, key: String, video: String, title: String, position: f64) -> Result<node::watch::WatchView, String> {
+    node.inner().watch_start(&key, &video, &title, position)
+}
+
+#[tauri::command]
+async fn watch_act(node: NodeState<'_>, id: String, action: node::watch::WatchAction) -> Result<(), String> {
+    node.inner().watch_act(&id, action)
+}
+
+#[tauri::command]
+async fn watch_close(node: NodeState<'_>, id: String) -> Result<(), String> {
+    node.inner().watch_close(&id);
+    Ok(())
+}
+
+#[tauri::command]
+fn watch_list(node: NodeState) -> Vec<node::watch::WatchView> {
+    node.watch_list()
+}
+
 // ───────────────────────────── Telefon ─────────────────────────────
 
 #[tauri::command]
@@ -1084,6 +1108,17 @@ pub fn run() {
                             serde_json::json!({ "view": "screen", "session": payload["session"] }),
                         );
                     }
+                    // Birlikte izle daveti
+                    "watch-invite" if !do_not_disturb(&emit_handle) => {
+                        let name = payload["hostName"].as_str().unwrap_or("Biri");
+                        let title = payload["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("YouTube videosu");
+                        notify_background(
+                            &emit_handle,
+                            &format!("🎬 {name} birlikte izlemeye çağırıyor"),
+                            &format!("{title} — katılmak için tıklayın"),
+                            serde_json::json!({ "view": "watch", "id": payload["id"] }),
+                        );
+                    }
                     // Dosya alımı başladı (güvenilir cihaz) / bitti / başarısız ("Odakta" iken sessiz)
                     "notify" if !do_not_disturb(&emit_handle) => {
                         notify_background(
@@ -1259,6 +1294,10 @@ pub fn run() {
             screen_watch,
             screen_watch_stop,
             screen_dismiss,
+            watch_start,
+            watch_act,
+            watch_close,
+            watch_list,
             phone_start,
             phone_stop,
             phone_offer,

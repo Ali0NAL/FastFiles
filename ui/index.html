@@ -51,6 +51,14 @@
     <button class="btn small" id="share-bar-stop">Paylaşımı durdur</button>
   </div>
 
+  <div class="watch-bar" id="watch-bar" hidden>
+    <span class="wb-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="2.5" y="5" width="19" height="13" rx="3"/><path d="M10 8.8v6.4l5.4-3.2z"/></svg></span>
+    <span class="wb-text" id="watch-bar-text"></span>
+    <span class="spacer"></span>
+    <button class="btn small" id="watch-bar-join">Katıl</button>
+    <button class="icon-btn sm" id="watch-bar-close" title="Daveti kapat"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+  </div>
+
   <div class="update-bar" id="update-bar" hidden>
     <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0-4-4m4 4 4-4M5 21h14"/></svg>
     <span id="update-text"></span>
@@ -229,6 +237,9 @@
           <button class="icon-btn sm" id="chat-screen" title="Ekranımı paylaş">
             <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4M12 13V7M9.5 9.5 12 7l2.5 2.5"/></svg>
           </button>
+          <button class="icon-btn sm" id="chat-watch" title="Birlikte izle (YouTube)">
+            <svg viewBox="0 0 24 24"><rect x="2.5" y="5" width="19" height="13" rx="3"/><path d="M10 8.8v6.4l5.4-3.2z"/><path d="M8 21h8"/></svg>
+          </button>
           <button class="icon-btn sm" id="chat-nudge" title="Dürt (penceresi titrer)" hidden>
             <svg viewBox="0 0 24 24"><path d="M7 11.5V6.5a1.5 1.5 0 0 1 3 0V11M10 10V4.5a1.5 1.5 0 0 1 3 0V10M13 10V5.5a1.5 1.5 0 0 1 3 0V12M16 9.5a1.5 1.5 0 0 1 3 0V14a7 7 0 0 1-7 7h-.6a6 6 0 0 1-4.6-2.2L3.5 15a1.6 1.6 0 0 1 2.4-2.1L7 14"/><path d="M3 5.5 1.8 4.6M4.6 3.2 4 1.8M20.5 3.8l1.2-1"/></svg>
           </button>
@@ -398,6 +409,62 @@
     <div class="sv-stage" id="sv-stage">
       <img id="sv-img" alt="" draggable="false" />
       <div class="sv-wait" id="sv-wait">Bağlanılıyor…</div>
+    </div>
+  </section>
+
+  <!-- Birlikte izle (YouTube) -->
+  <section class="watch-party" id="watch-party" hidden aria-label="Birlikte izle">
+    <div class="wp-head">
+      <span class="wp-live" aria-hidden="true"></span>
+      <div class="wp-titles">
+        <div class="wp-title" id="wp-title">Birlikte izle</div>
+        <div class="wp-sub" id="wp-sub"></div>
+      </div>
+      <div class="wp-viewers" id="wp-viewers"></div>
+      <span class="spacer"></span>
+      <button class="btn ghost small wp-lock" id="wp-lock" title="Oynat/duraklat/sar yalnızca sizde olsun" hidden></button>
+      <button class="icon-btn sm" id="wp-chat" title="Sohbeti aç (oynatıcı küçülür)"><svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg></button>
+      <button class="icon-btn sm" id="wp-queue-btn" title="Sıra ve video değiştir"><svg viewBox="0 0 24 24"><path d="M4 6h11M4 12h11M4 18h7M17 15v6M14 18h6"/></svg><span class="wp-qcount" id="wp-qcount" hidden></span></button>
+      <button class="icon-btn sm" id="wp-full" title="Tam ekran (F)"><svg viewBox="0 0 24 24"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/></svg></button>
+      <button class="icon-btn sm" id="wp-mini" title="Küçült (Esc) — izlerken uygulamayı kullanın"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="14" rx="2"/><rect x="12" y="11" width="7" height="5" rx="1" fill="currentColor" stroke="none"/></svg></button>
+      <button class="icon-btn sm" id="wp-close" title="Ayrıl"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+    </div>
+    <div class="wp-body">
+      <div class="wp-stage" id="wp-stage">
+        <iframe id="wp-frame" title="YouTube oynatıcısı" allow="autoplay; encrypted-media; picture-in-picture; fullscreen" referrerpolicy="strict-origin-when-cross-origin"></iframe>
+        <div class="wp-floats" id="wp-floats" aria-live="polite"></div>
+        <div class="wp-cover" id="wp-cover" hidden></div>
+        <div class="wp-mini-bar">
+          <button class="icon-btn sm" id="wp-mini-play" title="Oynat / duraklat"></button>
+          <span class="wp-mini-title" id="wp-mini-title"></span>
+          <button class="icon-btn sm" id="wp-mini-expand" title="Büyüt"><svg viewBox="0 0 24 24"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/></svg></button>
+          <button class="icon-btn sm" id="wp-mini-close" title="Ayrıl"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+        </div>
+      </div>
+      <aside class="wp-side" id="wp-side" hidden>
+        <div class="wp-side-head">
+          <b>Sıradakiler</b>
+          <button class="icon-btn sm" id="wp-side-close" title="Kapat"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+        </div>
+        <div class="wp-add">
+          <input id="wp-url" type="text" placeholder="YouTube bağlantısı yapıştırın" autocomplete="off" spellcheck="false" />
+          <div class="wp-add-btns">
+            <button class="btn small" id="wp-enqueue">Sıraya ekle</button>
+            <button class="btn soft small" id="wp-playnow">Şimdi oynat</button>
+          </div>
+          <div class="wp-add-err" id="wp-add-err"></div>
+        </div>
+        <div class="wp-queue" id="wp-queue"></div>
+      </aside>
+    </div>
+    <div class="wp-controls">
+      <button class="icon-btn wp-play" id="wp-play" title="Oynat / duraklat (Boşluk)"></button>
+      <span class="wp-time" id="wp-time">0:00</span>
+      <input class="wp-seek" id="wp-seek" type="range" min="0" max="100" step="0.1" value="0" aria-label="Konum" />
+      <span class="wp-time" id="wp-dur">0:00</span>
+      <span class="wp-sync" id="wp-sync" title="Herkesle aynı yerde misiniz?"></span>
+      <button class="icon-btn sm" id="wp-next" title="Sıradaki video"><svg viewBox="0 0 24 24"><path d="M6 5.5v13l9-6.5zM18 5v14"/></svg></button>
+      <div class="wp-reacts" id="wp-reacts"></div>
     </div>
   </section>
 

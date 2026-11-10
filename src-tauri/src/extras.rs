@@ -37,6 +37,7 @@ pub struct State {
     clip_cancel: AtomicBool,
     pub screen: screen::State,
     pub phone: phone::State,
+    pub watch: watch::State,
 }
 
 impl State {

@@ -197,6 +197,16 @@ pub enum Message {
     /// Kareler `u32 (big-endian) uzunluk + JPEG` olarak akar; uzunluk 0 = paylaşım bitti.
     ScreenWatch { device: DeviceInfo, session: String },
     ScreenStart { width: u32, height: u32 },
+    /// Birlikte izle odası (yalnızca oda sahibinden kabul edilir). Yanıt: GroupAck / ChatReject.
+    WatchUpdate {
+        device: DeviceInfo,
+        room: crate::node::watch::WatchRoom,
+        host_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event: Option<crate::node::watch::WatchEvent>,
+    },
+    /// İzleyicinin isteği (yalnızca oda sahibine gider). Yanıt: GroupAck / ChatReject.
+    WatchAction { device: DeviceInfo, room_id: String, action: crate::node::watch::WatchAction },
 }
 
 pub const MAX_CHAT_CHARS: usize = 4000;

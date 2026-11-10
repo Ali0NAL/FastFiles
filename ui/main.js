@@ -1,6 +1,8 @@
 // FastFiles arayüzü — derleme adımı gerektirmeyen düz JavaScript.
 // Tauri içinde `window.__TAURI__` kullanılır; tarayıcıda açılırsa örnek verilerle önizleme modu çalışır.
 
+import { YTPlayer, YT, parseYouTube, ytThumb, ytWatchUrl, fmtClock } from './ytplayer.js';
+
 const T = window.__TAURI__;
 const api = T ? {
   invoke: (cmd, args) => T.core.invoke(cmd, args),
@@ -156,6 +158,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   if (modalKind && modalKind !== 'incoming' && modalKind !== 'welcome') closeModal();
   else if (!modalKind && !$('#screen-viewer').hidden) closeScreenViewer();
+  else if (!modalKind && wpCovering()) setWatchMini(true);
   else if (document.getElementById('status-menu')) closeStatusMenu();
   else if (document.getElementById('react-pop')) closeReactPicker();
   else if (!modalKind && gamesOpen()) {
@@ -1200,7 +1203,7 @@ const unreadOf = (fp) => state.chats.get(fp)?.unread || 0;
 const peerByFp = (fp) => state.peers.find((p) => p.fingerprint === fp);
 const isBlocked = (fp) => !!state.settings?.blocked?.some((b) => b.fingerprint === fp);
 // Ofis ya da oyun ekranı açıkken sohbet görünmez (okunmuş sayılmamalı).
-const chatOpen = () => !!state.openChat && !$('#chat-view').hidden && !officeOpen() && !gamesOpen();
+const chatOpen = () => !!state.openChat && !$('#chat-view').hidden && !officeOpen() && !gamesOpen() && !wpCovering();
 
 function setTab(tab) {
   state.tab = tab;
@@ -1367,6 +1370,7 @@ function renderChatHeadBase() {
     $('#chat-send').disabled = !canSend || !ta.value.trim();
     $('#chat-nudge').hidden = true;
     $('#chat-screen').hidden = !canSend;
+    $('#chat-watch').hidden = !canSend;
     $('#chat-shot').disabled = !canSend;
     $('#chat-attach').title = 'Dosya gönder (ya da dosyaları sohbete sürükleyin)';
     if (chatx.edit) ta.disabled = false;
@@ -1402,6 +1406,7 @@ function renderChatHeadBase() {
   $('#chat-send').disabled = !canSend || !ta.value.trim();
   $('#chat-nudge').hidden = !canSend;
   $('#chat-screen').hidden = !canSend;
+  $('#chat-watch').hidden = !canSend;
   $('#chat-shot').disabled = blocked;
   updateComposerNote();
 }
@@ -1929,6 +1934,8 @@ $('#messages').addEventListener('keydown', (e) => {
   if (link) call('open_url', { url: link.dataset.url }).catch(() => {});
 });
 $('#messages').addEventListener('click', async (e) => {
+  const ytw = e.target.closest('.yt-watch');
+  if (ytw) return showWatchStart(state.openChat, ytw.dataset.yt);
   const link = e.target.closest('.msg-link');
   if (link) {
     e.preventDefault();
@@ -2332,6 +2339,7 @@ function onNotificationClick(target = {}) {
   if (lockVisible()) return;
   if (target.view === 'phone') return openPhone();
   if (target.view === 'screen' && target.session) return watchScreen(target.session);
+  if (target.view === 'watch' && target.id) return wp.rooms.get(target.id)?.v.joined ? openWatchPlayer(target.id) : joinWatch(target.id);
   if (modalKind && modalKind !== 'incoming') closeModal();
   if (target.view === 'games') {
     if (target.id && gameById(target.id)) openRoom(target.id);
@@ -4294,6 +4302,7 @@ function messageBody(text, key, hitRe) {
     if (!url.includes('.')) continue;
     out += messageSpan(text.slice(last, mm.index), key, hitRe);
     out += `<a class="msg-link" data-url="${esc(url)}" title="${esc(url)}" tabindex="0">${messageSpan(url, null, hitRe)}</a>`;
+    if (parseYouTube(url)) out += `<button class="yt-watch" data-yt="${esc(url)}" title="Bu videoyu sohbettekilerle aynı anda izleyin">${ic.play}Birlikte izle</button>`;
     last = mm.index + url.length;
   }
   return out + messageSpan(text.slice(last), key, hitRe);
@@ -5120,6 +5129,687 @@ $('#sv-fit').onclick = () => {
 };
 $('#sv-img').addEventListener('dblclick', () => $('#sv-full').click());
 
+// ───────────────────────────── Birlikte izle (YouTube) ─────────────────────────────
+// Video ağdan geçmez: herkes videoyu kendi bilgisayarında YouTube'dan oynatır. Arka uç yalnızca
+// odanın durumunu (hangi video, oynuyor mu, kaçıncı saniye) eşitler (bkz. src-tauri/src/watch.rs).
+// Bu taraf, oynatıcıyı o duruma uydurur ve kullanıcının oynatıcıda yaptığı oynat/duraklat/sar
+// işlemlerini odaya bildirir.
+
+const WP_REACTIONS = ['👍', '❤️', '😂', '😮', '😢', '👏', '🔥', '🎉'];
+/** Konum farkı bundan büyükse oynatıcı sarılır (sn). */
+const WP_DRIFT_PLAYING = 1.5;
+const WP_DRIFT_PAUSED = 0.75;
+const wp = {
+  rooms: new Map(), // id → { v: WatchView, at: performance.now() (konumun ölçüldüğü an) }
+  open: null, // oynatıcıda açık oda
+  player: null,
+  mini: false,
+  cmdAt: 0, // son kendi komutumuz (oynatıcının bu komuta verdiği tepki kullanıcı işlemi sanılmasın)
+  seekAt: 0,
+  playTries: 0,
+  needsClick: false,
+  error: null,
+  sentEnd: new Set(),
+  sentTitle: new Set(),
+  dragging: false,
+  optimistic: null, // { id, rev, until, playing, position, at }
+  lastNote: '',
+  dismissed: new Set(), // daveti kapatılan odalar (çubukta gösterilmez)
+};
+
+const wpRoom = (id = wp.open) => wp.rooms.get(id);
+const wpName = (r, fp) => (fp === myFp() ? 'Siz' : r.v.room.members.find((m) => m.fingerprint === fp)?.name || 'Biri');
+/** Başlık: odadaki kayıt, yoksa oynatıcının bildirdiği (o video oynuyorsa). */
+const wpTitle = (item) => item?.title || (item && wp.player?.video === item.video && wp.player.title) || 'YouTube videosu';
+const wpPlayIcon = (playing) => (playing ? ic.pause : ic.play);
+function wpCovering() { return !!wp.open && !wp.mini; }
+
+/** Odanın şu anki (beklenen) konumu. */
+function wpExpected(r) {
+  const room = r.v.room;
+  let t = room.position + (room.playing ? (performance.now() - r.at) / 1000 : 0);
+  const d = wp.player?.video === room.current.video ? wp.player.duration : 0;
+  if (d > 0) t = Math.min(t, d);
+  return Math.max(0, t);
+}
+
+function wpStore(view) {
+  const r = { v: view, at: performance.now() };
+  // Kendi isteğim sahibine giderken eski sürümlü bir güncelleme gelirse oynatıcı geri sarılmasın.
+  const o = wp.optimistic;
+  if (o && o.id === view.room.id && performance.now() < o.until && view.room.rev <= o.rev) {
+    Object.assign(r.v.room, { playing: o.playing, position: o.position });
+    r.at = o.at;
+  }
+  wp.rooms.set(view.room.id, r);
+  return r;
+}
+
+function onWatch({ view, event }) {
+  const r = wpStore(view);
+  if (view.joined) wp.dismissed.delete(view.room.id);
+  if (wp.open === view.room.id) {
+    if (!view.joined) closeWatchPlayer(false);
+    else {
+      renderWatch();
+      wpSync();
+      if (event) wpShowEvent(r, event);
+    }
+  }
+  renderWatchBar();
+}
+
+function onWatchInvite({ id, hostName, title }) {
+  if (wp.open) return renderWatchBar();
+  toast(`🎬 ${hostName} birlikte izlemeye çağırıyor${title ? ` · ${title}` : ''}`, { action: 'Katıl', timeout: 10000, onAction: () => joinWatch(id) });
+  renderWatchBar();
+}
+
+function onWatchEnd({ id, reason, hostName }) {
+  const r = wp.rooms.get(id);
+  wp.rooms.delete(id);
+  wp.dismissed.delete(id);
+  if (wp.open === id) {
+    closeWatchPlayer(false);
+    if (reason !== 'closed') toast(reason === 'gone' ? 'İzleme odasıyla bağlantı kesildi' : `${hostName || 'Oda sahibi'} izleme odasını kapattı`);
+  } else if (r?.v.joined && reason === 'ended') toast(`${hostName || 'Oda sahibi'} izleme odasını kapattı`);
+  renderWatchBar();
+}
+
+// ───────────── Oda açma / katılma ─────────────
+
+function wpChatTargets(key) {
+  const g = groupOf(key);
+  if (g) return `${g.name || 'Grup'} (${Math.max(0, g.members.length - 1)} kişi)`;
+  return peerByFp(key)?.name || state.chats.get(key)?.name || 'Kişi';
+}
+
+/** Sohbetteki kişilerle izleme odası açma penceresi. `preset`: hazır bağlantı. */
+function showWatchStart(key, preset = '') {
+  if (!key) return;
+  const mine = [...wp.rooms.values()].find((r) => r.v.chatKey === key && r.v.isHost);
+  const m = openModal('watch', `
+    <h3>🎬 Birlikte izle</h3>
+    <p class="lead">${mine ? 'Açık odanızda bu video oynatılır.' : `<b>${esc(wpChatTargets(key))}</b> davet edilir.`} Herkes videoyu kendi bilgisayarında izler; oynat, duraklat ve sar herkeste aynı anda olur.</p>
+    <div class="field">
+      <label for="ws-url">YouTube bağlantısı</label>
+      <input class="input" id="ws-url" placeholder="https://www.youtube.com/watch?v=…" autofocus spellcheck="false" autocomplete="off" value="${esc(preset)}" />
+      <div class="yt-card" id="ws-card" hidden><img id="ws-thumb" alt="" /><div><b>YouTube videosu</b><div class="muted" id="ws-meta"></div></div></div>
+      <div class="err" id="ws-err"></div>
+    </div>
+    <div class="foot">
+      <button class="btn ghost" data-close>Vazgeç</button>
+      <button class="btn" id="ws-go" disabled>${mine ? 'Bu videoyu aç' : 'Başlat ve davet et'}</button>
+    </div>`);
+  const input = m.querySelector('#ws-url');
+  const go = m.querySelector('#ws-go');
+  m.querySelector('[data-close]').onclick = closeModal;
+  const check = () => {
+    const hit = parseYouTube(input.value);
+    go.disabled = !hit;
+    m.querySelector('#ws-card').hidden = !hit;
+    m.querySelector('#ws-err').textContent = input.value.trim() && !hit ? 'Bu bir YouTube video bağlantısı değil' : '';
+    if (hit) {
+      m.querySelector('#ws-thumb').src = ytThumb(hit.video);
+      m.querySelector('#ws-meta').textContent = hit.start ? `${fmtClock(hit.start)} konumundan başlar` : 'Baştan başlar';
+    }
+    return hit;
+  };
+  input.addEventListener('input', check);
+  const submit = async () => {
+    const hit = check();
+    if (!hit) return input.focus();
+    go.disabled = true;
+    try {
+      const view = await api.invoke('watch_start', { key, video: hit.video, title: '', position: hit.start });
+      closeModal();
+      wpStore(view);
+      openWatchPlayer(view.room.id);
+    } catch (e) {
+      m.querySelector('#ws-err').textContent = String(e);
+      go.disabled = false;
+    }
+  };
+  go.onclick = submit;
+  input.addEventListener('keydown', (e) => e.key === 'Enter' && submit());
+  check();
+}
+
+/** Sohbet başlığındaki düğme: bu sohbette açık oda varsa ona katıl, yoksa yeni oda. */
+function watchFromChat(key) {
+  const r = [...wp.rooms.values()].find((x) => x.v.chatKey === key);
+  if (r) return r.v.joined ? openWatchPlayer(r.v.room.id) : joinWatch(r.v.room.id);
+  showWatchStart(key);
+}
+
+async function joinWatch(id) {
+  const r = wp.rooms.get(id);
+  if (!r) return toast('Bu izleme odası artık yok', { type: 'error' });
+  wp.dismissed.delete(id);
+  if (!r.v.joined) {
+    try {
+      await call('watch_act', { id, action: { kind: 'join' } });
+    } catch { return; }
+    r.v.joined = true;
+    r.v.canControl = r.v.isHost || !r.v.room.hostOnly;
+  }
+  openWatchPlayer(id);
+}
+
+// ───────────── Oynatıcı ekranı ─────────────
+
+function openWatchPlayer(id) {
+  const r = wp.rooms.get(id);
+  if (!r) return;
+  if (wp.open && wp.open !== id) closeWatchPlayer(true);
+  if (modalKind && modalKind !== 'incoming') closeModal();
+  if (!$('#screen-viewer').hidden) closeScreenViewer();
+  const fresh = wp.open !== id;
+  wp.open = id;
+  if (fresh) {
+    Object.assign(wp, { playTries: 0, needsClick: false, error: null, optimistic: null });
+    wp.player?.destroy();
+    wp.player = new YTPlayer($('#wp-frame'), {
+      onReady: () => wpSync(),
+      onState: wpOnState,
+      onTime: wpOnTime,
+      onError: (code) => { wp.error = code; wp.errorVideo = wp.player?.video; renderWatchCover(); },
+      onTitle: wpOnTitle,
+    });
+    const exp = wpExpected(r);
+    wp.cmdAt = performance.now();
+    wp.player.load(r.v.room.current.video, exp, r.v.room.playing);
+  }
+  setWatchMini(false);
+  $('#watch-party').hidden = false;
+  renderWatch();
+  renderWatchBar();
+  clearInterval(wp.timer);
+  wp.timer = setInterval(() => { wpSync(); renderWatchProgress(); }, 400);
+}
+
+/** Oynatıcıyı kapatır. `leave`: odadan ayrıl (sahipse odayı herkes için kapat). */
+function closeWatchPlayer(leave = true) {
+  const id = wp.open;
+  if (!id) return;
+  const r = wp.rooms.get(id);
+  wp.open = null;
+  clearInterval(wp.timer);
+  wp.player?.destroy();
+  wp.player = null;
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  $('#watch-party').hidden = true;
+  $('#wp-floats').innerHTML = '';
+  if (leave && r) {
+    if (r.v.isHost) {
+      api.invoke('watch_close', { id }).catch(() => {});
+      wp.rooms.delete(id);
+    } else {
+      // Ayrılınca davet çubuğu hemen geri gelmesin; sohbet başlığındaki düğmeyle yeniden katılınır.
+      wp.dismissed.add(id);
+      api.invoke('watch_act', { id, action: { kind: 'leave' } }).catch(() => {});
+      r.v.joined = false;
+      r.v.canControl = false;
+    }
+  }
+  renderWatchBar();
+}
+
+function askCloseWatch() {
+  const r = wpRoom();
+  if (!r) return;
+  if (!r.v.isHost) return closeWatchPlayer(true);
+  const others = r.v.room.joined.filter((f) => f !== myFp()).length;
+  if (!others) return closeWatchPlayer(true);
+  const m = openModal('watch-close', `
+    <h3>İzleme odası kapatılsın mı?</h3>
+    <p class="lead">Odayı siz açtınız. Kapatırsanız izleyen ${others} kişi için de biter. Yalnızca oynatıcıyı gizlemek için küçültebilirsiniz.</p>
+    <div class="foot">
+      <button class="btn ghost" id="wc-mini">Küçült</button>
+      <button class="btn danger" id="wc-go">Herkes için kapat</button>
+    </div>`);
+  m.querySelector('#wc-mini').onclick = () => { closeModal(); setWatchMini(true); };
+  m.querySelector('#wc-go').onclick = () => { closeModal(); closeWatchPlayer(true); };
+}
+
+function setWatchMini(on) {
+  wp.mini = !!on && !!wp.open;
+  const box = $('#watch-party');
+  box.classList.toggle('mini', wp.mini);
+  box.style.inset = '';
+  if (wp.mini) {
+    // Kullanıcının sürüklediği yer hatırlanır (yalnızca bu bilgisayarda).
+    try {
+      const at = JSON.parse(localStorage.getItem('ff.watch.mini') || 'null');
+      if (at) wpPlaceMini(at.x, at.y);
+    } catch { /* varsayılan yer */ }
+  }
+  if (wp.mini && document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  if (!wp.mini && chatOpen()) markRead(state.openChat);
+}
+
+/** Küçük oynatıcıyı pencere içinde tutarak (x, y) köşesine taşır. */
+function wpPlaceMini(x, y) {
+  const box = $('#watch-party');
+  const w = box.offsetWidth || 384;
+  const h = box.offsetHeight || 216;
+  x = Math.min(Math.max(8, x), window.innerWidth - w - 8);
+  y = Math.min(Math.max(8, y), window.innerHeight - h - 8);
+  box.style.inset = `${y}px auto auto ${x}px`;
+  return { x, y };
+}
+{
+  // Küçük oynatıcı başlığından sürüklenir.
+  const handle = $('#wp-mini-title');
+  let drag = null;
+  handle.addEventListener('pointerdown', (e) => {
+    if (!wp.mini) return;
+    const rect = $('#watch-party').getBoundingClientRect();
+    drag = { dx: e.clientX - rect.left, dy: e.clientY - rect.top };
+    handle.setPointerCapture(e.pointerId);
+  });
+  handle.addEventListener('pointermove', (e) => {
+    if (drag) drag.at = wpPlaceMini(e.clientX - drag.dx, e.clientY - drag.dy);
+  });
+  const end = () => {
+    if (drag?.at) try { localStorage.setItem('ff.watch.mini', JSON.stringify(drag.at)); } catch { /* önemsiz */ }
+    drag = null;
+  };
+  handle.addEventListener('pointerup', end);
+  handle.addEventListener('pointercancel', end);
+  window.addEventListener('resize', () => {
+    const box = $('#watch-party');
+    if (wp.mini && box.style.inset) { const r = box.getBoundingClientRect(); wpPlaceMini(r.left, r.top); }
+  });
+}
+
+function renderWatch() {
+  const r = wpRoom();
+  if (!r) return;
+  const { room } = r.v;
+  const me = myFp();
+  $('#wp-title').textContent = wpTitle(room.current);
+  $('#wp-mini-title').textContent = wpTitle(room.current);
+  const viewers = room.joined.length;
+  const g = r.v.chatKey.startsWith('g:') ? groupOf(r.v.chatKey) : null;
+  $('#wp-sub').textContent = `${r.v.isHost ? 'Odayı siz açtınız' : `${r.v.hostName} açtı`}${g ? ` · ${g.name}` : ''} · ${viewers} kişi izliyor${room.hostOnly ? ' · kontrol oda sahibinde' : ''}`;
+  const shown = room.joined.slice(0, 6);
+  $('#wp-viewers').innerHTML = shown.map((fp) => {
+    const name = wpName(r, fp) === 'Siz' ? state.device?.name || 'Siz' : wpName(r, fp);
+    return `<span class="avatar" title="${esc(fp === me ? `${name} (siz)` : name)}" style="background:${grad(fp)}">${face(fp, name)}</span>`;
+  }).join('') + (room.joined.length > shown.length ? `<span class="more">+${room.joined.length - shown.length}</span>` : '');
+  const lock = $('#wp-lock');
+  lock.hidden = !r.v.isHost;
+  lock.classList.toggle('on', room.hostOnly);
+  lock.textContent = room.hostOnly ? '🔒 Kontrol bende' : '🔓 Herkes kontrol eder';
+  lock.title = room.hostOnly ? 'Şu an yalnızca siz oynatıp durdurabilirsiniz. Herkese açmak için tıklayın.' : 'Şu an herkes oynatıp durdurabilir. Yalnızca sizde olsun diye tıklayın.';
+  const can = r.v.canControl;
+  $('#wp-play').disabled = !can;
+  $('#wp-seek').disabled = !can;
+  $('#wp-next').disabled = !can;
+  $('#wp-next').hidden = !room.queue.length;
+  $('#wp-mini-play').disabled = !can;
+  const q = $('#wp-qcount');
+  q.hidden = !room.queue.length;
+  q.textContent = room.queue.length;
+  $('#wp-play').title = can ? 'Oynat / duraklat (Boşluk)' : 'Kontrol oda sahibinde';
+  renderWatchQueue();
+  renderWatchCover();
+  renderWatchProgress();
+}
+
+function renderWatchProgress() {
+  const r = wpRoom();
+  if (!r || !wp.player) return;
+  const p = wp.player;
+  const playing = r.v.room.playing;
+  $('#wp-play').innerHTML = wpPlayIcon(playing);
+  $('#wp-mini-play').innerHTML = wpPlayIcon(playing);
+  const t = p.video === r.v.room.current.video && p.ready ? p.time() : wpExpected(r);
+  const d = p.duration || 0;
+  const seek = $('#wp-seek');
+  if (!wp.dragging) {
+    seek.max = String(Math.max(1, d));
+    seek.value = String(Math.min(t, d || t));
+    $('#wp-time').textContent = fmtClock(t);
+  }
+  $('#wp-dur').textContent = d ? fmtClock(d) : '–:––';
+  const sync = $('#wp-sync');
+  const diff = Math.abs(t - wpExpected(r));
+  const ok = p.ready && p.video === r.v.room.current.video && (diff < WP_DRIFT_PLAYING || p.state === YT.ENDED);
+  sync.className = `wp-sync ${ok ? 'ok' : 'busy'}`;
+  sync.textContent = !p.ready ? 'Yükleniyor…' : ok ? 'Herkesle aynı yerde' : 'Eşitleniyor…';
+}
+
+function renderWatchCover() {
+  const r = wpRoom();
+  const cover = $('#wp-cover');
+  if (!r) return (cover.hidden = true);
+  const video = r.v.room.current.video;
+  if (wp.error != null) {
+    const embed = [101, 150, 153].includes(wp.error);
+    cover.innerHTML = `<div style="font-size:34px">⚠️</div>
+      <b>${embed ? 'Bu video uygulama içinde oynatılamıyor' : 'Video açılamadı'}</b>
+      <p>${embed ? 'Video sahibi gömülü oynatmayı kapatmış olabilir.' : 'Video silinmiş, gizli ya da bağlantı hatalı olabilir.'} Tarayıcıda açabilir ya da sıradan başka bir video seçebilirsiniz.</p>
+      <button class="btn ghost small" id="wp-open-yt">YouTube'da aç</button>`;
+    cover.querySelector('#wp-open-yt').onclick = () => call('open_url', { url: ytWatchUrl(video, wpExpected(r)) }).catch(() => {});
+    cover.hidden = false;
+  } else if (wp.needsClick && r.v.room.playing) {
+    cover.innerHTML = `<button class="big-play" id="wp-unblock" title="Oynat">${ic.play}</button><p>Diğerleri izliyor — katılmak için tıklayın</p>`;
+    cover.querySelector('#wp-unblock').onclick = () => {
+      wp.needsClick = false;
+      wp.playTries = 0;
+      wp.cmdAt = performance.now();
+      wp.player?.seek(wpExpected(r));
+      wp.player?.play();
+      renderWatchCover();
+    };
+    cover.hidden = false;
+  } else cover.hidden = true;
+}
+
+function renderWatchQueue() {
+  const r = wpRoom();
+  if (!r) return;
+  const { room } = r.v;
+  const me = myFp();
+  const item = (it, i, now) => {
+    const canRemove = !now && (it.by === me || r.v.canControl);
+    return `<div class="wp-qi${now ? ' now' : ''}">
+      <img src="${esc(ytThumb(it.video))}" alt="" loading="lazy" />
+      <div class="qt"><b>${esc(wpTitle(it))}</b><span>${now ? 'Şimdi oynuyor' : `${esc(wpName(r, it.by))} ekledi`}</span></div>
+      ${now ? '' : `<div class="qa">
+        ${r.v.canControl ? `<button class="icon-btn sm" data-qplay="${i}" title="Şimdi oynat">${ic.play}</button>` : ''}
+        ${canRemove ? `<button class="icon-btn sm" data-qdel="${i}" title="Sıradan çıkar">${ic.x}</button>` : ''}
+      </div>`}
+    </div>`;
+  };
+  $('#wp-queue').innerHTML = item(room.current, -1, true)
+    + (room.queue.length
+      ? `<div class="wp-qsec">Sırada ${room.queue.length}</div>${room.queue.map((it, i) => item(it, i, false)).join('')}`
+      : '<div class="wp-qempty">Sırada video yok. Bağlantı yapıştırıp ekleyin; bu video bitince sıradaki kendiliğinden başlar.</div>');
+  $('#wp-playnow').hidden = !r.v.canControl;
+}
+
+// ───────────── Eşitleme ─────────────
+
+/** Oynatıcıyı odanın durumuna uydurur (400 ms'de bir ve her güncellemede). */
+function wpSync() {
+  const r = wpRoom();
+  const p = wp.player;
+  if (!r || !p) return;
+  const { room } = r.v;
+  // Hata yalnızca o videoya aittir: oda başka videoya geçince yeniden denenir.
+  if (wp.error != null) {
+    if (room.current.video === wp.errorVideo) return;
+    wp.error = null;
+    renderWatchCover();
+  }
+  const now = performance.now();
+  if (p.video !== room.current.video) {
+    wp.cmdAt = now;
+    wp.error = null;
+    wp.playTries = 0;
+    p.load(room.current.video, wpExpected(r), room.playing);
+    renderWatch();
+    return;
+  }
+  if (!p.ready) return;
+  const exp = wpExpected(r);
+  const t = p.time();
+  const st = p.state;
+  if (room.playing) {
+    if (st === YT.ENDED) return wpReportEnd(r);
+    if (st !== YT.PLAYING && st !== YT.BUFFERING && now - wp.cmdAt > 1200) {
+      wp.cmdAt = now;
+      if (++wp.playTries > 3 && !wp.needsClick) {
+        // Oynatıcı başlamıyor: büyük olasılıkla otomatik oynatma engellendi.
+        wp.needsClick = true;
+        renderWatchCover();
+      }
+      if (Math.abs(t - exp) > WP_DRIFT_PAUSED) p.seek(exp);
+      p.play();
+      return;
+    }
+    if (st === YT.PLAYING) {
+      wp.playTries = 0;
+      if (wp.needsClick) { wp.needsClick = false; renderWatchCover(); }
+      if (Math.abs(t - exp) > WP_DRIFT_PLAYING && now - wp.seekAt > 2500) {
+        wp.cmdAt = wp.seekAt = now;
+        p.seek(exp);
+      }
+    }
+  } else {
+    if (wp.needsClick) { wp.needsClick = false; renderWatchCover(); }
+    if ((st === YT.PLAYING || st === YT.BUFFERING) && now - wp.cmdAt > 700) {
+      wp.cmdAt = now;
+      p.pause();
+    }
+    if (st !== YT.ENDED && Math.abs(t - exp) > WP_DRIFT_PAUSED && now - wp.seekAt > 1200) {
+      wp.cmdAt = wp.seekAt = now;
+      p.seek(exp);
+    }
+  }
+}
+
+/** Kullanıcı oynatıcının kendisiyle mi oynuyor (iframe odakta ve son komutumuz eskide)? */
+function wpUserAction() {
+  return document.activeElement === $('#wp-frame') && performance.now() - wp.cmdAt > 700;
+}
+
+function wpOnState(st) {
+  const r = wpRoom();
+  if (!r) return;
+  renderWatchProgress();
+  if (st === YT.ENDED && r.v.room.playing) return wpReportEnd(r);
+  if (!r.v.canControl || !wpUserAction()) return;
+  const t = wp.player.time();
+  if (st === YT.PAUSED && r.v.room.playing) wpSend('pause', { position: t });
+  else if (st === YT.PLAYING && !r.v.room.playing) wpSend('play', { position: t });
+}
+
+function wpOnTime(t) {
+  const r = wpRoom();
+  if (!r || !r.v.canControl || !wpUserAction() || wp.player.state === YT.ENDED) return;
+  // Oynatıcıdaki ilerleme çubuğundan sarıldı: konum beklenenden belirgin şekilde farklı.
+  if (Math.abs(t - wpExpected(r)) > 2.5 && performance.now() - wp.seekAt > 1500) {
+    clearTimeout(wp.userSeek);
+    wp.userSeek = setTimeout(() => {
+      const rr = wpRoom();
+      if (rr && wp.player && Math.abs(wp.player.time() - wpExpected(rr)) > 2.5) wpSend('seek', { position: wp.player.time() });
+    }, 350);
+  }
+}
+
+function wpOnTitle(title, video) {
+  const r = wpRoom();
+  if (!r || !title) return;
+  if (r.v.room.current.video !== video || r.v.room.current.title) return;
+  renderWatch();
+  // Başlık odaya bir kez bildirilir (sırada aynı video başlıksız bekliyorsa onu da doldurur).
+  const key = `${r.v.room.id}:${video}`;
+  if (wp.sentTitle.has(key)) return;
+  wp.sentTitle.add(key);
+  api.invoke('watch_act', { id: r.v.room.id, action: { kind: 'title', video, title } }).catch(() => {});
+}
+
+function wpReportEnd(r) {
+  const key = `${r.v.room.id}:${r.v.room.current.video}:${r.v.room.rev}`;
+  if (!r.v.canControl || wp.sentEnd.has(key)) return;
+  wp.sentEnd.add(key);
+  api.invoke('watch_act', { id: r.v.room.id, action: { kind: 'next', from: r.v.room.current.video } }).catch(() => {});
+}
+
+/** Odaya istek gönderir; oynat/duraklat/sar hemen yerelde de uygulanır. */
+async function wpSend(kind, extra = {}) {
+  const r = wpRoom();
+  if (!r) return;
+  const control = ['play', 'pause', 'seek', 'load', 'next'].includes(kind);
+  if (control && !r.v.canControl) return toast('Kontrol şu an yalnızca oda sahibinde');
+  const now = performance.now();
+  if (['play', 'pause', 'seek'].includes(kind)) {
+    const room = r.v.room;
+    if (kind === 'play') room.playing = true;
+    if (kind === 'pause') room.playing = false;
+    room.position = extra.position;
+    r.at = now;
+    wp.optimistic = { id: room.id, rev: room.rev, until: now + 2500, playing: room.playing, position: room.position, at: now };
+    wp.cmdAt = wp.seekAt = now;
+    if (kind === 'seek') wp.player?.seek(extra.position);
+    if (kind === 'play') wp.player?.play();
+    if (kind === 'pause') wp.player?.pause();
+    renderWatchProgress();
+  }
+  try {
+    await api.invoke('watch_act', { id: r.v.room.id, action: { kind, ...extra } });
+  } catch (e) {
+    toast(String(e), { type: 'error' });
+  }
+}
+
+function wpTogglePlay() {
+  const r = wpRoom();
+  if (!r) return;
+  const t = wp.player?.ready ? wp.player.time() : wpExpected(r);
+  wpSend(r.v.room.playing ? 'pause' : 'play', { position: t });
+}
+
+// ───────────── Olaylar ve tepkiler ─────────────
+
+function wpFloat(emoji, name) {
+  const box = $('#wp-floats');
+  const el = document.createElement('div');
+  el.className = 'wp-float';
+  el.style.left = `${10 + Math.random() * 75}%`;
+  el.innerHTML = `<span class="e">${esc(emoji)}</span><span class="n">${esc(name)}</span>`;
+  box.appendChild(el);
+  setTimeout(() => el.remove(), 2700);
+}
+
+function wpNote(text) {
+  const box = $('#wp-floats');
+  box.querySelectorAll('.wp-note').forEach((n) => n.remove());
+  const el = document.createElement('div');
+  el.className = 'wp-note';
+  el.textContent = text;
+  box.appendChild(el);
+  setTimeout(() => el.remove(), 3100);
+}
+
+function wpShowEvent(r, e) {
+  if (e.by === myFp()) return;
+  const who = wpName(r, e.by);
+  if (e.kind === 'react') return wpFloat(e.emoji, who);
+  const text = {
+    play: `▶ ${who} oynattı`,
+    pause: `⏸ ${who} durdurdu · ${fmtClock(e.position)}`,
+    seek: `⏩ ${who} sardı · ${fmtClock(e.position)}`,
+    load: `🎬 ${who} yeni video açtı`,
+    enqueue: `➕ ${who} sıraya video ekledi`,
+    next: `⏭ ${who} sıradaki videoya geçti`,
+    join: `👋 ${who} katıldı`,
+    leave: `${who} ayrıldı`,
+    hostOnly: r.v.room.hostOnly ? '🔒 Kontrol artık yalnızca oda sahibinde' : '🔓 Artık herkes kontrol edebilir',
+  }[e.kind];
+  if (text) wpNote(text);
+}
+
+function wpReact(emoji) {
+  const r = wpRoom();
+  if (!r) return;
+  wpFloat(emoji, 'Siz');
+  api.invoke('watch_act', { id: r.v.room.id, action: { kind: 'react', emoji } }).catch((e) => toast(String(e), { type: 'error' }));
+}
+
+// ───────────── Davet çubuğu ─────────────
+
+function renderWatchBar() {
+  const invites = [...wp.rooms.values()].filter((r) => !r.v.joined && r.v.room.id !== wp.open && !wp.dismissed.has(r.v.room.id));
+  const bar = $('#watch-bar');
+  bar.hidden = !invites.length;
+  if (!invites.length) return;
+  const r = invites[0];
+  const watching = r.v.room.joined.length;
+  $('#watch-bar-text').innerHTML = `<b>${esc(r.v.hostName)}</b> birlikte izliyor: ${esc(wpTitle(r.v.room.current))} · ${watching} kişi${invites.length > 1 ? ` · +${invites.length - 1} oda daha` : ''}`;
+  $('#watch-bar-join').onclick = () => joinWatch(r.v.room.id);
+  $('#watch-bar-close').onclick = () => { wp.dismissed.add(r.v.room.id); renderWatchBar(); };
+}
+
+// ───────────── Düğmeler ─────────────
+
+$('#chat-watch').onclick = () => watchFromChat(state.openChat);
+$('#wp-play').onclick = wpTogglePlay;
+$('#wp-mini-play').onclick = wpTogglePlay;
+$('#wp-close').onclick = askCloseWatch;
+$('#wp-mini-close').onclick = askCloseWatch;
+$('#wp-mini').onclick = () => setWatchMini(true);
+$('#wp-mini-expand').onclick = () => setWatchMini(false);
+$('#wp-full').onclick = () => {
+  if (document.fullscreenElement) return document.exitFullscreen().catch(() => {});
+  $('#wp-stage').requestFullscreen?.().catch(() => {});
+};
+$('#wp-chat').onclick = () => {
+  const r = wpRoom();
+  if (!r) return;
+  setWatchMini(true);
+  openChat(r.v.chatKey, r.v.chatKey.startsWith('g:') ? undefined : r.v.hostName);
+};
+$('#wp-lock').onclick = () => {
+  const r = wpRoom();
+  if (r) api.invoke('watch_act', { id: r.v.room.id, action: { kind: 'hostOnly', on: !r.v.room.hostOnly } }).catch((e) => toast(String(e), { type: 'error' }));
+};
+$('#wp-next').onclick = () => {
+  const r = wpRoom();
+  if (r) wpSend('next', { from: r.v.room.current.video });
+};
+$('#wp-queue-btn').onclick = () => {
+  const side = $('#wp-side');
+  side.hidden = !side.hidden;
+  $('#wp-queue-btn').classList.toggle('active', !side.hidden);
+  if (!side.hidden) $('#wp-url').focus();
+};
+$('#wp-side-close').onclick = () => { $('#wp-side').hidden = true; $('#wp-queue-btn').classList.remove('active'); };
+const wpSeek = $('#wp-seek');
+wpSeek.addEventListener('input', () => { wp.dragging = true; $('#wp-time').textContent = fmtClock(Number(wpSeek.value)); });
+wpSeek.addEventListener('change', () => { wp.dragging = false; wpSend('seek', { position: Number(wpSeek.value) }); });
+$('#wp-reacts').innerHTML = WP_REACTIONS.map((e) => `<button data-react="${e}" title="Tepki gönder">${e}</button>`).join('');
+$('#wp-reacts').onclick = (e) => {
+  const b = e.target.closest('[data-react]');
+  if (b) wpReact(b.dataset.react);
+};
+function wpAddFromInput(now) {
+  const input = $('#wp-url');
+  const hit = parseYouTube(input.value);
+  const err = $('#wp-add-err');
+  if (!hit) { err.textContent = input.value.trim() ? 'Bu bir YouTube video bağlantısı değil' : 'Önce bir bağlantı yapıştırın'; return input.focus(); }
+  err.textContent = '';
+  input.value = '';
+  if (now) wpSend('load', { video: hit.video, title: '', position: hit.start });
+  else wpSend('enqueue', { video: hit.video, title: '' });
+}
+$('#wp-enqueue').onclick = () => wpAddFromInput(false);
+$('#wp-playnow').onclick = () => wpAddFromInput(true);
+$('#wp-url').addEventListener('keydown', (e) => { if (e.key === 'Enter') wpAddFromInput(false); });
+$('#wp-queue').onclick = (e) => {
+  const r = wpRoom();
+  if (!r) return;
+  const play = e.target.closest('[data-qplay]');
+  const del = e.target.closest('[data-qdel]');
+  if (play) {
+    const it = r.v.room.queue[Number(play.dataset.qplay)];
+    if (it) wpSend('load', { video: it.video, title: it.title, position: 0 });
+  } else if (del) {
+    const i = Number(del.dataset.qdel);
+    const it = r.v.room.queue[i];
+    if (it) wpSend('dequeue', { index: i, video: it.video });
+  }
+};
+document.addEventListener('keydown', (e) => {
+  if (!wpCovering() || modalKind || e.target.closest?.('input, textarea')) return;
+  if (e.key === ' ' && !e.ctrlKey) { e.preventDefault(); wpTogglePlay(); }
+  else if (e.key.toLowerCase() === 'f' && !e.ctrlKey) $('#wp-full').click();
+});
+
 // ───────────────────────────── Kısayollar ─────────────────────────────
 
 document.addEventListener('keydown', (e) => {
@@ -5539,6 +6229,12 @@ async function init() {
   api.listen('screen-offer', (e) => onScreenOffer(e.payload));
   api.listen('screen-end', (e) => onScreenEnd(e.payload));
   api.listen('screen-sharing', (e) => onScreenSharing(e.payload));
+  api.listen('watch', (e) => onWatch(e.payload));
+  api.listen('watch-invite', (e) => onWatchInvite(e.payload));
+  api.listen('watch-end', (e) => onWatchEnd(e.payload));
+  api.listen('watch-error', (e) => toast(e.payload.message, { type: 'error', timeout: 6000 }));
+  for (const v of await api.invoke('watch_list').catch(() => [])) wpStore(v);
+  renderWatchBar();
   // Karşı taraf gönderimi elle onayladı.
   api.listen('accepted', (e) => toast(`${e.payload.peerName} kabul etti · "${e.payload.title}" gönderiliyor`, { type: 'success' }));
   // Gezgin'de sağ tık → "FastFiles ile gönder".
@@ -5612,6 +6308,7 @@ function createPreviewApi() {
       { id: 'f-t9', outgoing: false, text: '📎 afis-taslak.png', at: now - 25e3, status: 'received', file: { title: 'afis-taslak.png', count: 1, total: 2.4e6, transfers: [{ to: 'me', id: 't9' }] } },
       { id: 'f-t10', outgoing: true, text: '📎 ofis-panorama.jpg', at: now - 20e3, status: 'sent', file: { title: 'ofis-panorama.jpg', count: 1, total: 5.1e6, transfers: [{ to: 'x', id: 't10' }] } },
       { id: 'f-t11', outgoing: false, text: '📎 ekran.png', at: now - 15e3, status: 'received', file: { title: 'ekran.png', count: 1, total: 900e3, transfers: [{ to: 'me', id: 't11' }] } },
+      { id: 'h7', outgoing: false, text: 'Şuna bakın 😂 https://www.youtube.com/watch?v=aqz-KE-bpKQ&t=30s', at: now - 10e3, status: 'received' },
     ],
   };
   snap.conversations = [
@@ -5796,6 +6493,29 @@ function createPreviewApi() {
     localStorage.setItem('ff.office.known', JSON.stringify({ [fpM]: { name: 'Mehmet (İzinde)', seat: 3, at: Date.now() } }));
   } catch { /* önizleme */ }
   const emit = (ev, payload) => (listeners[ev] || []).forEach((cb) => cb({ payload }));
+  // Birlikte izle önizlemesi: oda bu tarayıcıda tutulur; Elif ara sıra tepki gönderir.
+  const wmock = new Map();
+  const wSettle = (w) => { if (w.room.playing) w.room.position += (performance.now() - w.anchor) / 1000; w.anchor = performance.now(); };
+  const wView = (w) => {
+    const room = structuredClone(w.room);
+    if (room.playing) room.position += (performance.now() - w.anchor) / 1000;
+    return { room, hostName: w.hostName, isHost: w.isHost, joined: w.joined, canControl: w.joined && (w.isHost || !room.hostOnly), chatKey: w.chatKey };
+  };
+  const wPush = (w, event) => { if (wmock.has(w.room.id)) emit('watch', { view: wView(w), event }); };
+  setInterval(() => {
+    for (const w of wmock.values()) if (w.joined && w.room.joined.includes(fp2) && Math.random() < 0.5) wPush(w, { kind: 'react', by: fp2, emoji: ['😂', '🔥', '👏', '❤️'][Math.floor(Math.random() * 4)] });
+  }, 6000);
+  window.watchInvite = () => {
+    const id = `w-elif-${Date.now()}`;
+    const me = snap.device.fingerprint;
+    const w = { room: { id, host: fp2, members: [{ fingerprint: fp2, name: 'Elif (Tasarım)' }, { fingerprint: me, name: 'Nur' }, { fingerprint: fp1, name: 'Ahmet' }],
+      joined: [fp2, fp1], current: { video: 'aqz-KE-bpKQ', title: 'Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film', by: fp2 }, playing: true, position: 42, queue: [{ video: 'eRsGyueVLvQ', title: 'Sintel - Open Movie by Blender Foundation', by: fp1 }], hostOnly: false, ended: false, rev: 3 },
+      hostName: 'Elif (Tasarım)', isHost: false, joined: false, chatKey: fp2, anchor: performance.now() };
+    wmock.set(id, w);
+    emit('watch', { view: wView(w), event: null });
+    emit('watch-invite', { id, hostName: w.hostName, title: w.room.current.title, chatKey: fp2 });
+    return id;
+  };
   // Önizlemede olay tetiklemek için: __preview.emit('peers', [...])
   window.__preview = { emit, snap };
   // Sanal ofis gösterimi: mesajlar, yazıyor, dosya aktarımı ve oyun sırayla oynatılır.
@@ -5837,6 +6557,7 @@ function createPreviewApi() {
     if (location.hash.includes('palette')) openPalette();
     if (location.hash.includes('phone')) openPhone();
     if (location.hash.includes('shot')) startShot(null);
+    if (location.hash.includes('watch-invite')) window.watchInvite();
     if (location.hash.includes('screen')) { emit('screen-offer', { session: 'v1', fingerprint: fp2, name: 'Elif (Tasarım)' }); }
     if (location.hash.includes('office')) openOffice().then(() => { if (location.hash.includes('office-demo')) officeDemo(); });
     if (location.hash.includes('batch')) {
@@ -6032,6 +6753,38 @@ function createPreviewApi() {
       }
       if (cmd === 'phone_offer') return { offered: args.paths.map((p, i) => ({ i, name: p.split(/[\\/]/).pop(), size: 2.4e6 })), skipped: 0 };
       if (cmd === 'phone_unoffer') return { offered: [] };
+      if (cmd === 'watch_list') return [...wmock.values()].map(wView);
+      if (cmd === 'watch_start') {
+        const id = `w-${Date.now()}`;
+        const members = [{ fingerprint: snap.device.fingerprint, name: snap.settings.deviceName }, { fingerprint: fp2, name: 'Elif (Tasarım)' }];
+        const w = { room: { id, host: snap.device.fingerprint, members, joined: [snap.device.fingerprint], current: { video: args.video, title: args.title, by: snap.device.fingerprint }, playing: true, position: args.position || 0, queue: [], hostOnly: false, ended: false, rev: 1 },
+          hostName: snap.settings.deviceName, isHost: true, joined: true, chatKey: args.key, anchor: performance.now() };
+        wmock.set(id, w);
+        setTimeout(() => { w.room.joined.push(fp2); wPush(w, { kind: 'join', by: fp2 }); }, 2500);
+        return wView(w);
+      }
+      if (cmd === 'watch_act') {
+        const w = wmock.get(args.id);
+        if (!w) throw 'Bu oda kapandı';
+        const a = args.action;
+        const me = snap.device.fingerprint;
+        wSettle(w);
+        const r = w.room;
+        if (a.kind === 'join') { w.joined = true; if (!r.joined.includes(me)) r.joined.push(me); }
+        else if (a.kind === 'leave') { w.joined = false; r.joined = r.joined.filter((f) => f !== me); }
+        else if (a.kind === 'play' || a.kind === 'pause') { r.playing = a.kind === 'play'; r.position = a.position; }
+        else if (a.kind === 'seek') r.position = a.position;
+        else if (a.kind === 'load') { r.current = { video: a.video, title: a.title, by: me }; r.position = a.position || 0; r.playing = true; r.queue = r.queue.filter((q) => q.video !== a.video); }
+        else if (a.kind === 'enqueue') r.queue.push({ video: a.video, title: a.title, by: me });
+        else if (a.kind === 'dequeue') r.queue.splice(a.index, 1);
+        else if (a.kind === 'next') { if (r.current.video !== a.from) return null; if (r.queue.length) { r.current = r.queue.shift(); r.position = 0; } else r.playing = false; }
+        else if (a.kind === 'title') { if (r.current.video === a.video && !r.current.title) r.current.title = a.title; }
+        else if (a.kind === 'hostOnly') r.hostOnly = a.on;
+        if (a.kind !== 'react') r.rev++;
+        setTimeout(() => wPush(w, a.kind === 'title' || a.kind === 'react' ? null : { kind: a.kind, by: me, position: a.position || 0 }), 40);
+        return null;
+      }
+      if (cmd === 'watch_close') { wmock.delete(args.id); setTimeout(() => emit('watch-end', { id: args.id, reason: 'closed', hostName: '' }), 20); return null; }
       if (cmd === 'screen_share_start') {
         setTimeout(() => emit('screen-sharing', { active: true, session: 's1', viewers: [], invited: 1 }), 50);
         setTimeout(() => emit('screen-sharing', { active: true, session: 's1', viewers: ['Elif (Tasarım)'], invited: 1 }), 1500);
