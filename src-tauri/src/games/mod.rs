@@ -10,7 +10,9 @@
 //! Oda yönetimi, davet, ağ ve kayıt (bkz. `node/game.rs`) oyundan bağımsızdır; arayüzde de
 //! yalnızca oyun alanının çizimi oyuna özeldir.
 
+pub mod basket;
 pub mod chess;
+mod common;
 pub mod golf;
 
 use serde::Serialize;
@@ -34,6 +36,9 @@ pub struct GameDef {
     pub seats: &'static [&'static str],
     /// Beraberlik teklif edilebilir mi (iki kişilik oyunlarda).
     pub draw_offers: bool,
+    /// Takımlı oyun: çift koltuklar bir takım, tek koltuklar diğer takım; takımlar eşit sayıda.
+    /// Sonuçtaki `winner` kazanan takımın ilk koltuğudur (0 ya da 1).
+    pub teams: bool,
 }
 
 pub const CATALOG: &[GameDef] = &[
@@ -45,6 +50,7 @@ pub const CATALOG: &[GameDef] = &[
         max_players: 2,
         seats: &["Beyaz", "Siyah"],
         draw_offers: true,
+        teams: false,
     },
     GameDef {
         id: "golf",
@@ -54,6 +60,17 @@ pub const CATALOG: &[GameDef] = &[
         max_players: 6,
         seats: &[],
         draw_offers: false,
+        teams: false,
+    },
+    GameDef {
+        id: "basket",
+        name: "Basket",
+        description: "Takımlı atış yarışması: 1v1, 2v2 ya da 3v3. Her turda herkes aynı noktadan sırayla atar; rüzgâr, savunmacı, para topu, temiz sayı ve 🔥 seri bonusları var. Çok sayı atan takım kazanır.",
+        min_players: 2,
+        max_players: 6,
+        seats: &[],
+        draw_offers: false,
+        teams: true,
     },
 ];
 
@@ -136,15 +153,16 @@ fn evaluate_uncached(game: &str, seed: &str, players: usize, moves: &[String]) -
     match game {
         "chess" => chess::evaluate(moves),
         "golf" => golf::evaluate(seed, players, moves),
+        "basket" => basket::evaluate(seed, players, moves),
         _ => Err("bilinmeyen oyun".into()),
     }
 }
 
-/// Oyuncunun gönderdiği hamlenin odaya yazılacak hâli. Golfte herkes aynı anda vurduğundan
-/// vuruşa vuranın koltuğu eklenir (`a900p50` → `s1a900p50`); diğer oyunlarda olduğu gibi kalır.
+/// Oyuncunun gönderdiği hamlenin odaya yazılacak hâli. Atışlı oyunlarda (golf, basket) hamle
+/// atanın koltuğunu taşır (`a900p50` → `s1a900p50`); diğer oyunlarda olduğu gibi kalır.
 pub fn own_move(game: &str, seat: usize, mv: &str) -> String {
     match game {
-        "golf" => golf::seat_shot(seat, mv),
+        "golf" | "basket" => common::seat_shot(seat, mv),
         _ => mv.to_string(),
     }
 }
@@ -153,7 +171,7 @@ pub fn own_move(game: &str, seat: usize, mv: &str) -> String {
 /// `move_actor` ve `Eval::movers` ile denetlenir.)
 pub fn move_allowed(game: &str, before: &Eval, mv: &str) -> bool {
     match game {
-        "golf" => golf::parse_shot(mv).is_some(),
+        "golf" | "basket" => common::parse_shot(mv).is_some(),
         _ => before.legal.iter().any(|m| m == mv),
     }
 }
@@ -162,7 +180,7 @@ pub fn move_allowed(game: &str, before: &Eval, mv: &str) -> bool {
 /// çekilme (`q<koltuk>`) koltuğu kendisi taşır.
 pub fn move_actor(game: &str, before: &Eval, mv: &str) -> Option<usize> {
     match game {
-        "golf" => golf::parse_quit(mv).or_else(|| golf::parse_shot(mv).map(|s| s.0)),
+        "golf" | "basket" => common::parse_quit(mv).or_else(|| common::parse_shot(mv).map(|s| s.0)),
         _ => before.turn,
     }
 }
@@ -171,7 +189,7 @@ pub fn move_actor(game: &str, before: &Eval, mv: &str) -> Option<usize> {
 /// İki kişilik oyunlarda (satranç) `None`: pes eden kaybeder, oyun biter.
 pub fn forfeit_move(game: &str, seat: usize) -> Option<String> {
     match game {
-        "golf" => Some(golf::quit_move(seat)),
+        "golf" | "basket" => Some(common::quit_move(seat)),
         _ => None,
     }
 }
@@ -205,5 +223,13 @@ mod tests {
         assert!(!move_allowed("golf", &g, "q1"), "çekilme bir vuruş değildir");
         assert_eq!(move_actor("golf", &g, "q2"), Some(2));
         assert_eq!(move_actor("golf", &g, "s2a900p50"), Some(2));
+        let b = evaluate("basket", "r", 4, &[]).unwrap();
+        assert!(def("basket").unwrap().teams);
+        assert_eq!(b.movers, vec![0]);
+        assert_eq!(own_move("basket", 0, "a2500p60"), "s0a2500p60");
+        assert!(move_allowed("basket", &b, "s0a2500p60"));
+        assert_eq!(move_actor("basket", &b, "s0a2500p60"), Some(0));
+        assert_eq!(forfeit_move("basket", 3).as_deref(), Some("q3"));
+        assert!(evaluate("basket", "r", 3, &[]).is_err());
     }
 }

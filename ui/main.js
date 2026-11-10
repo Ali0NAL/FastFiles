@@ -3121,7 +3121,11 @@ const gameById = (id) => state.games.find((g) => g.id === id);
 const gamesOpen = () => !$('#games-screen').hidden;
 const gameDef = (id) => state.gameCatalog.find((d) => d.id === id);
 const opponentsOf = (g) => g.players.filter((p) => p.fingerprint !== myFp());
-const vsName = (g) => opponentsOf(g).map((p) => p.name).join(', ') || '—';
+/** Takımlı oyun (basket): çift koltuklar Kırmızı, tek koltuklar Mavi takım. */
+const isTeamGame = (g) => !!gameDef(g.game)?.teams || g.game === 'basket';
+const vsName = (g) => (isTeamGame(g) && g.players.length > 2
+  ? [0, 1].map((t) => g.players.filter((p, s) => s % 2 === t).map((p) => (p.fingerprint === myFp() ? 'Siz' : p.name)).join(' & ')).join(' vs ')
+  : opponentsOf(g).map((p) => p.name).join(', ') || '—');
 const gameOver = (g) => ['finished', 'declined', 'cancelled'].includes(g.status);
 
 // Taşlar: dolu satranç sembolleri; U+FE0E emoji yerine metin olarak çizilmelerini sağlar. Renk CSS'te.
@@ -3139,9 +3143,11 @@ const trSan = (san) => String(san).replace(/[KQRBN]/g, (c) => TR_PIECE[c]);
 const RESULT_REASON = {
   checkmate: 'şah mat', stalemate: 'pat', repetition: 'üç kez tekrar', fifty: '50 hamle kuralı', material: 'yetersiz malzeme',
   resign: 'pes etme', agreement: 'anlaşmalı', score: 'en az vuruş', tie: 'eşit vuruş', forfeit: 'diğerleri çekildi',
+  points: 'sayı', tie_points: 'eşit sayı', team_forfeit: 'rakip takım çekildi',
 };
 const GAME_ART = {
   chess: `<span class="gc-piece">${PIECE_GLYPH.n}︎</span>`,
+  basket: '<span class="gc-golf gc-basket"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3v18M5.6 5.6c3.2 3 3.2 9.8 0 12.8M18.4 5.6c-3.2 3-3.2 9.8 0 12.8"/></svg></span>',
   golf: '<span class="gc-golf"><svg viewBox="0 0 24 24"><path d="M8 20V3l8 3.5L8 10"/><path d="M3 20.5c0-1.4 2.5-2.5 6-2.5s6 1.1 6 2.5"/><circle cx="18.5" cy="18.5" r="2"/></svg></span>',
 };
 
@@ -3153,6 +3159,10 @@ function gameResultText(g) {
   if (r.reason === 'resign') return r.by === me ? 'Pes ettiniz' : `${nameOf(r.by)} pes etti · kazandınız`;
   const why = RESULT_REASON[r.reason] || 'oyun bitti';
   if (!r.winner) return `Berabere · ${why}`;
+  if (isTeamGame(g)) {
+    const wt = g.players.findIndex((p) => p.fingerprint === r.winner) % 2;
+    return wt === g.mySeat % 2 ? `Takımınız kazandı · ${why}` : `${['Kırmızı', 'Mavi'][wt]} takım kazandı · ${why}`;
+  }
   return r.winner === me ? `Kazandınız · ${why}` : `${nameOf(r.winner)} kazandı · ${why}`;
 }
 
@@ -3161,6 +3171,7 @@ function gameOutcome(g) {
   const r = g.result;
   if (!r) return 'draw';
   if (r.reason === 'resign') return r.by === myFp() ? 'lose' : 'win';
+  if (r.winner && isTeamGame(g)) return g.players.findIndex((p) => p.fingerprint === r.winner) % 2 === g.mySeat % 2 ? 'win' : 'lose';
   return !r.winner ? 'draw' : r.winner === myFp() ? 'win' : 'lose';
 }
 
@@ -3176,8 +3187,10 @@ function gameStatusText(g) {
   }
   const golf = g.game === 'golf';
   if (golf && g.info?.quit?.[g.mySeat]) return 'Çekildiniz · izliyorsunuz';
-  if (g.pending) return golf ? 'Vuruşunuz iletiliyor…' : 'Hamleniz iletiliyor…';
+  if (g.game === 'basket' && g.info?.quit?.[g.mySeat]) return 'Çekildiniz · izliyorsunuz';
+  if (g.pending) return golf ? 'Vuruşunuz iletiliyor…' : g.game === 'basket' ? 'Atışınız iletiliyor…' : 'Hamleniz iletiliyor…';
   if (g.drawOffer && g.drawOffer !== me) return 'Beraberlik teklif ediyor';
+  if (g.game === 'basket') return g.myTurn ? `Sıra sizde · ${(g.info?.round ?? 0) + 1}. tur` : `${g.players[g.turn]?.name || 'Rakip'} atıyor…`;
   if (golf) return g.myTurn ? `Oynuyorsunuz · ${(g.info?.hole ?? 0) + 1}. delik` : `Diğerleri bekleniyor · ${(g.info?.hole ?? 0) + 1}. delik`;
   if (g.myTurn) return g.info?.check ? 'Sıra sizde · Şah!' : 'Sıra sizde';
   return `${g.players[g.turn]?.name || 'Rakip'} düşünüyor…`;
@@ -3217,7 +3230,7 @@ function renderGameCards() {
       <span class="gc-art">${GAME_ART[d.id] || ''}</span>
       <span class="gc-name">${esc(d.name)}</span>
       <span class="gc-desc">${esc(d.description)}</span>
-      <span class="gc-meta">${d.minPlayers === d.maxPlayers ? `${d.maxPlayers} oyuncu` : `${d.minPlayers}–${d.maxPlayers} oyuncu`} · Davet gönder →</span>
+      <span class="gc-meta">${d.teams ? 'Takımlı · 1v1, 2v2, 3v3' : d.minPlayers === d.maxPlayers ? `${d.maxPlayers} oyuncu` : `${d.minPlayers}–${d.maxPlayers} oyuncu`} · Davet gönder →</span>
     </button>`).join('') + `
     <div class="game-card soon">
       <span class="gc-art"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></span>
@@ -3323,19 +3336,26 @@ function onGames(list) {
 function renderRoom() {
   const g = gameById(gameState.open);
   const isGolf = g?.game === 'golf';
+  const isBasket = g?.game === 'basket';
   $('#games-screen').classList.toggle('room-open', !!g);
-  // Golf sahası geniş: açıkken oyun listesi gizlenir (geri düğmesi listeye döner).
-  $('#games-screen').classList.toggle('wide-room', isGolf);
+  // Golf ve basket sahası geniş: açıkken oyun listesi gizlenir (geri düğmesi listeye döner).
+  $('#games-screen').classList.toggle('wide-room', isGolf || isBasket);
   $('#game-lobby').hidden = !!g;
   $('#game-room').hidden = !g;
   if (!g) return;
-  $('#chess-col').hidden = isGolf;
+  $('#chess-col').hidden = isGolf || isBasket;
   $('#golf-col').hidden = !isGolf;
-  $('#moves-head').textContent = isGolf ? 'Skor tablosu' : 'Hamleler';
+  $('#basket-col').hidden = !isBasket;
+  $('#moves-head').textContent = isGolf || isBasket ? 'Skor tablosu' : 'Hamleler';
   renderRoomPanel(g);
   if (isGolf) {
     renderGolf(g);
     renderScores(g);
+    return;
+  }
+  if (isBasket) {
+    renderBasket(g);
+    renderBasketScores(g);
     return;
   }
   cancelDrag();
@@ -3501,9 +3521,14 @@ function renderRoomPanel(g) {
   const oppOnline = !!opp && !!peerByFp(opp.fingerprint);
   const seatName = (gameDef(g.game)?.seats?.[g.mySeat] || '').toLocaleLowerCase('tr-TR');
   const isGolf = g.game === 'golf';
+  const isBasket = g.game === 'basket';
   const many = g.players.length > 2;
   $('#room-name').textContent = `${g.title} · ${vsName(g)}`;
-  if (isGolf && g.info?.holes) {
+  if (isBasket && g.info?.rounds) {
+    const r = g.info.rounds[g.info.round];
+    const t = g.mySeat % 2;
+    $('#room-sub').textContent = `${['Kırmızı', 'Mavi'][t]} takımdasınız · ${r.kind === 'overtime' ? 'Uzatma' : `${g.info.round + 1}/${g.info.baseRounds}. tur`} · ${r.name}`;
+  } else if (isGolf && g.info?.holes) {
     const h = g.info.holes[g.info.hole];
     $('#room-sub').textContent = `${g.info.hole + 1}/${g.info.holes.length}. delik · ${h.name}${h.no ? ` (seviye ${h.no})` : ''} · Par ${h.par}`;
   } else {
@@ -3545,6 +3570,16 @@ function renderRoomPanel(g) {
         else if (g.myTurn) { status = '<b>Herkes aynı anda oynuyor.</b> Topu geriye doğru çekip bırakın.'; tone = 'turn'; }
         else status = esc(golfWaitText(g));
         if (off.length) status += `<div class="small muted">${esc(off.map((p) => p.name).join(', '))} çevrimdışı; dönünce oyun sürer.</div>`;
+        if (!g.info?.quit?.[g.mySeat]) actions = roomBtn('resign', 'Oyundan çekil', 'ghost danger-text', g.pending);
+        break;
+      }
+      if (isBasket) {
+        const cur = g.players[g.turn];
+        const curOnline = !!cur && (cur.fingerprint === me || !!peerByFp(cur.fingerprint));
+        if (g.info?.quit?.[g.mySeat]) status = 'Oyundan çekildiniz; oyunu izliyorsunuz.';
+        else if (g.pending) status = 'Atışınız iletiliyor…';
+        else if (g.myTurn) { status = '<b>Sıra sizde.</b> Topu geriye doğru çekip bırakın.'; tone = 'turn'; }
+        else if (cur) status = curOnline ? `<b>${esc(cur.name)}</b> atıyor… <span class="muted">(${(g.turn % 2 === g.mySeat % 2) ? 'takım arkadaşınız' : 'rakip'})</span>` : `<b>${esc(cur.name)}</b> çevrimdışı; döndüğünde oyun sürer.`;
         if (!g.info?.quit?.[g.mySeat]) actions = roomBtn('resign', 'Oyundan çekil', 'ghost danger-text', g.pending);
         break;
       }
@@ -3705,17 +3740,19 @@ new ResizeObserver(() => golfLoop()).observe(golfCanvas);
 // sıfırlanınca (WebView2) tuvalin içeriği silinebiliyor ve geriye yalnızca arka plan kalıyordu;
 // boyut değişmediği için de yeniden çizilmiyordu (pencereyi boyutlandırınca düzeliyordu).
 // Bu olaylarda ve güvenlik için düzenli aralıklarla saha yeniden çizilir.
+// Aynısı basket sahası için de geçerlidir (`canvasLoops`).
+const canvasLoops = () => { golfLoop(); if (typeof basketLoop === 'function') basketLoop(); };
 golfCanvas.addEventListener('contextrestored', () => golfLoop());
-document.addEventListener('visibilitychange', () => { if (!document.hidden) golfLoop(); });
-window.addEventListener('focus', () => golfLoop());
-window.addEventListener('pageshow', () => golfLoop());
+document.addEventListener('visibilitychange', () => { if (!document.hidden) canvasLoops(); });
+window.addEventListener('focus', () => canvasLoops());
+window.addEventListener('pageshow', () => canvasLoops());
 (function watchDpr() {
   // Pencere başka bir ekrana (farklı ölçek) taşınınca da tuval yeniden boyutlanmalı.
   const mq = matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
-  mq.addEventListener('change', () => { golfLoop(); watchDpr(); }, { once: true });
+  mq.addEventListener('change', () => { canvasLoops(); watchDpr(); }, { once: true });
 })();
 setInterval(() => {
-  if (!document.hidden && gamesOpen() && gameById(gameState.open)?.game === 'golf') golfLoop();
+  if (!document.hidden && gamesOpen() && ['golf', 'basket'].includes(gameById(gameState.open)?.game)) canvasLoops();
 }, 1500);
 
 /** Yol üzerinde t (0–1) anındaki nokta. */
@@ -4064,6 +4101,454 @@ function renderScores(g) {
     <div class="golf-legend">Her delikte en fazla ${info.maxStrokes} vuruş. Suya düşen top +1 ceza ile geri gelir.</div>`;
 }
 
+// ── Basket ──
+// Fizik arka uçtadır (games/basket.rs): arayüz sahayı yandan çizer, nişanı alır ve arka ucun
+// verdiği top yollarını (`shots[].path`, ~40 nokta/sn) sırayla canlandırır. Saha 800×500 birimdir.
+// Takımlar: çift koltuklar Kırmızı, tek koltuklar Mavi. Her turda herkes aynı noktadan sırayla atar.
+
+const basketCanvas = $('#basket-canvas');
+const basketView = { room: null, status: '', seen: 0, queue: [], aim: null, raf: 0, flashTimer: 0, round: -1, introUntil: 0 };
+const BASKET_TEAMS = [{ name: 'Kırmızı', color: '#e5484d', soft: '#ff9b9e' }, { name: 'Mavi', color: '#3e63dd', soft: '#9db1ff' }];
+const BASKET_PULL = 220;          // bu kadar geri çekince %100 güç (saha birimi)
+const BASKET_INTRO_MS = 1900;     // yeni tur başlarken tanıtım
+const BASKET_GAP_MS = 350;        // art arda gelen atışlar arasında bekleme
+const BASKET_KIND = {
+  wind: { icon: '🌬️', name: 'Rüzgâr', desc: 'Top yana sürüklenir' },
+  defender: { icon: '🙌', name: 'Savunmacı', desc: 'Önünüzde blok yapan biri var: yüksek atın' },
+  money: { icon: '💰', name: 'Para topu', desc: 'Bu turda sayılar iki katı' },
+  overtime: { icon: '⏱️', name: 'Uzatma', desc: 'Eşitlik bozulana kadar serbest atış' },
+};
+const basketShotMs = (shot) => Math.max(400, (shot.path.length - 1) * GOLF_POINT_MS);
+const teamOfSeat = (s) => s % 2;
+const basketName = (g, seat) => (g.players[seat]?.fingerprint === myFp() ? 'Siz' : g.players[seat]?.name || '?');
+/** Şu an atabilir miyim: sıra bende, önceki atışlar oynatıldı, tur tanıtımı bitti. */
+const basketCanShoot = (g, now = performance.now()) => !!g?.myTurn && g.status === 'active'
+  && !basketView.queue.length && now >= basketView.introUntil;
+
+function renderBasket(g) {
+  const info = g.info;
+  if (!info?.rounds) return;
+  const n = g.moves.length;
+  const now = performance.now();
+  if (basketView.room !== g.id) {
+    Object.assign(basketView, { room: g.id, seen: n, queue: [], aim: null, round: info.round,
+      introUntil: g.status === 'active' && n === 0 ? now + BASKET_INTRO_MS : 0 });
+    $('#basket-flash').hidden = true;
+  } else {
+    if (basketView.status === 'invited' && g.status === 'active') basketView.introUntil = now + BASKET_INTRO_MS;
+    if (n > basketView.seen) {
+      // Atışlar sırayla oynatılır (birden çok atış tek güncellemede gelebilir).
+      for (const s of info.shots || []) {
+        if (s.ply >= basketView.seen && s.path?.length > 1) basketView.queue.push({ shot: s, start: null });
+      }
+    }
+    basketView.seen = n;
+  }
+  basketView.status = g.status;
+  if (!g.myTurn) basketView.aim = null;
+  renderBasketHud(g);
+  basketLoop();
+}
+
+function renderBasketHud(g) {
+  const info = g.info;
+  const r = info.rounds[info.round];
+  const kind = BASKET_KIND[r.kind];
+  const roundLabel = r.kind === 'overtime' ? `Uzatma ${info.round - info.baseRounds + 1}` : `${info.round + 1}. tur / ${info.baseRounds}`;
+  const teams = info.teams.map((seats, t) => {
+    const members = seats.map((s) => {
+      const st = info.stats[s];
+      const cur = g.status === 'active' && info.shooter === s;
+      return `<span class="bk-mem${cur ? ' cur' : ''}${info.quit[s] ? ' quit' : ''}" title="${esc(g.players[s]?.name || '')} · ${st.made}/${st.att} isabet · ${st.pts} sayı">${esc(basketName(g, s))}${st.fire ? ' 🔥' : ''}<small>${st.made}/${st.att}</small></span>`;
+    }).join('');
+    return `<div class="bk-team" style="--team:${BASKET_TEAMS[t].color}"><b>${BASKET_TEAMS[t].name}</b><em>${info.score[t]}</em><div class="bk-mems">${members}</div></div>`;
+  }).join('');
+  $('#basket-hud').innerHTML = `<div class="gh-hole"><b>${esc(roundLabel)}</b> · ${esc(r.name)} · ${r.pts} sayı`
+    + `${kind ? `<span class="gh-pups"><span class="gh-pup" title="${esc(kind.desc)}"><i style="background:#fff3">${kind.icon}</i>${esc(kind.name)}</span></span>` : ''}</div>`
+    + `<div class="bk-teams">${teams}</div>`;
+  let hint = '';
+  const order = (info.order || []).map((s) => basketName(g, s));
+  if (g.status === 'finished') hint = gameResultText(g);
+  else if (g.status !== 'active') hint = 'Herkes katılınca oyun başlar.';
+  else if (info.quit[g.mySeat]) hint = 'Oyundan çekildiniz; oyunu izliyorsunuz.';
+  else if (g.pending) hint = 'Atışınız iletiliyor…';
+  else if (g.myTurn) hint = `Sıra sizde: topu tutup geriye doğru çekin ve bırakın. Kesik çizgi atışın başlangıcını gösterir.${kind ? ` ${kind.icon} ${kind.desc}.` : ''} (Esc: vazgeç)`;
+  else hint = `${basketName(g, info.shooter)} atıyor… · Bu turda sıra: ${order.join(' → ')}`;
+  $('#basket-hint').textContent = hint;
+}
+
+function basketLoop() {
+  if (!basketView.raf) basketView.raf = requestAnimationFrame(basketTick);
+}
+function basketTick(now) {
+  basketView.raf = 0;
+  let more = false;
+  try { more = drawBasket(now); } catch (err) { console.error('basket çizimi', err); }
+  if (more) basketView.raf = requestAnimationFrame(basketTick);
+}
+
+/** Bir kare çizer; canlandırma, tanıtım ya da nişan sürüyorsa `true` döner. */
+function drawBasket(now) {
+  const g = gameById(gameState.open);
+  if (!g || g.game !== 'basket' || !gamesOpen() || !g.info?.rounds) return false;
+  const info = g.info;
+  const rect = basketCanvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(rect.width * dpr));
+  const h = Math.max(1, Math.round(rect.height * dpr));
+  if (basketCanvas.width !== w || basketCanvas.height !== h) { basketCanvas.width = w; basketCanvas.height = h; }
+  const ctx = basketCanvas.getContext('2d');
+  const k = w / info.width;
+  ctx.setTransform(k, 0, 0, k, 0, 0);
+  ctx.clearRect(0, 0, info.width, info.height);
+
+  // Sıradaki atış biter: sonucu gösterilir, ardından (kısa beklemeyle) bir sonraki başlar.
+  let a = basketView.queue[0];
+  if (a && a.start != null && now - a.start >= basketShotMs(a.shot)) {
+    basketFlash(g, a.shot);
+    basketView.queue.shift();
+    a = basketView.queue[0];
+    if (a) a.start = now + BASKET_GAP_MS;
+  }
+  const shown = a ? a.shot.round : info.round;
+  if (shown > basketView.round) {
+    if (g.status === 'active' || a) basketView.introUntil = Math.max(basketView.introUntil, now + BASKET_INTRO_MS);
+    basketView.round = shown;
+  }
+  if (a && a.start == null) a.start = Math.max(now, basketView.introUntil);
+  if (a) a.start = Math.max(a.start, basketView.introUntil);
+  const round = info.rounds[Math.min(shown, info.rounds.length - 1)];
+  const shooter = a ? a.shot.seat : info.shooter;
+  drawCourt(ctx, info, round);
+  if (round.defender != null && shooter != null) drawPlayer(ctx, info, round.defender, BASKET_TEAMS[1 - teamOfSeat(shooter)].color, true, '');
+  if (shooter != null) drawPlayer(ctx, info, round.x, BASKET_TEAMS[teamOfSeat(shooter)].color, false, basketName(g, shooter));
+  // Top: atış sürerken yolunda, değilse atıcının elinde.
+  const [rdx, ry] = info.release;
+  let ball = null;
+  let fire = false;
+  if (a) {
+    const t = Math.max(0, Math.min(1, (now - a.start) / basketShotMs(a.shot)));
+    ball = pointAlong(a.shot.path, t);
+    fire = a.shot.fire;
+  } else if (g.status === 'active' && shooter != null) {
+    ball = [round.x + rdx, ry];
+    fire = !!info.stats[shooter]?.fire;
+  }
+  const canShoot = basketCanShoot(g, now);
+  if (basketView.aim && !canShoot) basketView.aim = null;
+  const aiming = !!basketView.aim;
+  if (aiming) drawBasketAim(ctx, info, round);
+  drawNet(ctx, info, ball);
+  if (ball) drawBasketBall(ctx, ball, info.ballR, round.kind === 'money', fire, canShoot && !aiming);
+  drawRimFront(ctx, info);
+  const intro = now < basketView.introUntil;
+  if (intro) drawRoundIntro(ctx, info, round, shown, g, shooter);
+  // Yalnızca canlandırma, tanıtım ve nişan sürerken çizmeye devam edilir (boşta işlemci harcanmaz).
+  return basketView.queue.length > 0 || aiming || intro;
+}
+
+function drawCourt(ctx, info, round) {
+  const W = info.width;
+  const F = info.floor;
+  // Salon: koyu arka plan ve tribün ışıkları
+  const sky = ctx.createLinearGradient(0, 0, 0, F);
+  sky.addColorStop(0, '#1b2238');
+  sky.addColorStop(1, '#2c3554');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, F);
+  ctx.fillStyle = 'rgba(255, 255, 255, .05)';
+  for (let x = 20; x < W; x += 46) for (let y = 40; y < 250; y += 38) ctx.fillRect(x + ((y / 38) % 2) * 23, y, 14, 9);
+  // Parke
+  const wood = ctx.createLinearGradient(0, F, 0, info.height);
+  wood.addColorStop(0, '#c98f55');
+  wood.addColorStop(1, '#a8703d');
+  ctx.fillStyle = wood;
+  ctx.fillRect(0, F, W, info.height - F);
+  ctx.strokeStyle = 'rgba(0, 0, 0, .12)';
+  ctx.lineWidth = 1;
+  for (let x = 0; x < W; x += 60) { ctx.beginPath(); ctx.moveTo(x, F); ctx.lineTo(x - 20, info.height); ctx.stroke(); }
+  ctx.fillStyle = 'rgba(255, 255, 255, .85)';
+  ctx.fillRect(0, F, W, 3);
+  // Üç sayı çizgisi ve serbest atış çizgisi (zeminde işaret)
+  ctx.fillStyle = 'rgba(255, 255, 255, .75)';
+  ctx.fillRect(info.threeX - 2, F, 4, info.height - F);
+  ctx.font = '600 13px "Segoe UI", system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('3 SAYI', info.threeX - 34, F + 24);
+  // Atış noktası
+  ctx.fillStyle = round.kind === 'money' ? '#ffd166' : 'rgba(255, 255, 255, .9)';
+  ctx.beginPath(); ctx.ellipse(round.x, F + 6, 24, 6, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#1b2238';
+  ctx.font = '700 12px "Segoe UI", system-ui, sans-serif';
+  ctx.fillText(`${round.pts}`, round.x, F + 10);
+  ctx.textAlign = 'start';
+  // Direk, kol ve pano
+  const b = info.board;
+  ctx.fillStyle = '#5b6474';
+  ctx.fillRect(info.poleX - 6, b.bottom - 20, 12, F - b.bottom + 20);
+  ctx.fillRect(b.x, b.bottom - 24, info.poleX - b.x, 8);
+  ctx.fillStyle = 'rgba(240, 246, 255, .92)';
+  ctx.fillRect(b.x - b.r, b.top, b.r * 2 + 2, b.bottom - b.top);
+  ctx.strokeStyle = '#e5484d';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(b.x - b.r - 1, b.top + 1, b.r * 2 + 4, b.bottom - b.top - 2);
+  // Çemberin arkası (önü topun önüne çizilir)
+  const rim = info.rim;
+  ctx.strokeStyle = '#c2410c';
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.ellipse((rim.front + rim.back) / 2, rim.y, (rim.back - rim.front) / 2, 6, 0, Math.PI, Math.PI * 2); ctx.stroke();
+  ctx.fillStyle = '#5b6474';
+  ctx.fillRect(rim.back, rim.y - 2, b.x - rim.back, 4);
+  // Turun özelliği: rüzgâr oku, para topu, uzatma
+  if (round.kind === 'wind') {
+    const dir = Math.sign(round.wind);
+    const len = 40 + Math.abs(round.wind) * 0.45;
+    const cx = W / 2;
+    ctx.strokeStyle = 'rgba(200, 230, 255, .85)';
+    ctx.fillStyle = 'rgba(200, 230, 255, .85)';
+    ctx.lineWidth = 4;
+    for (const y of [70, 92]) {
+      ctx.beginPath(); ctx.moveTo(cx - dir * len / 2, y); ctx.lineTo(cx + dir * len / 2, y); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(cx + dir * (len / 2 + 10), y); ctx.lineTo(cx + dir * (len / 2 - 4), y - 8); ctx.lineTo(cx + dir * (len / 2 - 4), y + 8); ctx.closePath(); ctx.fill();
+    }
+    ctx.font = '600 14px "Segoe UI", system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(`🌬️ Rüzgâr ${dir > 0 ? 'potaya doğru' : 'potadan geriye'} · ${Math.round(Math.abs(round.wind) / 22)} kuvvet`, cx, 50);
+    ctx.textAlign = 'start';
+  } else if (BASKET_KIND[round.kind] && round.kind !== 'defender') {
+    const kd = BASKET_KIND[round.kind];
+    ctx.font = '700 16px "Segoe UI", system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = round.kind === 'money' ? '#ffd166' : '#fff';
+    ctx.fillText(`${kd.icon} ${kd.name} · ${kd.desc}`, W / 2, 56);
+    ctx.textAlign = 'start';
+  }
+}
+
+/** Atıcı ya da savunmacı (kolları havada). */
+function drawPlayer(ctx, info, x, color, defender, label) {
+  const F = info.floor;
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = '#2a1f1a';
+  ctx.lineWidth = 7;
+  // Bacaklar
+  ctx.beginPath(); ctx.moveTo(x - 6, F - 2); ctx.lineTo(x - 4, F - 52); ctx.moveTo(x + 8, F - 2); ctx.lineTo(x + 5, F - 52); ctx.stroke();
+  // Gövde (forma)
+  ctx.fillStyle = color;
+  ctx.beginPath(); ctx.roundRect(x - 13, F - 108, 27, 60, 8); ctx.fill();
+  ctx.fillStyle = 'rgba(255, 255, 255, .85)';
+  ctx.font = '700 15px "Segoe UI", system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(defender ? '🙌' : '', x, F - 74);
+  // Kollar
+  ctx.strokeStyle = '#2a1f1a';
+  ctx.lineWidth = 6;
+  ctx.beginPath();
+  if (defender) { ctx.moveTo(x - 10, F - 100); ctx.lineTo(x - 14, info.defender.top + 4); ctx.moveTo(x + 10, F - 100); ctx.lineTo(x + 12, info.defender.top + 2); }
+  else { ctx.moveTo(x + 10, F - 100); ctx.lineTo(x + info.release[0] - 2, info.release[1] + 10); ctx.moveTo(x - 10, F - 100); ctx.lineTo(x + 6, info.release[1] + 16); }
+  ctx.stroke();
+  // Baş
+  ctx.fillStyle = '#e8b48a';
+  ctx.beginPath(); ctx.arc(x, F - 122, 13, 0, Math.PI * 2); ctx.fill();
+  if (label) {
+    ctx.font = '600 13px "Segoe UI", system-ui, sans-serif';
+    const tw = ctx.measureText(label).width + 14;
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.roundRect(x - tw / 2, F - 204, tw, 22, 11); ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.fillText(label, x, F - 188);
+  }
+  ctx.restore();
+}
+
+function drawNet(ctx, info, ball) {
+  const { front, back, y } = info.rim;
+  // Top filenin içinden geçerken file biraz genişler.
+  const inNet = ball && ball[0] > front && ball[0] < back && ball[1] > y && ball[1] < y + 60;
+  const sway = inNet ? 6 : 0;
+  ctx.strokeStyle = 'rgba(255, 255, 255, .8)';
+  ctx.lineWidth = 1.5;
+  const n = 6;
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    const x0 = front + (back - front) * t;
+    const x1 = front + 10 - sway + (back - front - 20 + sway * 2) * t;
+    ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y + 48); ctx.stroke();
+  }
+  for (const dy of [16, 32, 48]) {
+    const inset = (dy / 48) * (10 - sway);
+    ctx.beginPath(); ctx.moveTo(front + inset, y + dy); ctx.lineTo(back - inset, y + dy); ctx.stroke();
+  }
+}
+
+function drawRimFront(ctx, info) {
+  const rim = info.rim;
+  ctx.strokeStyle = '#ea580c';
+  ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.ellipse((rim.front + rim.back) / 2, rim.y, (rim.back - rim.front) / 2, 6, 0, 0, Math.PI); ctx.stroke();
+}
+
+function drawBasketBall(ctx, [x, y], r, gold, fire, ready) {
+  if (fire) {
+    // Alev: topun etrafında titreyen turuncu hale
+    const fl = 1;
+    const glow = ctx.createRadialGradient(x, y, r * 0.6, x, y, r * 2.4 * fl);
+    glow.addColorStop(0, 'rgba(255, 170, 40, .85)');
+    glow.addColorStop(1, 'rgba(255, 60, 0, 0)');
+    ctx.fillStyle = glow;
+    ctx.beginPath(); ctx.arc(x, y, r * 2.4 * fl, 0, Math.PI * 2); ctx.fill();
+  }
+  if (ready) {
+    ctx.strokeStyle = 'rgba(255, 255, 255, .55)';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(x, y, r + 7, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.fillStyle = gold ? '#f5c542' : '#e8772e';
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = 'rgba(40, 20, 10, .75)';
+  ctx.lineWidth = 1.6;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x - r, y); ctx.lineTo(x + r, y); ctx.moveTo(x, y - r); ctx.lineTo(x, y + r); ctx.stroke();
+  ctx.beginPath(); ctx.arc(x - r * 1.35, y, r, -0.75, 0.75); ctx.stroke();
+  ctx.beginPath(); ctx.arc(x + r * 1.35, y, r, Math.PI - 0.75, Math.PI + 0.75); ctx.stroke();
+}
+
+/** Geri çekme vektöründen atış: yön imlecin tersine, güç çekme uzunluğuyla. */
+function basketAimShot(info, round) {
+  const { cur: [px, py] } = basketView.aim;
+  const [bx, by] = [round.x + info.release[0], info.release[1]];
+  const [dx, dy] = [bx - px, by - py];
+  return { bx, by, angle: Math.atan2(dy, dx), power: Math.min(1, Math.hypot(dx, dy) / BASKET_PULL) };
+}
+
+function drawBasketAim(ctx, info, round) {
+  const { bx, by, angle, power } = basketAimShot(info, round);
+  const [px, py] = basketView.aim.cur;
+  ctx.setLineDash([4, 5]);
+  ctx.strokeStyle = 'rgba(255, 255, 255, .45)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(px, py); ctx.stroke();
+  // Atışın ilk anı (rüzgâr ve çarpmalar hariç): yalnızca başlangıcı gösterilir, gerisi beceri.
+  const p = Math.max(1, Math.round(power * 100));
+  const v = info.vmin + (info.vmax - info.vmin) * (p - 1) / 99;
+  const [vx, vy] = [Math.cos(angle) * v, Math.sin(angle) * v];
+  ctx.strokeStyle = 'rgba(255, 220, 120, .95)'; ctx.lineWidth = 3;
+  ctx.beginPath();
+  for (let t = 0; t <= 0.28; t += 0.02) {
+    const x = bx + vx * t;
+    const y = by + vy * t + 0.5 * info.g * t * t;
+    if (t === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.font = '600 14px "Segoe UI", system-ui, sans-serif';
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'right';
+  ctx.fillText(`%${p}`, bx - 22, by - 18);
+  ctx.textAlign = 'start';
+}
+
+function drawRoundIntro(ctx, info, round, idx, g, shooter) {
+  const W = info.width;
+  const H = info.height;
+  ctx.fillStyle = 'rgba(10, 12, 24, .6)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#fff';
+  ctx.font = '700 34px "Segoe UI", system-ui, sans-serif';
+  const title = round.kind === 'overtime' ? `Uzatma ${idx - info.baseRounds + 1}` : `${idx + 1}. tur`;
+  ctx.fillText(`${title} · ${round.name}`, W / 2, H / 2 - 50);
+  ctx.font = '19px "Segoe UI", system-ui, sans-serif';
+  ctx.fillStyle = 'rgba(255, 255, 255, .85)';
+  const kd = BASKET_KIND[round.kind];
+  ctx.fillText(`${round.pts} sayı${kd ? ` · ${kd.icon} ${kd.name}: ${kd.desc}` : ''}`, W / 2, H / 2 - 10);
+  if (shooter != null) {
+    ctx.font = '600 18px "Segoe UI", system-ui, sans-serif';
+    ctx.fillStyle = BASKET_TEAMS[teamOfSeat(shooter)].soft;
+    ctx.fillText(`İlk atış: ${basketName(g, shooter)} (${BASKET_TEAMS[teamOfSeat(shooter)].name})`, W / 2, H / 2 + 30);
+  }
+  ctx.font = '700 26px "Segoe UI", system-ui, sans-serif';
+  ctx.fillStyle = '#ffd166';
+  ctx.fillText(`${BASKET_TEAMS[0].name} ${info.score[0]} – ${info.score[1]} ${BASKET_TEAMS[1].name}`, W / 2, H / 2 + 74);
+  ctx.textAlign = 'start';
+  ctx.textBaseline = 'alphabetic';
+}
+
+function basketFlash(g, shot) {
+  const name = basketName(g, shot.seat);
+  const parts = shot.made ? [`${name}: SAYI! +${shot.points}`] : [`${name}: kaçtı`];
+  if (shot.swish) parts.push('Temiz! ✨ +1');
+  if (shot.made && shot.fire) parts.push('🔥 seri bonusu +1');
+  if (shot.nowFire) parts.push('🔥 Alev aldı! Sonraki isabetler +1');
+  const el = $('#basket-flash');
+  el.textContent = parts.join(' · ');
+  el.className = `golf-flash ${shot.made ? 'in' : 'miss'}`;
+  el.hidden = false;
+  clearTimeout(basketView.flashTimer);
+  basketView.flashTimer = setTimeout(() => { el.hidden = true; }, shot.made ? 2200 : 1400);
+}
+
+function basketPoint(e) {
+  const g = gameById(gameState.open);
+  const r = basketCanvas.getBoundingClientRect();
+  const k = (g?.info?.width || 800) / r.width;
+  return [(e.clientX - r.left) * k, (e.clientY - r.top) * k];
+}
+
+new ResizeObserver(() => basketLoop()).observe(basketCanvas);
+basketCanvas.addEventListener('contextrestored', () => basketLoop());
+basketCanvas.addEventListener('pointerdown', (e) => {
+  const g = gameById(gameState.open);
+  if (e.button !== 0 || !g || g.game !== 'basket' || !basketCanShoot(g)) return;
+  basketView.aim = { cur: basketPoint(e), pointerId: e.pointerId };
+  basketCanvas.setPointerCapture(e.pointerId);
+  e.preventDefault();
+  basketLoop();
+});
+basketCanvas.addEventListener('pointermove', (e) => {
+  if (!basketView.aim) return;
+  basketView.aim.cur = basketPoint(e);
+  basketLoop();
+});
+basketCanvas.addEventListener('pointerup', async (e) => {
+  const aim = basketView.aim;
+  const g = gameById(gameState.open);
+  if (!aim || !g?.info?.rounds) return;
+  aim.cur = basketPoint(e);
+  const { angle, power } = basketAimShot(g.info, g.info.rounds[g.info.round]);
+  basketView.aim = null;
+  basketLoop();
+  if (!basketCanShoot(g) || power < 0.04) return;
+  const deg10 = ((Math.round((angle * 180 / Math.PI) * 10) % 3600) + 3600) % 3600;
+  const mv = `a${deg10}p${Math.max(1, Math.min(100, Math.round(power * 100)))}`;
+  await call('game_act', { id: g.id, action: { kind: 'move', mv } }).catch(() => {});
+});
+basketCanvas.addEventListener('pointercancel', () => { basketView.aim = null; basketLoop(); });
+basketCanvas.addEventListener('lostpointercapture', () => { if (basketView.aim) { basketView.aim = null; basketLoop(); } });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && basketView.aim) { basketView.aim = null; basketLoop(); e.stopImmediatePropagation(); }
+}, true);
+
+function renderBasketScores(g) {
+  const info = g.info;
+  if (!info?.rounds) return;
+  const live = g.status === 'active';
+  const cols = info.rounds.map((r, i) => `<th class="${live && i === info.round ? 'cur' : ''}" title="${esc(r.name)} · ${r.pts} sayı">${r.kind === 'overtime' ? `U${i - info.baseRounds + 1}` : i + 1}${r.kind === 'money' ? '💰' : ''}</th>`).join('');
+  const head = `<tr><th></th>${cols}<th>Top.</th></tr>`;
+  const winTeam = g.result?.winner ? g.players.findIndex((p) => p.fingerprint === g.result.winner) % 2 : -1;
+  const rows = info.teams.map((seats, t) => {
+    const cells = info.rounds.map((r, i) => `<td class="${i < info.roundPts[t].length && info.roundPts[t][i] > 0 ? 'under' : ''}">${i < info.roundPts[t].length && (i < info.round || !live) ? info.roundPts[t][i] : i === info.round && live ? (info.roundPts[t][i] || '') : ''}</td>`).join('');
+    const members = seats.map((s) => {
+      const st = info.stats[s];
+      return `<tr class="bk-sub${info.quit[s] ? ' quit' : ''}"><td class="who" colspan="${info.rounds.length + 1}">${esc(basketName(g, s))}${st.fire ? ' 🔥' : ''} <span class="muted">· ${st.made}/${st.att} isabet</span></td><td class="tot">${st.pts}</td></tr>`;
+    }).join('');
+    return `<tr class="${winTeam === t ? 'win' : ''}"><td class="who"><i style="background:${BASKET_TEAMS[t].color}"></i>${BASKET_TEAMS[t].name}</td>${cells}<td class="tot">${info.score[t]}</td></tr>${members}`;
+  }).join('');
+  $('#moves').innerHTML = `<table class="golf-scores bk-scores">${head}${rows}</table>
+    <div class="golf-legend">Turdaki noktadan isabet 2, 3 ya da 4 sayı. Hiçbir yere değmeden giren (temiz) +1; art arda 2 isabetten sonra 🔥 her isabet +1; 💰 son turda sayılar iki katı. Eşitlikte en fazla ${info.maxOvertime} uzatma turu.</div>`;
+}
+
 $('#room-actions').addEventListener('click', async (e) => {
   const b = e.target.closest('[data-room-act]');
   const g = gameById(gameState.open);
@@ -4071,7 +4556,9 @@ $('#room-actions').addEventListener('click', async (e) => {
   const act = b.dataset.roomAct;
   if (act === 'rematch') return rematch(g);
   if (act === 'resign') {
-    const ok = g.game === 'golf'
+    const ok = g.game === 'basket'
+      ? await confirmDialog('Oyundan çekilmek istiyor musunuz?', g.players.length > 2 ? 'Atışlarınızı takım arkadaşınız yapar; takımınızda kimse kalmazsa rakip takım kazanır.' : 'Rakibiniz kazanmış sayılır.', 'Çekil', true)
+      : g.game === 'golf'
       ? await confirmDialog('Oyundan çekilmek istiyor musunuz?', 'Diğer oyuncular oyuna devam eder; tek kişi kalırsa o kazanır.', 'Çekil', true)
       : await confirmDialog('Pes etmek istiyor musunuz?', `Oyunu ${vsName(g)} kazanmış sayılır.`, 'Pes et', true);
     if (!ok) return;
@@ -4083,8 +4570,10 @@ $('#room-actions').addEventListener('click', async (e) => {
 
 async function rematch(g) {
   const two = g.players.length === 2 && g.mySeat != null;
+  // Takımlı oyunda takımlar korunur (aynı koltuklar); iki kişilikte taraflar değişir.
+  const seat = isTeamGame(g) && !two ? g.mySeat : two ? 1 - g.mySeat : null;
   try {
-    const n = await call('game_invite', { game: g.game, players: opponentsOf(g).map((p) => p.fingerprint), seat: two ? 1 - g.mySeat : null });
+    const n = await call('game_invite', { game: g.game, players: opponentsOf(g).map((p) => p.fingerprint), seat });
     if (!gameById(n.id)) state.games = [n, ...state.games];
     openRoom(n.id);
     toast(`Davet gönderildi → ${vsName(n)}`, { type: 'success' });
@@ -4101,7 +4590,7 @@ $('#room-chat').onclick = () => {
 $('#room-remove').onclick = async () => {
   const g = gameById(gameState.open);
   if (!g) return;
-  const text = g.status === 'active' && g.game === 'golf' ? 'Oyun sürüyor; kaldırırsanız oyundan çekilmiş sayılırsınız.'
+  const text = g.status === 'active' && ['golf', 'basket'].includes(g.game) ? 'Oyun sürüyor; kaldırırsanız oyundan çekilmiş sayılırsınız.'
     : g.status === 'active' ? 'Oyun sürüyor; kaldırırsanız pes etmiş sayılırsınız.'
     : g.status === 'invited' ? (g.isHost ? 'Davet geri çekilir.' : 'Davet reddedilir.')
     : 'Yalnızca sizin listenizden kaldırılır.';
@@ -4257,12 +4746,17 @@ function showGameCreate({ game, fp } = {}) {
   let chosen = gameDef(game) || defs[0];
   const selected = new Set(fp && !isBlocked(fp) ? [fp] : []);
   let seat = 'random';
+  // Takımlı oyun: kişi → takım (0 Kırmızı, 1 Mavi). Seçilen kişi az kişili takıma eklenir.
+  const teamOf = new Map([[myFp(), 0]]);
+  const teamSizes = () => [0, 1].map((t) => [...teamOf.values()].filter((x) => x === t).length);
   const m = openModal('game-new', `
     <h3>Yeni oyun</h3>
     <p class="lead">Rakibinize davet gider. Kabul edince oyun odası açılır ve oynamaya başlarsınız.</p>
     <div class="field"><label>Oyun</label><div class="game-pick" id="gn-games"></div></div>
     <div class="field"><label id="gn-people-label">Rakip</label><div class="recips" id="gn-people"></div></div>
     <div class="field" id="gn-seat-field"><label>Taşlarınız</label><div class="seg" id="gn-seat"></div></div>
+    <div class="field" id="gn-teams-field" hidden><label>Takımlar <span class="muted" id="gn-mode"></span></label><div class="gn-teams" id="gn-teams"></div>
+      <div class="small muted">Oyuncuya tıklayıp takımını değiştirin. Takımlar eşit olmalı: 1v1, 2v2 ya da 3v3.</div></div>
     <div class="err" id="gn-err"></div>
     <div class="foot">
       <button class="btn ghost" data-close>Vazgeç</button>
@@ -4274,12 +4768,20 @@ function showGameCreate({ game, fp } = {}) {
     const single = maxOpp() === 1;
     m.querySelector('#gn-games').innerHTML = defs.map((d) => `
       <button class="gp ${d.id === chosen.id ? 'on' : ''}" data-g="${esc(d.id)}">${GAME_ART[d.id] || ''}<span>${esc(d.name)}</span></button>`).join('');
-    m.querySelector('#gn-people-label').textContent = single ? 'Rakip' : `Rakipler (en fazla ${maxOpp()})`;
+    m.querySelector('#gn-people-label').textContent = single ? 'Rakip' : chosen.teams ? `Oyuncular (en fazla ${maxOpp()})` : `Rakipler (en fazla ${maxOpp()})`;
     m.querySelector('#gn-people').innerHTML = people.length
       ? people.map((p) => personRow(p, selected.has(p.fingerprint)).replace('type="checkbox"', single ? 'type="radio" name="gn-opp"' : 'type="checkbox"')).join('')
       : '<span class="muted small">Davet edilecek kimse yok. Ağda başka bir FastFiles görünmeli.</span>';
     const seats = chosen.seats || [];
     m.querySelector('#gn-seat-field').hidden = seats.length !== 2;
+    m.querySelector('#gn-teams-field').hidden = !chosen.teams;
+    if (chosen.teams) {
+      const [a, b] = teamSizes();
+      m.querySelector('#gn-mode').textContent = a === b ? `· ${a}v${b}` : `· ${a}v${b} (eşit değil)`;
+      const nameOf = (f) => (f === myFp() ? 'Siz' : people.find((p) => p.fingerprint === f)?.name || 'Kişi');
+      m.querySelector('#gn-teams').innerHTML = ['Kırmızı', 'Mavi'].map((t, i) => `<div class="gn-team t${i}"><b>${t}</b>${[...teamOf].filter(([, x]) => x === i)
+        .map(([f]) => `<button type="button" data-team-fp="${esc(f)}" title="Diğer takıma geçir">${esc(nameOf(f))} ⇄</button>`).join('') || '<span class="muted small">boş</span>'}</div>`).join('');
+    }
     m.querySelector('#gn-seat').innerHTML = [['random', 'Rastgele'], ...seats.map((s, i) => [String(i), s])]
       .map(([v, l]) => `<button class="${seat === v ? 'on' : ''}" data-seat="${v}">${esc(l)}</button>`).join('');
   };
@@ -4296,6 +4798,14 @@ function showGameCreate({ game, fp } = {}) {
     if (maxOpp() === 1) { selected.clear(); selected.add(f); }
     else if (e.target.checked) { if (selected.size < maxOpp()) selected.add(f); }
     else selected.delete(f);
+    for (const k of [...teamOf.keys()]) if (k !== myFp() && !selected.has(k)) teamOf.delete(k);
+    for (const k of selected) if (!teamOf.has(k)) { const [a, b] = teamSizes(); teamOf.set(k, a > b ? 1 : b > a ? 0 : 1); }
+    render();
+  });
+  m.querySelector('#gn-teams').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-team-fp]');
+    if (!b) return;
+    teamOf.set(b.dataset.teamFp, 1 - teamOf.get(b.dataset.teamFp));
     render();
   });
   m.querySelector('#gn-seat').addEventListener('click', (e) => {
@@ -4309,8 +4819,19 @@ function showGameCreate({ game, fp } = {}) {
       err.textContent = maxOpp() === 1 ? 'Bir rakip seçin' : `En az ${chosen.minPlayers - 1} rakip seçin`;
       return;
     }
+    let players = [...selected];
+    let mySeat = seat === 'random' ? null : Number(seat);
+    if (chosen.teams) {
+      // Koltuklar takımlara göre dizilir: K1, M1, K2, M2... (çift koltuk Kırmızı, tek koltuk Mavi).
+      for (const k of selected) if (!teamOf.has(k)) teamOf.set(k, 1);
+      const [a, b] = [0, 1].map((t) => [...teamOf].filter(([, x]) => x === t).map(([f]) => f));
+      if (a.length !== b.length) { err.textContent = 'Takımlar eşit olmalı (1v1, 2v2 ya da 3v3)'; return; }
+      const order = a.flatMap((f, i) => [f, b[i]]);
+      mySeat = order.indexOf(myFp());
+      players = order.filter((f) => f !== myFp());
+    }
     try {
-      const g = await api.invoke('game_invite', { game: chosen.id, players: [...selected], seat: seat === 'random' ? null : Number(seat) });
+      const g = await api.invoke('game_invite', { game: chosen.id, players, seat: mySeat });
       if (!gameById(g.id)) state.games = [g, ...state.games];
       closeModal();
       openRoom(g.id);
@@ -7073,6 +7594,144 @@ function createPreviewApi() {
     const mine = !info.balls[g.mySeat].done;
     Object.assign(g, { turn: null, myTurn: mine, needsMe: mine, rev: g.rev + 1, updatedAt: Date.now() });
   };
+  // Önizleme: basket kurallarının kısa bir kopyası (gerçeği games/basket.rs içindedir).
+  const BK = { W: 800, H: 500, F: 460, R: 15, rimY: 200, front: 642, back: 698, rimR: 3, boardX: 712, top: 95, bottom: 225, boardR: 4, pole: 752,
+    three: 390, rel: [18, 330], def: { dx: 85, top: 290, r: 12 }, g: 980, vmin: 300, vmax: 1050 };
+  const bkRounds = [
+    { name: 'Serbest atış', x: 470, pts: 2, kind: 'plain', wind: 0 },
+    { name: 'Tepe üçlük', x: 330, pts: 3, kind: 'defender', wind: 0 },
+    { name: 'Dirsek', x: 525, pts: 2, kind: 'wind', wind: -160 },
+    { name: 'Köşe üçlük', x: 365, pts: 3, kind: 'plain', wind: 0 },
+    { name: 'Yarı saha', x: 110, pts: 4, kind: 'money', wind: 0 },
+  ];
+  const bkRound = (i) => ({ no: i + 1, ...(bkRounds[i] || { name: 'Serbest atış', x: 470, pts: 2, kind: 'overtime', wind: 0 }),
+    defender: bkRounds[i]?.kind === 'defender' ? bkRounds[i].x + BK.def.dx : null });
+  const bkThrow = (r, deg, power) => {
+    const a = deg * Math.PI / 180;
+    const v0 = BK.vmin + (BK.vmax - BK.vmin) * (Math.max(1, Math.min(100, power)) - 1) / 99;
+    const p = [r.x + BK.rel[0], BK.rel[1]];
+    const v = [Math.cos(a) * v0, Math.sin(a) * v0];
+    const collide = (ax, ay, bx, by, rad, rest) => {
+      const [abx, aby] = [bx - ax, by - ay];
+      const l2 = abx * abx + aby * aby;
+      const t = l2 > 0 ? Math.max(0, Math.min(1, ((p[0] - ax) * abx + (p[1] - ay) * aby) / l2)) : 0;
+      const [cx, cy] = [ax + abx * t, ay + aby * t];
+      const [dx, dy] = [p[0] - cx, p[1] - cy];
+      const d = Math.hypot(dx, dy);
+      if (d >= BK.R + rad || d < 1e-9) return false;
+      const [nx, ny] = [dx / d, dy / d];
+      p[0] = cx + nx * (BK.R + rad); p[1] = cy + ny * (BK.R + rad);
+      const vn = v[0] * nx + v[1] * ny;
+      if (vn < 0) { v[0] -= (1 + rest) * vn * nx; v[1] -= (1 + rest) * vn * ny; }
+      return true;
+    };
+    const path = [[...p]];
+    let made = false, touched = false, floorAt = null, t = 0, step = 0;
+    const dt = 1 / 240;
+    while (t < 5) {
+      t += dt; step++;
+      v[1] += BK.g * dt; v[0] += r.wind * dt;
+      const py = p[1];
+      p[0] += v[0] * dt; p[1] += v[1] * dt;
+      let hit = collide(BK.front, BK.rimY, BK.front, BK.rimY, BK.rimR, 0.65);
+      hit = collide(BK.back, BK.rimY, BK.back, BK.rimY, BK.rimR, 0.65) || hit;
+      hit = collide(BK.boardX, BK.top, BK.boardX, BK.bottom, BK.boardR, 0.85) || hit;
+      touched ||= hit;
+      collide(BK.pole, BK.bottom, BK.pole, BK.F, 6, 0.5);
+      if (r.defender != null) collide(r.defender, BK.def.top, r.defender, BK.F, BK.def.r, 0.45);
+      if (!made && floorAt == null && py < BK.rimY && p[1] >= BK.rimY && v[1] > 0 && p[0] > BK.front + BK.rimR && p[0] < BK.back - BK.rimR) made = true;
+      if (p[1] > BK.F - BK.R) { p[1] = BK.F - BK.R; v[1] = -v[1] * 0.6; v[0] *= 0.85; floorAt ??= t; }
+      if (p[0] < BK.R) { p[0] = BK.R; v[0] = Math.abs(v[0]) * 0.6; } else if (p[0] > BK.W - BK.R) { p[0] = BK.W - BK.R; v[0] = -Math.abs(v[0]) * 0.6; }
+      if (step % 6 === 0) path.push([Math.round(p[0] * 10) / 10, Math.round(p[1] * 10) / 10]);
+      if ((floorAt != null && t - floorAt > 0.7) || (!made && t > 4)) break;
+    }
+    path.push([...p]);
+    return { made, swish: made && !touched, path };
+  };
+  const bkOrder = (round, n, quit) => {
+    const size = n / 2, first = round % 2, out = [];
+    for (let k = 0; k < size; k++) for (const team of [first, 1 - first]) {
+      const mem = Array.from({ length: size }, (_, i) => i * 2 + team);
+      const s = Array.from({ length: size }, (_, j) => mem[(k + j) % size]).find((x) => !quit[x]);
+      if (s != null) out.push(s);
+    }
+    return out;
+  };
+  /** Hamlelerden oyun durumu (arka ucun `evaluate`'i gibi). */
+  const basketMockEval = (n, moves) => {
+    let round = 0, slot = 0, winner;
+    const quit = Array(n).fill(false);
+    const stats = Array.from({ length: n }, () => ({ made: 0, att: 0, pts: 0, streak: 0, fire: false }));
+    const score = [0, 0];
+    const roundPts = [[0], [0]];
+    const shots = [];
+    moves.forEach((mv, ply) => {
+      const q = mv.match(/^q(\d)$/);
+      if (q) { quit[+q[1]] = true; return; }
+      const [, s, a, pw] = mv.match(/^s(\d)a(\d+)p(\d+)$/).map(Number);
+      const r = bkRound(round);
+      const th = bkThrow(r, a / 10, pw);
+      const st = stats[s];
+      const fire = st.streak >= 2;
+      st.att++;
+      let pts = 0;
+      if (th.made) { pts = (r.pts + (th.swish ? 1 : 0) + (fire ? 1 : 0)) * (r.kind === 'money' ? 2 : 1); st.made++; st.streak++; st.pts += pts; } else st.streak = 0;
+      st.fire = st.streak >= 2;
+      score[s % 2] += pts;
+      roundPts[s % 2][roundPts[s % 2].length - 1] += pts;
+      shots.push({ ply, seat: s, team: s % 2, round, made: th.made, swish: th.swish, fire, nowFire: st.fire && !fire, points: pts, path: th.path });
+      if (++slot >= bkOrder(round, n, quit).length) {
+        round++; slot = 0;
+        if (round >= 5 && score[0] !== score[1]) winner = score[1] > score[0] ? 1 : 0;
+        else if (round >= 8) winner = null;
+        if (winner === undefined) { roundPts[0].push(0); roundPts[1].push(0); }
+      }
+    });
+    const order = bkOrder(round, n, quit);
+    const over = winner !== undefined;
+    const shown = Math.min(round, roundPts[0].length - 1);
+    return {
+      over, winner, turn: over ? null : order[slot],
+      info: { width: BK.W, height: BK.H, floor: BK.F, ballR: BK.R, rim: { y: BK.rimY, front: BK.front, back: BK.back, r: BK.rimR },
+        board: { x: BK.boardX, top: BK.top, bottom: BK.bottom, r: BK.boardR }, poleX: BK.pole, threeX: BK.three, release: BK.rel, defender: BK.def,
+        g: BK.g, vmin: BK.vmin, vmax: BK.vmax, baseRounds: 5, maxOvertime: 3, teamNames: ['Kırmızı', 'Mavi'],
+        teams: [0, 1].map((t) => Array.from({ length: n }, (_, s) => s).filter((s) => s % 2 === t)),
+        rounds: Array.from({ length: Math.max(5, roundPts[0].length) }, (_, i) => bkRound(i)), round: shown, slot, order, shooter: over ? null : order[slot],
+        score, roundPts, stats, quit, shots: shots.slice(-12), lastShot: shots.at(-1) || null },
+    };
+  };
+  const basketMockApply = (g) => {
+    const e = basketMockEval(g.players.length, g.moves);
+    const mine = !e.over && e.turn === g.mySeat;
+    Object.assign(g, { info: e.info, turn: e.turn, myTurn: mine, needsMe: mine, rev: g.rev + 1, updatedAt: Date.now() });
+    if (e.over) Object.assign(g, { status: 'finished', result: { winner: e.winner == null ? null : g.players[e.winner].fingerprint, reason: e.winner == null ? 'tie_points' : 'points', by: null } });
+  };
+  // Bot atıcılar: isabetli bir atış bulup biraz sapmayla atarlar.
+  const basketBots = (g) => {
+    if (g.botTimer || g.status !== 'active' || g.turn == null || g.turn === g.mySeat) return;
+    g.botTimer = setTimeout(() => {
+      g.botTimer = 0;
+      if (g.status !== 'active' || g.turn == null || g.turn === g.mySeat) return;
+      const r = bkRound(g.info.round);
+      let best = [3100, 60];
+      outer: for (let a = 2750; a <= 3400; a += 10) for (let p = 1; p <= 100; p += 1) if (bkThrow(r, a / 10, p).made) { best = [a, p]; break outer; }
+      const a = Math.round(best[0] + (Math.random() - 0.5) * 30);
+      const p = Math.max(1, Math.min(100, Math.round(best[1] + (Math.random() - 0.5) * 6)));
+      g.moves = [...g.moves, `s${g.turn}a${a}p${p}`];
+      basketMockApply(g);
+      emit('games', structuredClone(snap.games));
+      basketBots(g);
+    }, (g.info.lastShot?.path?.length || 0) * 25 + 1800);
+  };
+  // Örnek basket (2v2): Kırmızı = Nur & Elif, Mavi = Ahmet & Render-Sunucu. 2. turda (savunmacı) Ahmet attı, sıra bizde.
+  snap.gameCatalog.push({ id: 'basket', name: 'Basket', description: 'Takımlı atış yarışması: 1v1, 2v2 ya da 3v3. Her turda herkes aynı noktadan sırayla atar; rüzgâr, savunmacı, para topu, temiz sayı ve 🔥 seri bonusları var. Çok sayı atan takım kazanır.', minPlayers: 2, maxPlayers: 6, seats: [], teams: true });
+  const fp3 = snap.peers[2]?.fingerprint || 'c'.repeat(64);
+  const bkPlayers = [{ fingerprint: me, name: 'Nur' }, { fingerprint: fp1, name: 'Ahmet' }, { fingerprint: fp2, name: 'Elif (Tasarım)' }, { fingerprint: fp3, name: snap.peers[2]?.name || 'Render-Sunucu' }];
+  const bkDemo = gameMock({ id: 'gm4', game: 'basket', title: 'Basket', host: me, hostName: 'Nur', isHost: true, players: bkPlayers,
+    joined: bkPlayers.map((p) => p.fingerprint), status: 'active', mySeat: 0, createdAt: now - 5 * 60e3, updatedAt: now - 15e3,
+    moves: ['s0a2994p40', 's1a2757p96', 's2a2739p97', 's3a2741p96', 's1a2790p100'] });
+  basketMockApply(bkDemo);
+  snap.games.unshift(bkDemo);
   // Önizleme: rakipler bizi beklemeden, kendi hızlarında vurur.
   const golfBots = (g) => {
     for (const seat of [0, 2]) {
@@ -7096,6 +7755,13 @@ function createPreviewApi() {
   const gameAct = (g, a) => {
     const opp = g.players.find((p) => p.fingerprint !== me).fingerprint;
     const end = (result) => Object.assign(g, { status: 'finished', result, drawOffer: null, myTurn: false, needsMe: false, legal: [], turn: null });
+    if (a.kind === 'move' && g.game === 'basket') {
+      if (!g.myTurn) throw 'Sıra sizde değil';
+      g.moves = [...g.moves, `s${g.mySeat}${a.mv}`];
+      basketMockApply(g);
+      basketBots(g);
+      return;
+    }
     if (a.kind === 'move' && g.game === 'golf') {
       if (!g.myTurn) throw 'Deliği bitirdiniz; diğerleri bekleniyor';
       golfMockShot(g, g.mySeat, a.mv);
@@ -7203,6 +7869,7 @@ function createPreviewApi() {
     if (location.hash.includes('game-invite')) openRoom('gm2');
     if (location.hash.includes('game-over')) openRoom('gm0');
     if (location.hash.includes('game-golf')) openRoom('gm3');
+    if (location.hash.includes('game-basket')) openRoom('gm4');
     if (location.hash.includes('game-new')) showGameCreate();
     if (location.hash.includes('palette')) openPalette();
     if (location.hash.includes('phone')) openPhone();
@@ -7221,7 +7888,8 @@ function createPreviewApi() {
   }, 400);
   return {
     invoke: async (cmd, args = {}) => {
-      if (cmd === 'get_snapshot') return location.hash.includes('empty') ? { ...snap, peers: [], transfers: [], conversations: [] } : snap;
+      // Oyunlar kopyalanır: arayüz örnek verilerle aynı nesneleri paylaşırsa ilk değişiklik "değişmedi" sanılır.
+      if (cmd === 'get_snapshot') return location.hash.includes('empty') ? { ...snap, peers: [], transfers: [], conversations: [] } : { ...snap, games: structuredClone(snap.games) };
       if (cmd === 'chat_history') return structuredClone(history[args.fingerprint] || []);
       if (cmd === 'chat_image') {
         // Örnek resim: mesaja göre farklı boyut/renkte çizilir.
@@ -7300,6 +7968,15 @@ function createPreviewApi() {
         const others = args.players.map((f) => ({ fingerprint: f, name: snap.peers.find((p) => p.fingerprint === f)?.name || 'Kişi' }));
         const seat = args.seat ?? Math.round(Math.random());
         const players = seat === 0 ? [{ fingerprint: me, name: 'Nur' }, ...others] : [...others, { fingerprint: me, name: 'Nur' }];
+        if (args.game === 'basket') {
+          const bg = gameMock({ id: `gm${Date.now()}`, game: 'basket', title: 'Basket', host: me, hostName: 'Nur', isHost: true, players, joined: [me], status: 'invited', mySeat: seat,
+            createdAt: Date.now(), updatedAt: Date.now(), info: basketMockEval(players.length, []).info });
+          snap.games.unshift(bg);
+          // Önizlemede diğerleri hemen kabul eder.
+          setTimeout(() => { Object.assign(bg, { status: 'active', joined: players.map((p) => p.fingerprint) }); basketMockApply(bg); emit('games', structuredClone(snap.games)); basketBots(bg); }, 1500);
+          setTimeout(() => emit('games', structuredClone(snap.games)), 40);
+          return structuredClone(bg);
+        }
         const golf = args.game === 'golf';
         const tee = golfHoles[0].tee;
         const g = gameMock({ id: `gm${Date.now()}`, host: me, hostName: 'Nur', isHost: true, players, joined: [me], status: 'invited', mySeat: seat, createdAt: Date.now(), updatedAt: Date.now(),

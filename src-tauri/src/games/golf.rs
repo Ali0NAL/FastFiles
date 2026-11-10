@@ -1,8 +1,8 @@
-//! Mini golf: 2–6 oyuncu, 25 delikten rastgele seçilen 6 delik, sırayla vuruş, power-up'lar.
+//! Mini golf: 2–6 oyuncu, 25 delikten rastgele seçilen 6 delik, herkes aynı anda vurur, power-up'lar.
 //!
-//! Hamleler:
-//! - `a<açı>p<güç>`: vuruş. Açı derecenin onda biri (0–3599; 0 = sağa, 900 = aşağı, ekran
-//!   koordinatları), güç yüzde (1–100). Ör. `a1800p65` = sola, %65 güçle.
+//! Hamleler (biçimleri `common.rs`):
+//! - `s<koltuk>a<açı>p<güç>`: vuruş. Açı derecenin onda biri (0–3599; 0 = sağa, 900 = aşağı,
+//!   ekran koordinatları), güç yüzde (1–100). Ör. `s1a1800p65` = 1. koltuk, sola, %65 güçle.
 //! - `q<koltuk>`: oyuncu oyundan çekildi (sıradan bağımsız; yalnızca oda sahibi ekler).
 //!
 //! Fizik sabit adımlı (1/240 sn) ve yalnızca bu dosyadadır: oda sahibi de diğer oyuncular da
@@ -17,18 +17,21 @@
 //! - Kendine: `turbo` (daha sert, kumdan etkilenmez), `ghost` (iç duvar ve direklerin içinden
 //!   geçer), `magnet` (delik topu çeker). Kişide tek bir kendine-etki tutulur; yenisi eskisini siler.
 //!
-//! Sıra: her delikte sırayla birer vuruş; deliği bitiren (topu sokan ya da `MAX_STROKES`'a
-//! ulaşan) atlanır. Deliğe ilk vuran her delikte bir sonraki oyuncuya kayar. Suya düşen top
+//! Sıra yok: deliği bitirmemiş (topu sokmamış, `MAX_STROKES`'a ulaşmamış) herkes istediği an
+//! vurur; sonraki delik herkes bitirince herkes için birlikte başlar. Suya düşen top
 //! vuruşun başladığı yere döner ve bir ceza vuruşu yazılır. Bütün delikler bitince en az toplam
 //! vuruş kazanır; eşitlikte berabere. Bir kişi dışında herkes çekilirse kalan kazanır.
 
+use super::common::{fnv, parse_quit, parse_shot, Rng};
+#[cfg(test)]
+use super::common::seat_shot;
 use super::{Eval, Outcome};
 use serde_json::{json, Value};
 
 pub const MAX_STROKES: u32 = 8;
-/// Bir oyunda oynanan delik sayısı (`HOLES` içinden rastgele seçilir).
 /// Arayüze gönderilen son vuruş sayısı (aynı anda gelen vuruşlar birlikte canlandırılır).
 const RECENT_SHOTS: usize = 12;
+/// Bir oyunda oynanan delik sayısı (`HOLES` içinden rastgele seçilir).
 pub const HOLES_PER_GAME: usize = 6;
 const WIDTH: f64 = 800.0;
 const HEIGHT: f64 = 500.0;
@@ -496,63 +499,6 @@ const HOLES: &[Hole] = &[
         pups: &[(600.0, 190.0), (100.0, 400.0)],
     },
 ];
-
-pub fn quit_move(seat: usize) -> String {
-    format!("q{seat}")
-}
-
-/// `s<koltuk>a<açı>p<güç>` → (koltuk, açı, güç). Yalnızca kanonik yazım kabul edilir (baştaki
-/// sıfır yok). Herkes aynı anda vurduğu için vuruş, kimin vuruşu olduğunu kendisi taşır.
-pub fn parse_shot(mv: &str) -> Option<(usize, u32, u32)> {
-    let rest = mv.strip_prefix('s')?;
-    let (s, rest) = rest.split_once('a')?;
-    let (a, p) = rest.split_once('p')?;
-    let (s, a, p): (usize, u32, u32) = (s.parse().ok()?, a.parse().ok()?, p.parse().ok()?);
-    (s < 6 && a < 3600 && (1..=100).contains(&p) && format!("s{s}a{a}p{p}") == mv).then_some((s, a, p))
-}
-
-/// Arayüzün gönderdiği `a<açı>p<güç>` vuruşunu oyuncunun koltuğuyla tamamlar (zaten koltuklu
-/// ya da başka türden hamle olduğu gibi kalır; başkasının koltuğu yazılmışsa kurallar reddeder).
-pub fn seat_shot(seat: usize, mv: &str) -> String {
-    let full = format!("s{seat}{mv}");
-    if mv.starts_with('a') && parse_shot(&full).is_some() {
-        full
-    } else {
-        mv.to_string()
-    }
-}
-
-pub fn parse_quit(mv: &str) -> Option<usize> {
-    let seat: usize = mv.strip_prefix('q')?.parse().ok()?;
-    (quit_move(seat) == mv).then_some(seat)
-}
-
-// ───────────── Rastgelelik (herkeste aynı) ─────────────
-
-/// FNV-1a: sürümden ve platformdan bağımsız, kararlı özet (std'nin `DefaultHasher`'ı değil).
-fn fnv(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
-}
-
-/// SplitMix64.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-    /// [0, 1)
-    fn unit(&mut self) -> f64 {
-        (self.next() >> 11) as f64 / (1u64 << 53) as f64
-    }
-}
 
 /// Bir oyunun sahası: seçilen delikler ve her deliğin power-up türleri.
 struct Course {
