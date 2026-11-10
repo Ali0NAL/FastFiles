@@ -917,6 +917,29 @@ body.games-open .layout { display: none; }
 .gh-pup { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; cursor: help; }
 .gh-pup i { width: 18px; height: 18px; border-radius: 50%; display: grid; place-items: center; font-size: 11px; font-style: normal; border: 1.5px solid #fff; box-shadow: 0 0 0 1px rgba(0, 0, 0, .15); }
 .gh-fx { font-style: normal; font-size: 12px; letter-spacing: 1px; }
+/* Basket */
+#basket-canvas { display: block; width: 100%; aspect-ratio: 8 / 5; border-radius: 14px; touch-action: none; cursor: crosshair; background: #1b2238; }
+.golf-flash.miss { background: color-mix(in srgb, var(--text) 55%, #000); }
+.bk-teams { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.bk-team { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; padding: 6px 10px; border-radius: 10px; border: 1px solid color-mix(in srgb, var(--team) 45%, var(--border)); background: color-mix(in srgb, var(--team) 12%, var(--surface)); }
+.bk-team > b { color: var(--team); font-size: 13px; }
+.bk-team > em { font-style: normal; font-weight: 800; font-size: 20px; font-variant-numeric: tabular-nums; margin-right: auto; }
+.bk-mems { display: flex; flex-wrap: wrap; gap: 4px; width: 100%; }
+.bk-mem { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--surface-2); border: 1px solid transparent; }
+.bk-mem small { margin-left: 5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.bk-mem.cur { border-color: var(--team); font-weight: 700; }
+.bk-mem.quit { opacity: .45; text-decoration: line-through; }
+.bk-scores tr.bk-sub td { font-size: 11.5px; padding-top: 2px; padding-bottom: 4px; border-bottom-style: dashed; }
+.bk-scores tr.bk-sub td.who { font-weight: 500; padding-left: 16px; max-width: none; }
+.gn-teams { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 6px; }
+.gn-team { display: flex; flex-direction: column; gap: 5px; padding: 8px; border-radius: 10px; min-height: 64px; }
+.gn-team.t0 { background: color-mix(in srgb, #e5484d 14%, var(--surface)); }
+.gn-team.t1 { background: color-mix(in srgb, #3e63dd 14%, var(--surface)); }
+.gn-team.t0 > b { color: #e5484d; }
+.gn-team.t1 > b { color: #3e63dd; }
+.gn-team button { text-align: left; font: inherit; font-size: 12.5px; padding: 4px 8px; border-radius: 7px; border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; }
+.gn-team button:hover { border-color: var(--accent); }
+
 .golf-scores { width: 100%; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; }
 .golf-scores th, .golf-scores td { padding: 5px 3px; text-align: center; border-bottom: 1px solid var(--border); }
 .golf-scores th { color: var(--muted); font-weight: 700; }

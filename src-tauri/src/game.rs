@@ -202,6 +202,9 @@ fn reason_text(reason: &str) -> &'static str {
         "score" => "en az vuruş",
         "tie" => "eşit vuruş",
         "forfeit" => "diğerleri çekildi",
+        "points" => "sayı",
+        "tie_points" => "eşit sayı",
+        "team_forfeit" => "rakip takım çekildi",
         _ => "oyun bitti",
     }
 }
@@ -226,6 +229,15 @@ fn result_line(room: &GameRoom, me: &str) -> String {
     if r.reason == "resign" {
         let by = r.by.as_deref().unwrap_or("");
         return if by == me { "Pes ettiniz".into() } else { format!("{} pes etti — kazandınız", room.name_of(by)) };
+    }
+    if games::def(&room.game).is_some_and(|d| d.teams) {
+        // Takımlı oyun: kazanan, takımın ilk koltuğuyla yazılır (0 Kırmızı, 1 Mavi).
+        let team = |fp: &str| room.seat_of(fp).map(|s| s % 2);
+        return match &r.winner {
+            Some(w) if team(w).is_some() && team(w) == team(me) => format!("Takımınız kazandı ({why})"),
+            Some(w) => format!("{} takım kazandı ({why})", if team(w) == Some(0) { "Kırmızı" } else { "Mavi" }),
+            None => format!("Berabere ({why})"),
+        };
     }
     match &r.winner {
         Some(w) if w == me => format!("Kazandınız ({why})"),
@@ -267,8 +279,10 @@ fn apply(room: &GameRoom, sender: &str, action: &GameAction) -> Result<Option<Ga
             RoomStatus::Invited if sender == r.host => r.status = RoomStatus::Cancelled,
             RoomStatus::Invited => {
                 // Çok oyunculu oyunda yeterince kişi kalıyorsa reddeden çıkar, oyun diğerleriyle kurulur.
+                // Takımlı oyunda takımlar bozulacağından reddeden olursa oyun kurulmaz.
                 let min = games::def(&r.game).map_or(2, |d| d.min_players);
-                if n > min {
+                let teams = games::def(&r.game).is_some_and(|d| d.teams);
+                if n > min && !teams {
                     r.players.retain(|p| p.fingerprint != sender);
                     r.joined.retain(|f| f != sender);
                     if r.players.iter().all(|p| r.joined.contains(&p.fingerprint)) {
@@ -534,6 +548,9 @@ impl Node {
                 format!("{}–{} rakip", def.min_players - 1, def.max_players - 1)
             };
             return Err(format!("{} için {need} seçin", def.name));
+        }
+        if def.teams && total % 2 != 0 {
+            return Err(format!("{} için takımlar eşit olmalı (1v1, 2v2 ya da 3v3)", def.name));
         }
         let seat = match my_seat {
             Some(s) if s < total => s,
@@ -1029,6 +1046,11 @@ fn last_move_text(room: &GameRoom, eval: &games::Eval) -> String {
     }
     let shot = &eval.info["lastShot"];
     let who = shot["seat"].as_u64().and_then(|s| room.players.get(s as usize)).map(|p| p.name.clone()).unwrap_or_default();
+    if room.game == "basket" {
+        let round = shot["round"].as_u64().unwrap_or(0) + 1;
+        let what = if shot["made"].as_bool() == Some(true) { format!("+{} sayı", shot["points"]) } else { "kaçırdı".into() };
+        return format!("{who} {what} · {round}. tur");
+    }
     let hole = eval.info["hole"].as_u64().unwrap_or(0) + 1;
     format!("{who} vurdu · {hole}. delik")
 }
@@ -1129,6 +1151,32 @@ mod tests {
         let e = games::evaluate("golf", &r.id, 2, &r.moves).unwrap();
         assert_eq!(e.info["hole"], 1);
         assert_eq!(e.movers, vec![0, 1]);
+    }
+
+    /// Takımlı oyunda reddeden olursa takımlar bozulacağından oyun kurulmaz; sonuç takımca yazılır.
+    #[test]
+    fn team_game_rules() {
+        let (a, b, c, d) = ("a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64));
+        let mut r = room();
+        r.game = "basket".into();
+        r.players = vec![member(&a, "Ali"), member(&b, "Banu"), member(&c, "Can"), member(&d, "Deniz")];
+        let declined = apply(&r, &c, &GameAction::Decline).unwrap().unwrap();
+        assert_eq!(declined.status, RoomStatus::Declined);
+        assert_eq!(declined.players.len(), 4);
+        // Mavi (1, 3) kazandı.
+        let mut done = r.clone();
+        finish(&mut done, Some(b.clone()), "points", None);
+        assert_eq!(result_line(&done, &d), "Takımınız kazandı (sayı)");
+        assert_eq!(result_line(&done, &a), "Mavi takım kazandı (sayı)");
+        // Sırası gelmeyen atamaz; atış atanın koltuğuyla yazılır.
+        r.status = RoomStatus::Active;
+        r.joined = r.players.iter().map(|p| p.fingerprint.clone()).collect();
+        let shot = GameAction::Move { mv: "a900p1".into(), at: Some(0) };
+        assert_eq!(apply(&r, &b, &shot), Err("not_your_turn"));
+        let r = apply(&r, &a, &shot).unwrap().unwrap();
+        assert_eq!(r.moves, vec!["s0a900p1"]);
+        assert_eq!(apply(&r, &a, &shot), Ok(None), "yinelenen atış");
+        assert!(apply(&r, &b, &GameAction::Move { mv: "a900p1".into(), at: Some(1) }).is_ok());
     }
 
     #[test]
