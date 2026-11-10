@@ -240,6 +240,29 @@
           <button class="icon-btn sm" id="chat-watch" title="Birlikte izle (YouTube)">
             <svg viewBox="0 0 24 24"><rect x="2.5" y="5" width="19" height="13" rx="3"/><path d="M10 8.8v6.4l5.4-3.2z"/><path d="M8 21h8"/></svg>
           </button>
+          <div class="chat-fx" id="chat-fx-wrap" hidden>
+            <button class="icon-btn sm" id="chat-fx" title="Animasyon gönder (ekranında oynar)" aria-haspopup="menu" aria-expanded="false">
+              <svg viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="1.5"/><path d="M3 7.5h18V10H3zM12 7.5V20"/><path d="M12 7.5C10.5 4 7 3.6 7 5.6 7 7 9.4 7.5 12 7.5zM12 7.5c1.5-3.5 5-3.9 5-1.9 0 1.4-2.4 1.9-5 1.9z"/></svg>
+            </button>
+            <div class="fx-menu" id="fx-menu" role="menu" hidden>
+              <div class="fx-menu-title">Ekranında oynat</div>
+              <div class="fx-tiles">
+                <button class="fx-tile" data-fx="gift" role="menuitem">
+                  <svg viewBox="0 0 48 48"><rect x="9" y="20" width="30" height="21" rx="3" fill="#ff5f7e"/><rect x="7" y="14" width="34" height="8" rx="2.5" fill="#ff8099"/><rect x="21.5" y="14" width="5" height="27" fill="#ffd23f"/><path d="M24 14c-3-6-10-7-10-3 0 2.6 4.4 3 10 3zM24 14c3-6 10-7 10-3 0 2.6-4.4 3-10 3z" fill="#ffd23f"/></svg>
+                  <span>Hediye</span>
+                </button>
+                <button class="fx-tile" data-fx="heart" role="menuitem">
+                  <svg viewBox="0 0 48 48"><path d="M24 41S6 30 6 17.5C6 11.7 10.4 8 15.2 8c3.8 0 6.8 2.2 8.8 5.4C26 10.2 29 8 32.8 8 37.6 8 42 11.7 42 17.5 42 30 24 41 24 41z" fill="#ff3d7f"/><path d="M13 15.5c1-2.6 3.4-3.6 5.4-3" stroke="#fff" stroke-opacity=".7" stroke-width="2.4" stroke-linecap="round" fill="none"/></svg>
+                  <span>Kalp</span>
+                </button>
+                <button class="fx-tile" data-fx="bullet" role="menuitem">
+                  <svg viewBox="0 0 48 48"><path d="M27 16h6c5 0 9 4 11.5 8-2.5 4-6.5 8-11.5 8h-6z" fill="#e07a3a"/><rect x="9" y="15.5" width="19" height="17" rx="1.5" fill="#e3b14b"/><rect x="5" y="14" width="5" height="20" rx="1.5" fill="#c9952f"/><path d="M3 24h-1" stroke="#ff7a1a" stroke-width="3" stroke-linecap="round"/></svg>
+                  <span>Kurşun</span>
+                </button>
+              </div>
+              <div class="fx-menu-note" id="fx-menu-note">Art arda gönderilemez · 15 sn ara</div>
+            </div>
+          </div>
           <button class="icon-btn sm" id="chat-nudge" title="Dürt (penceresi titrer)" hidden>
             <svg viewBox="0 0 24 24"><path d="M7 11.5V6.5a1.5 1.5 0 0 1 3 0V11M10 10V4.5a1.5 1.5 0 0 1 3 0V10M13 10V5.5a1.5 1.5 0 0 1 3 0V12M16 9.5a1.5 1.5 0 0 1 3 0V14a7 7 0 0 1-7 7h-.6a6 6 0 0 1-4.6-2.2L3.5 15a1.6 1.6 0 0 1 2.4-2.1L7 14"/><path d="M3 5.5 1.8 4.6M4.6 3.2 4 1.8M20.5 3.8l1.2-1"/></svg>
           </button>
@@ -489,6 +512,13 @@
       </div>
       <button class="link-btn" id="pin-forgot">PIN'imi unuttum</button>
     </div>
+  </div>
+
+  <!-- Ekran animasyonları (hediye, kalp, kurşun): tüm pencerenin üstünde, tıklamayı engellemez -->
+  <div class="fx-layer" id="fx-layer" aria-hidden="true" hidden>
+    <canvas id="fx-canvas"></canvas>
+    <div class="fx-stage" id="fx-stage"></div>
+    <div class="fx-caption" id="fx-caption"></div>
   </div>
 
 <script type="module" src="main.js"></script>

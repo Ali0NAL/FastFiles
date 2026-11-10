@@ -8,15 +8,19 @@
 //!   mesajları, grupta `sender` alanı gönderenin parmak iziyle aynı olan mesajlar.
 //! - Grup olayları yalnızca iki taraf da o grubun üyesiyse geçerlidir.
 //! - Dürtme yalnızca birebir sohbette olur ve kişi başına 10 saniyede bir kabul edilir.
+//! - Ekran animasyonları (hediye, kalp, kurşun) yalnızca sabit listeden olabilir; aynı sohbete
+//!   en fazla 15 saniyede bir gönderilir, aynı kişiden en fazla 15 saniyede bir kabul edilir.
 
 use super::*;
-use crate::chat::{ChatEventKind, Reaction, ReplyRef, REACTIONS, REPLY_SNIPPET_CHARS};
+use crate::chat::{ChatEventKind, Reaction, ReplyRef, EFFECTS, REACTIONS, REPLY_SNIPPET_CHARS};
 use std::sync::atomic::AtomicBool;
 
 /// Bu kadar süre klavye/fare kullanılmazsa durum kendiliğinden "Dışarıda" olur.
 const AUTO_AWAY: Duration = Duration::from_secs(10 * 60);
 /// Aynı kişiden en fazla bu sıklıkta dürtme.
 const NUDGE_GAP: Duration = Duration::from_secs(10);
+/// Ekran animasyonları arasında en az bu kadar süre olmalı (art arda atılamaz).
+pub const EFFECT_GAP: Duration = Duration::from_secs(15);
 /// Mesaj gönderildikten sonra bu süre içinde düzenlenebilir.
 const EDIT_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
 /// Sohbet olayları için hız sınırı (cihaz başına).
@@ -33,6 +37,8 @@ pub struct State {
     status: Mutex<String>,
     nudge_sent: Mutex<HashMap<String, Instant>>,
     nudge_seen: Mutex<HashMap<String, Instant>>,
+    effect_sent: Mutex<HashMap<String, Instant>>,
+    effect_seen: Mutex<HashMap<String, Instant>>,
     event_rate: Mutex<HashMap<String, VecDeque<Instant>>>,
     clip_cancel: AtomicBool,
     pub screen: screen::State,
@@ -43,6 +49,15 @@ pub struct State {
 impl State {
     pub fn status_now(&self) -> String {
         self.status.lock().unwrap().clone()
+    }
+}
+
+/// Animasyonun sohbet notundaki simgesi ve adı.
+fn effect_label(effect: &str) -> (&'static str, &'static str) {
+    match effect {
+        "gift" => ("🎁", "hediye"),
+        "heart" => ("❤️", "kalp"),
+        _ => ("🔫", "kurşun"),
     }
 }
 
@@ -319,6 +334,51 @@ impl Node {
         Ok(())
     }
 
+    /// Sohbete ekran animasyonu gönderir (hediye, kalp, kurşun): karşının tüm ekranında oynar.
+    /// Birebir sohbette kişi çevrimiçi olmalı; grupta çevrimiçi üyelere gider.
+    pub fn chat_effect(self: &Arc<Self>, key: &str, effect: &str) -> Result<(), String> {
+        if !EFFECTS.contains(&effect) {
+            return Err("Geçersiz animasyon".into());
+        }
+        let (targets, group_id) = self.event_targets(key)?;
+        let online: Vec<Peer> = self.peers().into_iter().filter(|p| !p.blocked && targets.contains(&p.fingerprint)).collect();
+        let name = match &group_id {
+            Some(_) => {
+                if online.is_empty() {
+                    return Err("Grupta şu an çevrimiçi kimse yok".into());
+                }
+                String::new()
+            }
+            None => {
+                if self.is_blocked(key) {
+                    return Err("Bu cihazı engellediniz".into());
+                }
+                online.first().ok_or("Kişi çevrimdışı")?.name.clone()
+            }
+        };
+        {
+            let mut sent = self.extras.effect_sent.lock().unwrap();
+            if let Some(left) = sent.get(key).and_then(|t| EFFECT_GAP.checked_sub(t.elapsed())) {
+                return Err(format!("Art arda gönderilemez, {} sn bekleyin", left.as_secs() + 1));
+            }
+            sent.insert(key.to_string(), Instant::now());
+        }
+        let (icon, what) = effect_label(effect);
+        let verb = if effect == "bullet" { "sıktınız" } else { "gönderdiniz" };
+        let note = match group_id {
+            Some(_) => format!("{icon} Gruba {what} {verb}"),
+            None => format!("{icon} {name} kişisine {what} {verb}"),
+        };
+        self.push_note(key, &self.conv_name(key, &name), note);
+        self.broadcast_event(key, ChatEventKind::Effect { effect: effect.to_string() })?;
+        Ok(())
+    }
+
+    /// Sohbetin kayıtlı adı (grupta grup adı); yoksa verilen ad.
+    fn conv_name(&self, key: &str, fallback: &str) -> String {
+        self.chats.lock().unwrap().conversation_meta(key).map(|m| m.0).filter(|n| !n.is_empty()).unwrap_or_else(|| fallback.to_string())
+    }
+
     /// Sohbete bilgi satırı ekler (sohbet yoksa oluşturur); okunmamış sayılmaz.
     fn push_note(&self, key: &str, name: &str, text: String) {
         let msg = ChatMessage { id: uuid::Uuid::new_v4().to_string(), text, at: now_ms(), system: true, ..Default::default() };
@@ -399,6 +459,32 @@ impl Node {
                 self.upsert_peer(device.clone(), ip, None);
                 self.push_note(&fp, &name, format!("👋 {name} sizi dürttü"));
                 self.emit("nudge", json!({ "fingerprint": fp, "name": name }));
+            }
+            ChatEventKind::Effect { effect } => {
+                if !EFFECTS.contains(&effect.as_str()) {
+                    return;
+                }
+                {
+                    let mut seen = self.extras.effect_seen.lock().unwrap();
+                    if seen.get(&fp).is_some_and(|t| t.elapsed() < EFFECT_GAP) {
+                        return;
+                    }
+                    seen.insert(fp.clone(), Instant::now());
+                }
+                let name = sanitize_name(&device.name);
+                let (icon, what) = effect_label(&effect);
+                let verb = if effect == "bullet" { "sıktı" } else { "gönderdi" };
+                let note = if group_id.is_some() {
+                    format!("{icon} {name} gruba {what} {verb}")
+                } else {
+                    self.upsert_peer(device.clone(), ip, None);
+                    format!("{icon} {name} size {what} {verb}")
+                };
+                self.push_note(&key, &self.conv_name(&key, &name), note);
+                self.emit(
+                    "effect",
+                    json!({ "key": key, "fingerprint": fp, "name": name, "effect": effect, "group": group_id.is_some() }),
+                );
             }
         }
     }

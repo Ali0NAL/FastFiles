@@ -454,6 +454,7 @@ impl Node {
         let owner_name = sanitize_name(owner_name);
         let poll_id = poll.id.clone();
         let mut notify: Option<(String, String)> = None;
+        let mut is_new = false;
         {
             let mut map = self.polls.lock().unwrap();
             match map.get_mut(&poll.id) {
@@ -473,6 +474,7 @@ impl Node {
                 None => {
                     if !poll.closed {
                         notify = Some((format!("Yeni oylama · {owner_name}"), poll.question.clone()));
+                        is_new = true;
                     }
                     map.insert(poll.id.clone(), PollState { poll, owner_name, ..Default::default() });
                 }
@@ -483,6 +485,10 @@ impl Node {
             self.notify_to(&title, &body, json!({ "view": "polls", "id": poll_id }));
         }
         self.emit_polls();
+        // Yeni oylama: kabuk pencereyi öne getirir.
+        if is_new {
+            self.emit("poll-new", json!({ "id": poll_id }));
+        }
         Message::PollAck
     }
 

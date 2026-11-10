@@ -1369,6 +1369,8 @@ function renderChatHeadBase() {
     ta.placeholder = canSend ? 'Gruba mesaj yazın… (@ ile birinden bahsedin)' : 'Bu gruba mesaj gönderemezsiniz';
     $('#chat-send').disabled = !canSend || !ta.value.trim();
     $('#chat-nudge').hidden = true;
+    $('#chat-fx-wrap').hidden = !canSend;
+    if (!canSend) closeFxMenu();
     $('#chat-screen').hidden = !canSend;
     $('#chat-watch').hidden = !canSend;
     $('#chat-shot').disabled = !canSend;
@@ -1405,6 +1407,8 @@ function renderChatHeadBase() {
   ta.placeholder = canSend ? 'Mesaj yazın…' : blocked ? 'Bu cihazı engellediniz' : 'Çevrimdışı · mesaj gönderilemez, ama dosya bırakabilirsiniz';
   $('#chat-send').disabled = !canSend || !ta.value.trim();
   $('#chat-nudge').hidden = !canSend;
+  $('#chat-fx-wrap').hidden = !canSend;
+  if (!canSend) closeFxMenu();
   $('#chat-screen').hidden = !canSend;
   $('#chat-watch').hidden = !canSend;
   $('#chat-shot').disabled = blocked;
@@ -4741,6 +4745,470 @@ function onNudge({ fingerprint, name }) {
   }
 }
 
+// ── Ekran animasyonları (hediye, kalp, kurşun) ──
+// Gönderilen animasyon alıcının tüm penceresinde oynar: üstte parçacık katmanı, altta
+// uygulamanın renkleri ve yerleşimi kısa süre animasyona göre değişir. Art arda gönderim
+// arka uçta engellenir (sohbet başına 15 sn); arayüz de geri sayımı gösterir.
+const FX_GAP = 15000;
+const fxx = { cooldown: new Map(), queue: [], playing: false, parts: [], emitters: [], raf: 0, last: 0, tick: 0, classes: [] };
+const fxReduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const FX_INFO = {
+  gift: { icon: '🎁', what: 'hediye', sent: 'Hediye gönderildi', verb: 'gönderdi' },
+  heart: { icon: '❤️', what: 'kalp', sent: 'Kalp gönderildi', verb: 'gönderdi' },
+  bullet: { icon: '🔫', what: 'kurşun', sent: 'Kurşun sıkıldı', verb: 'sıktı' },
+};
+
+const fxMenuOpen = () => !$('#fx-menu').hidden;
+function closeFxMenu() {
+  if (!fxMenuOpen()) return;
+  $('#fx-menu').hidden = true;
+  $('#chat-fx').setAttribute('aria-expanded', 'false');
+  clearInterval(fxx.tick);
+}
+function fxCooldownLeft(key) {
+  return Math.max(0, (fxx.cooldown.get(key) || 0) - Date.now());
+}
+function renderFxMenu() {
+  const left = fxCooldownLeft(state.openChat);
+  $('#fx-menu').classList.toggle('cool', left > 0);
+  $('#chat-fx').classList.toggle('cool', left > 0);
+  document.querySelectorAll('#fx-menu .fx-tile').forEach((b) => (b.disabled = left > 0));
+  $('#fx-menu-note').textContent = left > 0 ? `Tekrar göndermek için ${Math.ceil(left / 1000)} sn bekleyin` : 'Art arda gönderilemez · 15 sn ara';
+}
+$('#chat-fx').onclick = (e) => {
+  e.stopPropagation();
+  if (fxMenuOpen()) return closeFxMenu();
+  $('#chat-more-menu').hidden = true;
+  $('#fx-menu').hidden = false;
+  $('#chat-fx').setAttribute('aria-expanded', 'true');
+  renderFxMenu();
+  clearInterval(fxx.tick);
+  fxx.tick = setInterval(renderFxMenu, 250);
+};
+document.addEventListener('mousedown', (e) => { if (!e.target.closest('.chat-fx')) closeFxMenu(); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && fxMenuOpen()) { closeFxMenu(); e.stopImmediatePropagation(); }
+}, true);
+$('#fx-menu').addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-fx]');
+  const key = state.openChat;
+  if (!b || b.disabled || !key || fxCooldownLeft(key)) return;
+  const effect = b.dataset.fx;
+  try {
+    await call('chat_effect', { key, effect });
+  } catch { return; /* toast gösterildi */ }
+  fxx.cooldown.set(key, Date.now() + FX_GAP);
+  closeFxMenu();
+  $('#chat-fx').classList.add('cool');
+  setTimeout(() => { if (state.openChat === key) renderFxMenu(); }, FX_GAP + 50);
+  const name = state.chats.get(key)?.name || peerByFp(key)?.name || '';
+  playEffect({ effect, caption: `${FX_INFO[effect].icon} ${FX_INFO[effect].sent}${name ? ` · ${name}` : ''}` });
+});
+
+function onEffect({ key, name, effect, group }) {
+  const info = FX_INFO[effect];
+  if (!info) return;
+  const locked = lockVisible();
+  const text = `${name} ${group ? 'gruba' : 'sana'} ${info.what} ${info.verb}${effect === 'bullet' ? '!' : ''}`;
+  // Kilitliyken animasyon oynar ama kimden geldiği gösterilmez.
+  playEffect({ effect, caption: locked ? '' : `${info.icon} ${text}` });
+  if (!locked && (state.openChat !== key || !chatOpen())) {
+    toast(`${info.icon} ${text}`, {
+      action: effect === 'bullet' ? 'Karşılık ver' : 'Aç',
+      timeout: 8000,
+      onAction: () => openChat(key, group ? undefined : name),
+    });
+  }
+}
+
+function onPollNew({ id, wasFront, dnd }) {
+  // Pencere arkadaydı ve kabuk öne getirdi: oylamayı doğrudan aç. Uygulama zaten öndeyken
+  // kullanıcının yaptığı iş bölünmesin diye yalnızca bildirim (toast) gösterilir.
+  if (wasFront || dnd || lockVisible() || modalKind) return;
+  onNotificationClick({ view: 'polls', id });
+}
+
+function fxBody(...cls) {
+  document.body.classList.add(...cls);
+  fxx.classes.push(...cls);
+}
+function fxUnbody(...cls) {
+  document.body.classList.remove(...cls);
+  fxx.classes = fxx.classes.filter((c) => !cls.includes(c));
+}
+
+function playEffect(fx) {
+  if (fxx.playing) {
+    // Aynı anda birden çok kişiden gelirse sırayla oynar (en fazla 3 bekler).
+    if (fxx.queue.length < 3) fxx.queue.push(fx);
+    return;
+  }
+  const run = { gift: fxGift, heart: fxHeart, bullet: fxBullet }[fx.effect];
+  if (!run) return;
+  fxx.playing = true;
+  $('#fx-layer').hidden = false;
+  fxFit();
+  const cap = $('#fx-caption');
+  cap.textContent = fx.caption || '';
+  cap.className = `fx-caption ${fx.effect}`;
+  if (fx.caption) { void cap.offsetWidth; cap.classList.add('show'); }
+  fxBody('fx-on', `fx-${fx.effect}`);
+  const dur = run();
+  setTimeout(() => cap.classList.remove('show'), dur - 500);
+  setTimeout(() => {
+    fxUnbody(...fxx.classes);
+    $('#fx-stage').innerHTML = '';
+    fxx.playing = false;
+    const next = fxx.queue.shift();
+    if (next) setTimeout(() => playEffect(next), 200);
+    else fxKick();
+  }, dur);
+  fxKick();
+}
+
+// ── Parçacık motoru ──
+function fxFit() {
+  const cv = $('#fx-canvas');
+  const dpr = Math.min(2, devicePixelRatio || 1);
+  const w = Math.round(innerWidth * dpr), h = Math.round(innerHeight * dpr);
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+}
+addEventListener('resize', () => { if (!$('#fx-layer').hidden) fxFit(); });
+const fxRand = (a, b) => a + Math.random() * (b - a);
+const fxN = (n) => Math.max(1, Math.round(fxReduced ? n * 0.35 : n));
+function fxSpawn(p) {
+  fxx.parts.push({ age: 0, rot: 0, vr: 0, drag: 0, g: 0, ...p });
+}
+/** `ms` boyunca her karede `fn(dt, t)` çağrılır. */
+function fxEmit(ms, fn) {
+  fxx.emitters.push({ t: 0, ms, fn });
+  fxKick();
+}
+function fxKick() {
+  if (!fxx.raf) fxx.raf = requestAnimationFrame(fxFrame);
+}
+function heartPath(ctx, s) {
+  ctx.beginPath();
+  ctx.moveTo(0, s * 0.9);
+  ctx.bezierCurveTo(-s * 1.6, -s * 0.1, -s * 0.8, -s * 1.3, 0, -s * 0.45);
+  ctx.bezierCurveTo(s * 0.8, -s * 1.3, s * 1.6, -s * 0.1, 0, s * 0.9);
+  ctx.closePath();
+}
+const FIRE = [[255, 250, 210], [255, 205, 90], [255, 120, 30], [220, 50, 10], [70, 55, 55]];
+function fireColor(k) {
+  const x = Math.min(0.999, k) * (FIRE.length - 1);
+  const i = Math.floor(x), f = x - i;
+  const a = FIRE[i], b = FIRE[i + 1];
+  return [0, 1, 2].map((j) => Math.round(a[j] + (b[j] - a[j]) * f));
+}
+function fxFrame(now) {
+  fxx.raf = 0;
+  const dt = fxx.last ? Math.min(0.05, (now - fxx.last) / 1000) : 1 / 60;
+  fxx.last = now;
+  const cv = $('#fx-canvas');
+  const ctx = cv.getContext('2d');
+  const dpr = cv.width / innerWidth;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, innerWidth, innerHeight);
+  fxx.emitters = fxx.emitters.filter((e) => {
+    e.t += dt * 1000;
+    e.fn(dt, e.t);
+    return e.t < e.ms;
+  });
+  fxx.parts = fxx.parts.filter((p) => (p.age += dt) < p.life);
+  for (const p of fxx.parts) {
+    const k = p.age / p.life;
+    if (p.drag) { const d = Math.pow(1 - p.drag, dt * 60); p.vx *= d; p.vy *= d; }
+    p.vy += p.g * dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.rot += p.vr * dt;
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    switch (p.kind) {
+      case 'fire': {
+        const [r, g, b] = fireColor(k);
+        const smoke = k > 0.7;
+        ctx.globalCompositeOperation = smoke ? 'source-over' : 'lighter';
+        const rad = p.size * (smoke ? 1 + (k - 0.7) * 3 : 0.6 + k * 0.8);
+        const a = smoke ? 0.35 * (1 - k) / 0.3 : 0.9 * (1 - k * 0.6);
+        const gr = ctx.createRadialGradient(0, 0, 0, 0, 0, rad);
+        gr.addColorStop(0, `rgba(${r},${g},${b},${a})`);
+        gr.addColorStop(1, `rgba(${r},${g},${b},0)`);
+        ctx.fillStyle = gr;
+        ctx.beginPath();
+        ctx.arc(0, 0, rad, 0, Math.PI * 2);
+        ctx.fill();
+        break;
+      }
+      case 'spark': {
+        ctx.globalCompositeOperation = 'lighter';
+        const [r, g, b] = fireColor(k * 0.8);
+        ctx.strokeStyle = `rgba(${r},${g},${b},${1 - k})`;
+        ctx.lineWidth = p.size * (1 - k * 0.5);
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(-p.vx * 0.035, -p.vy * 0.035);
+        ctx.stroke();
+        break;
+      }
+      case 'ember': {
+        ctx.globalCompositeOperation = 'lighter';
+        const flick = 0.55 + 0.45 * Math.sin(p.age * 30 + p.seed);
+        ctx.fillStyle = `rgba(255,${Math.round(150 - k * 90)},40,${(1 - k) * flick})`;
+        ctx.beginPath();
+        ctx.arc(0, 0, p.size, 0, Math.PI * 2);
+        ctx.fill();
+        break;
+      }
+      case 'heart': {
+        ctx.rotate(p.rot);
+        const s = p.size * (k < 0.15 ? k / 0.15 : 1);
+        ctx.globalAlpha = k > 0.7 ? (1 - k) / 0.3 : 1;
+        ctx.fillStyle = p.color;
+        heartPath(ctx, s);
+        ctx.fill();
+        ctx.globalAlpha *= 0.45;
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        ctx.ellipse(-s * 0.45, -s * 0.45, s * 0.22, s * 0.12, -0.6, 0, Math.PI * 2);
+        ctx.fill();
+        break;
+      }
+      case 'confetti': {
+        ctx.rotate(p.rot);
+        ctx.scale(1, Math.cos(p.age * p.flip));
+        ctx.globalAlpha = k > 0.75 ? (1 - k) / 0.25 : 1;
+        ctx.fillStyle = p.color;
+        ctx.fillRect(-p.size / 2, -p.size * 0.3, p.size, p.size * 0.6);
+        break;
+      }
+      case 'star': {
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.rotate(p.rot);
+        const s = p.size * Math.sin(Math.PI * k);
+        ctx.fillStyle = p.color || '#fff6c8';
+        ctx.beginPath();
+        for (let i = 0; i < 8; i++) {
+          const r = i % 2 ? s * 0.22 : s;
+          const a = (i / 8) * Math.PI * 2;
+          ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+        }
+        ctx.closePath();
+        ctx.fill();
+        break;
+      }
+    }
+    ctx.restore();
+  }
+  if (fxx.parts.length || fxx.emitters.length || fxx.playing) {
+    fxKick();
+  } else {
+    fxx.last = 0;
+    $('#fx-layer').hidden = true;
+  }
+}
+
+function fxEl(cls, html = '') {
+  const el = document.createElement('div');
+  el.className = cls;
+  el.innerHTML = html;
+  $('#fx-stage').appendChild(el);
+  return el;
+}
+
+// ── Kurşun: alevli iz bırakarak gelir, camı kırar, delik yanar, sonra kaybolur ──
+const BULLET_SVG = `<svg viewBox="0 0 120 36" width="120" height="36">
+  <defs>
+    <linearGradient id="fxCase" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff0b8"/><stop offset=".4" stop-color="#e0aa3e"/><stop offset="1" stop-color="#76500f"/></linearGradient>
+    <linearGradient id="fxTip" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffd2ad"/><stop offset=".45" stop-color="#cf6a2c"/><stop offset="1" stop-color="#5f240a"/></linearGradient>
+  </defs>
+  <path d="M58 6h26c18 0 30 6 35 12-5 6-17 12-35 12H58z" fill="url(#fxTip)"/>
+  <rect x="10" y="5" width="50" height="26" rx="2" fill="url(#fxCase)"/>
+  <rect x="3" y="3" width="9" height="30" rx="2" fill="url(#fxCase)"/>
+  <path d="M14 9h44" stroke="#fff" stroke-opacity=".55" stroke-width="2"/>
+</svg>`;
+
+function crackSvg(size) {
+  const r = size / 2;
+  const rays = 10 + Math.floor(Math.random() * 4);
+  const pts = [];
+  const f = (n) => n.toFixed(1);
+  let d = '';
+  for (let i = 0; i < rays; i++) {
+    const a = (i / rays) * Math.PI * 2 + fxRand(-0.22, 0.22);
+    const len = r * fxRand(0.5, 0.98);
+    const ray = [];
+    d += 'M0 0';
+    for (let s = 1; s <= 4; s++) {
+      const aa = a + fxRand(-0.18, 0.18);
+      const x = Math.cos(aa) * len * (s / 4), y = Math.sin(aa) * len * (s / 4);
+      d += ` L${f(x)} ${f(y)}`;
+      ray.push([x, y]);
+    }
+    if (Math.random() < 0.6) {
+      const [px, py] = ray[1 + Math.floor(Math.random() * 2)];
+      const ba = a + (Math.random() < 0.5 ? -1 : 1) * fxRand(0.4, 0.9);
+      d += ` M${f(px)} ${f(py)} l${f(Math.cos(ba) * len * 0.28)} ${f(Math.sin(ba) * len * 0.28)}`;
+    }
+    pts.push(ray);
+  }
+  // Halkalar: komşu ışınları birleştiren kırık çizgiler.
+  for (const ring of [0, 1]) {
+    for (let i = 0; i < rays; i++) {
+      if (Math.random() < 0.25) continue;
+      const a = pts[i][ring], b = pts[(i + 1) % rays][ring];
+      const mx = ((a[0] + b[0]) / 2) * fxRand(0.88, 1.12), my = ((a[1] + b[1]) / 2) * fxRand(0.88, 1.12);
+      d += ` M${f(a[0])} ${f(a[1])} L${f(mx)} ${f(my)} L${f(b[0])} ${f(b[1])}`;
+    }
+  }
+  return `<svg viewBox="${-r} ${-r} ${size} ${size}" style="width:${size}px;height:${size}px">
+    <circle r="${f(r * 0.22)}" class="glare"/>
+    <path d="${d}" class="c1"/><path d="${d}" class="c2"/></svg>`;
+}
+
+function fxBullet() {
+  const W = innerWidth, H = innerHeight;
+  const ix = W * fxRand(0.35, 0.65), iy = H * fxRand(0.32, 0.62);
+  const fromLeft = Math.random() < 0.5;
+  const sx = fromLeft ? -160 : W + 160, sy = iy + fxRand(-0.22, 0.22) * H;
+  const ang = Math.atan2(iy - sy, ix - sx);
+  const FLY = 200;
+  fxEl('fx-vignette');
+  const b = fxEl('fx-shot', BULLET_SVG);
+  // Merminin ucu (SVG'nin sağ kenarı) hedefe varsın.
+  const tf = (x, y) => `translate(${x}px, ${y}px) rotate(${ang}rad) translate(-118px, -18px)`;
+  b.animate([{ transform: tf(sx, sy) }, { transform: tf(ix, iy) }], { duration: FLY, easing: 'linear', fill: 'forwards' });
+  // Alevli iz
+  fxEmit(FLY, (dt, t) => {
+    const k = Math.min(1, t / FLY);
+    const x = sx + (ix - sx) * k, y = sy + (iy - sy) * k;
+    for (let i = 0; i < fxN(6); i++) {
+      const back = fxRand(10, 70);
+      fxSpawn({ kind: 'fire', x: x - Math.cos(ang) * back, y: y - Math.sin(ang) * back + fxRand(-4, 4),
+        vx: -Math.cos(ang) * fxRand(40, 140) + fxRand(-30, 30), vy: -Math.sin(ang) * fxRand(40, 140) - fxRand(10, 60),
+        size: fxRand(10, 22), life: fxRand(0.3, 0.55), drag: 0.04 });
+    }
+  });
+  setTimeout(() => {
+    b.remove();
+    fxBody('fx-hit', 'fx-burn');
+    fxEl('fx-flash');
+    const crack = fxEl('fx-crack', crackSvg(Math.round(Math.min(W, H) * 0.72)));
+    crack.style.left = `${ix}px`;
+    crack.style.top = `${iy}px`;
+    const hole = fxEl('fx-hole');
+    hole.style.left = `${ix}px`;
+    hole.style.top = `${iy}px`;
+    // Patlama: kıvılcım + alev topu
+    for (let i = 0; i < fxN(46); i++) {
+      const a = fxRand(0, Math.PI * 2), v = fxRand(260, 900);
+      fxSpawn({ kind: 'spark', x: ix, y: iy, vx: Math.cos(a) * v, vy: Math.sin(a) * v, g: 900, drag: 0.03, size: fxRand(1.5, 3.2), life: fxRand(0.35, 0.8) });
+    }
+    for (let i = 0; i < fxN(34); i++) {
+      const a = fxRand(0, Math.PI * 2), v = fxRand(40, 260);
+      fxSpawn({ kind: 'fire', x: ix, y: iy, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 60, drag: 0.06, size: fxRand(22, 46), life: fxRand(0.45, 0.9) });
+    }
+    // Delikten yükselen alevler ve közler
+    fxEmit(1500, (dt, t) => {
+      const fade = Math.max(0, 1 - t / 1500);
+      for (let i = 0; i < fxN(4 * fade + 1); i++) {
+        fxSpawn({ kind: 'fire', x: ix + fxRand(-14, 14), y: iy + fxRand(-6, 8), vx: fxRand(-30, 30), vy: -fxRand(90, 220),
+          size: fxRand(12, 26) * (0.5 + fade * 0.5), life: fxRand(0.5, 0.95), drag: 0.02 });
+      }
+      if (Math.random() < 0.5) {
+        fxSpawn({ kind: 'ember', x: ix + fxRand(-20, 20), y: iy, vx: fxRand(-60, 60), vy: -fxRand(80, 240), g: -20, size: fxRand(1.2, 2.6), life: fxRand(0.9, 1.8), seed: Math.random() * 9 });
+      }
+    });
+    setTimeout(() => fxUnbody('fx-hit'), 600);
+    setTimeout(() => { fxUnbody('fx-burn'); crack.classList.add('out'); hole.classList.add('out'); }, 1900);
+  }, FLY);
+  return 2900;
+}
+
+// ── Kalp: ortada iki kez atar, patlayıp kalplere dağılır, alttan kalpler süzülür ──
+const HEART_COLORS = ['#ff3d7f', '#ff6b9d', '#ff8fb3', '#e8175d', '#ffb3c9', '#ff4f6d'];
+function fxHeart() {
+  const W = innerWidth, H = innerHeight;
+  fxEl('fx-tint heart');
+  const big = fxEl('fx-bigheart', `<svg viewBox="0 0 100 92" width="100%" height="100%">
+    <defs><radialGradient id="fxHg" cx=".35" cy=".3" r=".8"><stop offset="0" stop-color="#ff9cc0"/><stop offset=".55" stop-color="#ff3d7f"/><stop offset="1" stop-color="#c3104a"/></radialGradient></defs>
+    <path d="M50 88S4 60 4 28C4 13 15 4 28 4c9.6 0 17 5.4 22 13.2C55 9.4 62.4 4 72 4c13 0 24 9 24 24 0 32-46 60-46 60z" fill="url(#fxHg)"/>
+    <path d="M18 24c2-7 8-10 14-9" stroke="#fff" stroke-opacity=".75" stroke-width="5" stroke-linecap="round" fill="none"/></svg>`);
+  const cx = W / 2, cy = H / 2;
+  setTimeout(() => {
+    big.classList.add('pop');
+    fxBody('fx-glow');
+    for (let i = 0; i < fxN(54); i++) {
+      const a = fxRand(0, Math.PI * 2), v = fxRand(160, 620);
+      fxSpawn({ kind: 'heart', x: cx, y: cy, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 80, g: 260, drag: 0.035,
+        size: fxRand(7, 18), life: fxRand(1.1, 1.9), rot: fxRand(-0.5, 0.5), vr: fxRand(-2, 2), color: HEART_COLORS[i % HEART_COLORS.length] });
+    }
+    for (let i = 0; i < fxN(18); i++) {
+      const a = fxRand(0, Math.PI * 2), v = fxRand(80, 380);
+      fxSpawn({ kind: 'star', x: cx, y: cy, vx: Math.cos(a) * v, vy: Math.sin(a) * v, drag: 0.05, size: fxRand(6, 14), life: fxRand(0.5, 1), vr: 3, color: '#ffe3ee' });
+    }
+  }, 1500);
+  // Ekranın altından süzülen kalpler
+  fxEmit(2700, () => {
+    if (Math.random() < (fxReduced ? 0.12 : 0.35)) {
+      fxSpawn({ kind: 'heart', x: fxRand(0, W), y: H + 20, vx: fxRand(-25, 25), vy: -fxRand(120, 260),
+        size: fxRand(8, 20), life: fxRand(2.2, 3.4), rot: fxRand(-0.3, 0.3), vr: fxRand(-0.8, 0.8), color: HEART_COLORS[Math.floor(Math.random() * HEART_COLORS.length)] });
+    }
+  });
+  setTimeout(() => fxUnbody('fx-glow'), 2900);
+  return 3600;
+}
+
+// ── Hediye: kutu düşer, sallanır, kapağı fırlar, konfeti patlar ──
+const CONFETTI = ['#ffd23f', '#ff5f7e', '#5b55f6', '#22c5e0', '#34d17f', '#ff9a3d', '#c86bff'];
+function fxGift() {
+  const W = innerWidth, H = innerHeight;
+  fxEl('fx-tint gift');
+  const rays = fxEl('fx-rays');
+  const box = fxEl('fx-box', `
+    <svg class="lid" viewBox="0 0 120 60" width="100%">
+      <path d="M60 30C52 12 30 6 30 20c0 9 14 10 30 10zM60 30c8-18 30-24 30-10 0 9-14 10-30 10z" fill="#ffd23f" stroke="#e0a800" stroke-width="2"/>
+      <rect x="4" y="28" width="112" height="30" rx="6" fill="#ff6f8b"/>
+      <rect x="4" y="28" width="112" height="9" rx="6" fill="#fff" fill-opacity=".22"/>
+      <rect x="52" y="28" width="16" height="30" fill="#ffd23f"/>
+    </svg>
+    <svg class="body" viewBox="0 0 120 86" width="100%">
+      <rect x="10" y="0" width="100" height="84" rx="6" fill="#ff4f74"/>
+      <rect x="10" y="0" width="100" height="10" fill="#000" fill-opacity=".12"/>
+      <rect x="52" y="0" width="16" height="84" fill="#ffd23f"/>
+      <rect x="10" y="0" width="22" height="84" rx="6" fill="#fff" fill-opacity=".12"/>
+    </svg>`);
+  const cx = W / 2, cy = H / 2;
+  setTimeout(() => fxBody('fx-land'), 620);
+  setTimeout(() => fxUnbody('fx-land'), 1150);
+  setTimeout(() => {
+    box.classList.add('open');
+    rays.classList.add('on');
+    fxBody('fx-glow');
+    const top = cy - Math.min(W, H) * 0.08;
+    for (let i = 0; i < fxN(140); i++) {
+      const a = -Math.PI / 2 + fxRand(-1.1, 1.1), v = fxRand(380, 1100);
+      fxSpawn({ kind: 'confetti', x: cx + fxRand(-30, 30), y: top, vx: Math.cos(a) * v, vy: Math.sin(a) * v, g: 820, drag: 0.03,
+        size: fxRand(7, 13), life: fxRand(1.8, 2.8), rot: fxRand(0, 6), vr: fxRand(-9, 9), flip: fxRand(4, 12), color: CONFETTI[i % CONFETTI.length] });
+    }
+    for (let i = 0; i < fxN(24); i++) {
+      const a = fxRand(0, Math.PI * 2), v = fxRand(60, 420);
+      fxSpawn({ kind: 'star', x: cx, y: top, vx: Math.cos(a) * v, vy: Math.sin(a) * v, drag: 0.05, size: fxRand(7, 16), life: fxRand(0.6, 1.2), vr: 2.5, color: '#fff2b0' });
+    }
+  }, 1500);
+  // Üstten konfeti yağmuru
+  setTimeout(() => fxEmit(1500, () => {
+    for (let i = 0; i < fxN(2); i++) {
+      fxSpawn({ kind: 'confetti', x: fxRand(0, W), y: -20, vx: fxRand(-60, 60), vy: fxRand(80, 220), g: 160, drag: 0.01,
+        size: fxRand(6, 11), life: fxRand(2.4, 3.4), rot: fxRand(0, 6), vr: fxRand(-6, 6), flip: fxRand(3, 9), color: CONFETTI[Math.floor(Math.random() * CONFETTI.length)] });
+    }
+  }), 1600);
+  setTimeout(() => { box.classList.add('out'); rays.classList.add('out'); fxUnbody('fx-glow'); }, 2900);
+  return 3900;
+}
+
 // ── Çevrimdışı kişiye dosya ──
 async function queueFiles(fp, paths) {
   const name = state.chats.get(fp)?.name || '';
@@ -6352,6 +6820,8 @@ async function init() {
   api.listen('typing', (e) => onTyping(e.payload));
   api.listen('my-status', (e) => { state.myStatus = e.payload.status; renderMyStatus(); officeSyncPeople(); });
   api.listen('nudge', (e) => onNudge(e.payload));
+  api.listen('effect', (e) => onEffect(e.payload));
+  api.listen('poll-new', (e) => onPollNew(e.payload));
   api.listen('chat-remove', (e) => onChatRemove(e.payload));
   api.listen('quick-send', () => openPalette());
   api.listen('quick-shot', () => startShot(null));
@@ -6919,6 +7389,7 @@ function createPreviewApi() {
         return structuredClone(m);
       }
       if (cmd === 'chat_nudge') return null;
+      if (cmd === 'chat_effect') return null;
       if (cmd === 'chat_queue_files') {
         const name = args.paths[0].split(/[\\/]/).pop();
         const msg = { id: `q${Date.now()}`, outgoing: true, text: `📎 ${name}`, at: Date.now(), status: 'sending', pending: [args.fingerprint], recipients: 1,

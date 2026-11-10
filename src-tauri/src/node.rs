@@ -4831,6 +4831,19 @@ mod tests {
         alice.chat_nudge(&bfp).unwrap();
         wait_until(|| bob.chat_history(&afp).iter().any(|m| m.system && m.text.contains("dürttü"))).await;
         assert!(alice.chat_nudge(&bfp).is_err());
+
+        // Ekran animasyonu: karşıda not düşer, listede olmayan reddedilir, art arda atılamaz.
+        assert!(alice.chat_effect(&bfp, "bomba").is_err());
+        alice.chat_effect(&bfp, "bullet").unwrap();
+        wait_until(|| bob.chat_history(&afp).iter().any(|m| m.system && m.text.contains("kurşun sıktı"))).await;
+        assert!(alice.chat_effect(&bfp, "heart").is_err(), "art arda animasyon engellenmeli");
+        // Alıcı da art arda geleni yok sayar (gönderen sınırı atlasa bile).
+        bob.broadcast_event(&afp, ChatEventKind::Effect { effect: "heart".into() }).unwrap();
+        bob.broadcast_event(&afp, ChatEventKind::Effect { effect: "gift".into() }).unwrap();
+        wait_until(|| alice.chat_history(&bfp).iter().any(|m| m.system && m.text.contains("size"))).await;
+        sleep(Duration::from_millis(400)).await;
+        let got = alice.chat_history(&bfp).iter().filter(|m| m.system && m.text.contains(" size ")).count();
+        assert_eq!(got, 1, "15 sn içinde ikinci animasyon kabul edilmemeli");
     }
 
     #[tokio::test]

@@ -93,7 +93,12 @@ pub enum ChatEventKind {
     Delete { id: String },
     /// Dürtme: karşının penceresi titrer.
     Nudge,
+    /// Animasyonlu gönderi (hediye, kalp, kurşun): karşının tüm ekranında oynar.
+    Effect { effect: String },
 }
+
+/// Kabul edilen ekran animasyonları.
+pub const EFFECTS: [&str; 3] = ["gift", "heart", "bullet"];
 
 /// Metinde `@ad` ya da `@herkes` geçiyor mu? (Büyük/küçük harf duyarsız, ad bir kelime sınırında bitmeli.)
 pub fn mentions(text: &str, my_name: &str) -> bool {

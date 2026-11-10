@@ -206,6 +206,12 @@ async fn chat_nudge(node: NodeState<'_>, fingerprint: String) -> Result<(), Stri
     node.inner().chat_nudge(&fingerprint)
 }
 
+/// Sohbete ekran animasyonu gönderir: "gift" | "heart" | "bullet".
+#[tauri::command]
+async fn chat_effect(node: NodeState<'_>, key: String, effect: String) -> Result<(), String> {
+    node.inner().chat_effect(&key, &effect)
+}
+
 /// Çevrimdışı kişiye dosya bırakır (çevrimiçi olunca gider).
 #[tauri::command]
 async fn chat_queue_files(node: NodeState<'_>, fingerprint: String, name: String, paths: Vec<String>) -> Result<(), String> {
@@ -387,6 +393,16 @@ fn apply_hotkeys(app: &AppHandle, on: bool) {
 }
 
 /// "Odakta" durumunda mı? (Bildirimler susar.)
+/// Pencereyi gösterir, simge durumundan çıkarır ve öne getirmeye çalışır.
+fn bring_to_front(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+        let _ = w.request_user_attention(Some(tauri::UserAttentionType::Critical));
+    }
+}
+
 fn do_not_disturb(app: &AppHandle) -> bool {
     app.try_state::<Arc<Node>>().is_some_and(|n| n.do_not_disturb())
 }
@@ -1047,7 +1063,7 @@ pub fn run() {
                 .unwrap_or_else(|_| config_dir.join("downloads"));
 
             let emit_handle = handle.clone();
-            let emitter: Emitter = Arc::new(move |event, payload| {
+            let emitter: Emitter = Arc::new(move |event, mut payload| {
                 #[cfg(debug_assertions)]
                 if event != "transfer" {
                     eprintln!("[event] {event}: {payload}");
@@ -1097,6 +1113,25 @@ pub fn run() {
                             "Yanıtlamak için tıklayın",
                             serde_json::json!({ "view": "chat", "key": payload["fingerprint"] }),
                         );
+                    }
+                    // Ekran animasyonu (hediye, kalp, kurşun): pencere öne gelir, animasyon tüm ekranda oynar.
+                    "effect" if !do_not_disturb(&emit_handle) => {
+                        let name = payload["name"].as_str().unwrap_or("Biri");
+                        let (title, body) = match payload["effect"].as_str() {
+                            Some("gift") => (format!("🎁 {name} size hediye gönderdi"), "Açmak için tıklayın"),
+                            Some("heart") => (format!("❤️ {name} size kalp gönderdi"), "Açmak için tıklayın"),
+                            _ => (format!("🔫 {name} size kurşun sıktı"), "Karşılık vermek için tıklayın"),
+                        };
+                        bring_to_front(&emit_handle);
+                        notify_background(&emit_handle, &title, body, serde_json::json!({ "view": "chat", "key": payload["key"] }));
+                    }
+                    // Yeni oylama: pencere öne gelir; arkadaysa arayüz oylamayı doğrudan açar.
+                    "poll-new" => {
+                        payload["wasFront"] = serde_json::Value::Bool(in_front(&emit_handle));
+                        payload["dnd"] = serde_json::Value::Bool(do_not_disturb(&emit_handle));
+                        if payload["dnd"] == false {
+                            bring_to_front(&emit_handle);
+                        }
                     }
                     // Ekran paylaşımı daveti
                     "screen-offer" if !do_not_disturb(&emit_handle) => {
@@ -1285,6 +1320,7 @@ pub fn run() {
             chat_edit,
             chat_delete,
             chat_nudge,
+            chat_effect,
             chat_queue_files,
             screen_clip,
             screen_clip_cancel,
