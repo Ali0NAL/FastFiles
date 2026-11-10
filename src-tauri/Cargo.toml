@@ -1,6 +1,6 @@
 [package]
 name = "fastfiles"
-version = "1.7.0"
+version = "1.8.0"
 description = "Aynı ağdaki bilgisayarlar arasında hızlı ve güvenli dosya transferi"
 authors = ["Twinup"]
 edition = "2021"
