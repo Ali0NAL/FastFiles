@@ -1214,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "fastfiles"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "arboard",
  "base64 0.22.1",
