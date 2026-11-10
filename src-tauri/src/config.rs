@@ -131,10 +131,7 @@ impl Default for Settings {
 
 impl Settings {
     pub fn load(path: &Path, default_download: &Path) -> Self {
-        let mut s: Settings = fs::read(path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let mut s: Settings = crate::store::read_json(path).unwrap_or_default();
         if s.device_name.trim().is_empty() {
             s.device_name = default_device_name();
         }
@@ -146,9 +143,7 @@ impl Settings {
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let json = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, json).map_err(|e| e.to_string())?;
-        fs::rename(&tmp, path).map_err(|e| e.to_string())
+        crate::store::write_atomic(path, &json).map_err(|e| e.to_string())
     }
 }
 

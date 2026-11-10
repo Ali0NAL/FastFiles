@@ -270,10 +270,7 @@ pub struct ChatStore {
 
 impl ChatStore {
     pub fn load(path: &Path) -> Self {
-        let list: Vec<Conversation> = std::fs::read(path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let list: Vec<Conversation> = crate::store::read_json(path).unwrap_or_default();
         let mut convs = HashMap::new();
         for mut c in list {
             // Uygulama kapanırken yolda kalan birebir mesajlar gönderilememiş sayılır.
@@ -290,10 +287,7 @@ impl ChatStore {
     fn save(&self) {
         let list: Vec<&Conversation> = self.convs.values().collect();
         if let Ok(json) = serde_json::to_vec(&list) {
-            let tmp = self.path.with_extension("json.tmp");
-            if std::fs::write(&tmp, json).is_ok() {
-                let _ = std::fs::rename(&tmp, &self.path);
-            }
+            let _ = crate::store::write_atomic(&self.path, &json);
         }
     }
 

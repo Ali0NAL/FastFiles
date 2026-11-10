@@ -444,13 +444,19 @@ function showBatch(initialPaths = [], preselected = []) {
   m.querySelector('#b-files').onclick = () => pick(false);
   m.querySelector('#b-folder').onclick = () => pick(true);
   m.querySelector('[data-close]').onclick = closeModal;
-  m.querySelector('#b-send').onclick = async () => {
+  m.querySelector('#b-send').onclick = async (e) => {
+    const btn = e.currentTarget;
+    if (btn.disabled) return;
+    // Büyük klasörlerin taranması sürerken ikinci tıklama aynı gönderimi tekrar başlatmasın.
+    btn.disabled = true;
     const ids = [...selected];
     try {
       const started = await call('send_paths', { peerIds: ids, paths });
       closeModal();
       toast(`${started.length} kişiye gönderim başladı`, { type: 'success' });
-    } catch { /* toast gösterildi */ }
+    } catch {
+      btn.disabled = false; /* toast gösterildi */
+    }
   };
 
   batch = { add, render };
@@ -987,6 +993,7 @@ function renderPinDots() {
 function showLock() {
   closeEmoji();
   closeViewer(); // kilitliyken resim görünmesin
+  officeState.mod?.stop(); // kilit ekranının arkasında 3B çizim sürmesin
   lockUi.pin = '';
   renderPinDots();
   $('#pin-err').textContent = '';
@@ -1018,6 +1025,7 @@ async function submitPin() {
     state.lock = { ...(state.lock || {}), locked: false };
     $('#lock-screen').hidden = true;
     lastActivity = Date.now();
+    if (officeOpen()) officeState.mod?.start();
     if (!state.booted) init().catch((e) => toast(`Başlatılamadı: ${e}`, { type: 'error', timeout: 15000 }));
   } catch (e) {
     lockUi.pin = '';
@@ -1191,7 +1199,8 @@ function showWelcome() {
 const unreadOf = (fp) => state.chats.get(fp)?.unread || 0;
 const peerByFp = (fp) => state.peers.find((p) => p.fingerprint === fp);
 const isBlocked = (fp) => !!state.settings?.blocked?.some((b) => b.fingerprint === fp);
-const chatOpen = () => !!state.openChat && !$('#chat-view').hidden;
+// Ofis ya da oyun ekranı açıkken sohbet görünmez (okunmuş sayılmamalı).
+const chatOpen = () => !!state.openChat && !$('#chat-view').hidden && !officeOpen() && !gamesOpen();
 
 function setTab(tab) {
   state.tab = tab;
@@ -1254,6 +1263,7 @@ $('#convs').addEventListener('click', (e) => {
 
 async function openChat(fp, name) {
   if (gamesOpen()) closeGames();
+  if (officeOpen()) closeOffice();
   if (state.openChat !== fp) resetChatExtras();
   closeEmoji();
   closeViewer();
@@ -1550,10 +1560,15 @@ async function makeThumb(chat, id) {
   }
   thumbs.delete(k); // en sona taşı (en son kullanılan)
   thumbs.set(k, entry);
+  // En eski küçük resimler atılır, ama açık sohbetinkiler asla: o sohbette sınırdan çok resim
+  // varsa her yeni mesajda resimler baştan okunup birbirini atıyordu (ve ekrandakiler bozuluyordu).
+  const openPrefix = `${state.openChat}|`;
   while (thumbs.size > THUMB_CACHE) {
-    const [oldKey, old] = thumbs.entries().next().value;
+    const victim = [...thumbs.keys()].find((key) => !key.startsWith(openPrefix));
+    if (victim === undefined) break;
+    const old = thumbs.get(victim);
     if (old.url) URL.revokeObjectURL(old.url);
-    thumbs.delete(oldKey);
+    thumbs.delete(victim);
   }
   updateImageBubble(chat, id);
   if (viewer.open && viewer.chat === chat) renderViewerCount();
@@ -2515,6 +2530,7 @@ function onShares(list) {
 
 function openShare(id) {
   if (gamesOpen()) closeGames();
+  if (officeOpen()) closeOffice();
   // Sohbet / oylama açıksa kapat (aynı paneli kullanırlar).
   state.openChat = null;
   $('#chat-view').hidden = true;
@@ -2902,6 +2918,7 @@ function onPolls(list) {
 
 function openPoll(id) {
   if (gamesOpen()) closeGames();
+  if (officeOpen()) closeOffice();
   state.openChat = null;
   $('#chat-view').hidden = true;
   state.openShare = null;
@@ -3355,7 +3372,8 @@ function shownBoard(g) {
   return { board, last: opt ? opt.uci : g.info?.lastMove, opt };
 }
 
-const legalFrom = (g, sq) => (g.myTurn && !gameState.optimistic ? g.legal.filter((m) => m.startsWith(sq)) : []);
+// Onay bekleyen hamle yalnızca kendi odasını kilitler (diğer oyunlarda oynamaya devam edilebilir).
+const legalFrom = (g, sq) => (g.myTurn && gameState.optimistic?.id !== g.id ? g.legal.filter((m) => m.startsWith(sq)) : []);
 
 function renderBoard(g) {
   const el = $('#board');
@@ -3849,6 +3867,8 @@ golfCanvas.addEventListener('pointerup', async (e) => {
   await call('game_act', { id: g.id, action: { kind: 'move', mv } }).catch(() => {});
 });
 golfCanvas.addEventListener('pointercancel', () => { golfView.aim = null; golfLoop(); });
+// Odak kaybı (Alt+Tab) gibi durumlarda pointerup gelmeyebilir: nişan takılı kalmasın.
+golfCanvas.addEventListener('lostpointercapture', () => { if (golfView.aim) { golfView.aim = null; golfLoop(); } });
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && golfView.aim) { golfView.aim = null; golfLoop(); e.stopImmediatePropagation(); }
 }, true);
@@ -4911,6 +4931,8 @@ function openPalette() {
 state.phoneRecv = [];
 async function openPhone() {
   if (lockVisible()) return;
+  // Pencere zaten açıksa yeniden açma: eski pencerenin kapanışı oturumu durdurur, telefon kopar.
+  if (modalKind === 'phone') return;
   let info;
   try {
     info = await call('phone_start');
@@ -5194,7 +5216,8 @@ function officeSyncPeople() {
 }
 
 function officeTransfers() {
-  if (!officeState.mod) return;
+  // Ofis kapalıyken sahneye bir şey eklenmez (açılınca baştan eşitlenir).
+  if (!officeState.mod || !officeOpen()) return;
   const me = myFp();
   const list = [];
   for (const t of state.transfers.values()) {
@@ -5246,7 +5269,7 @@ function officeOnChat(key, incoming, m) {
   officeFeed('💬', group
     ? `<b>${esc(officeName(from))}</b> → ${esc(gname)}`
     : `<b>${esc(officeName(from))}</b> → <b>${esc(officeName(to[0]))}</b>`);
-  officeState.mod?.message(from, to, group ? gname : 'Mesaj');
+  if (officeOpen()) officeState.mod?.message(from, to, group ? gname : 'Mesaj');
 }
 
 function officeFeed(icon, html) {

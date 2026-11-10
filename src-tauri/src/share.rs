@@ -268,6 +268,25 @@ fn move_to_trash(dir: &Path, rel: &str) -> bool {
     candidates.iter().any(|dst| std::fs::rename(&src, dst).is_ok())
 }
 
+/// `move_to_trash` gibi, ama dosyanın çöpteki yeni yolunu döndürür (geri almak için).
+/// `Ok(None)`: dosya zaten yok. `Err(())`: klasör ya da taşınamadı.
+fn move_to_trash_undoable(dir: &Path, rel: &str) -> Result<Option<PathBuf>, ()> {
+    let src = dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+    if !src.exists() {
+        return Ok(None);
+    }
+    if src.is_dir() {
+        return Err(());
+    }
+    let trash = dir.join(SHARE_META_DIR).join("silinen");
+    let _ = std::fs::create_dir_all(&trash);
+    let stamp = chrono_stamp();
+    let name = rel.replace('/', " - ");
+    let short: String = rel.rsplit('/').next().unwrap_or(rel).chars().rev().take(120).collect::<Vec<_>>().into_iter().rev().collect();
+    let candidates = [trash.join(format!("{stamp} {name}")), trash.join(format!("{stamp} {short}"))];
+    candidates.into_iter().find(|dst| std::fs::rename(&src, dst).is_ok()).map(Some).ok_or(())
+}
+
 fn chrono_stamp() -> String {
     // Saat dilimi olmadan, dosya adına uygun sıralanabilir bir damga.
     format!("{}", now_ms())
@@ -307,11 +326,7 @@ impl Node {
 
     fn save_share(&self, st: &ShareState) {
         if let Ok(json) = serde_json::to_vec(st) {
-            let path = self.share_path(&st.info.id);
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, json).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-            }
+            let _ = crate::store::write_atomic(&self.share_path(&st.info.id), &json);
         }
     }
 
@@ -322,7 +337,7 @@ impl Node {
             if p.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            if let Some(mut st) = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<ShareState>(&b).ok()) {
+            if let Some(mut st) = crate::store::read_json::<ShareState>(&p) {
                 st.digest = digest_of(&st.entries);
                 map.insert(st.info.id.clone(), st);
             }
@@ -1000,14 +1015,19 @@ impl Node {
                     return Err(e.to_string());
                 }
             }
-            if target.exists() && !move_to_trash(&dir, &served.path) {
+            let Ok(backup) = move_to_trash_undoable(&dir, &served.path) else {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(format!("{}: aynı adda klasör var ya da mevcut dosya yedeklenemedi", served.path));
-            }
-            std::fs::rename(&tmp, &target).map_err(|e| {
+            };
+            if let Err(e) = std::fs::rename(&tmp, &target) {
                 let _ = std::fs::remove_file(&tmp);
-                format!("dosya yerleştirilemedi: {e}")
-            })?;
+                // Eski dosya geri konur. Konmazsa bir sonraki tarama dosyayı "silindi" sayar ve
+                // silmeyi tüm üyelere yayardı.
+                if let Some(b) = backup {
+                    let _ = std::fs::rename(&b, &target);
+                }
+                return Err(format!("dosya yerleştirilemedi: {e}"));
+            }
             st.entries.insert(key.to_string(), served.clone());
             if st.wanted.get(key).map_or(false, |(w, _)| !w.newer_than(&served)) {
                 st.wanted.remove(key);
@@ -1075,7 +1095,9 @@ impl Node {
                     return Message::GroupAck;
                 }
                 let mut map = self.shares.lock().unwrap();
-                if let Some(st) = map.get_mut(&info.id) {
+                // Sürüm aynı kilit altında yeniden denetlenir: art arda iki güncelleme (N ve N+1)
+                // aynı anda gelirse eskisi yenisinin üzerine yazılmasın.
+                if let Some(st) = map.get_mut(&info.id).filter(|st| info.rev > st.info.rev) {
                     // Kullanıcı klasörü sildiyse (ayrılık bildirimi yolda) güncelleme onu geri katmaz.
                     st.left = st.forgotten || st.leave_pending || info.deleted || !info.has(&me);
                     st.info = info;

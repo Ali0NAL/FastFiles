@@ -41,7 +41,16 @@ pub struct State {
     /// Bana gelen davetler: oturum → (paylaşanın parmak izi, zaman).
     offers: Mutex<HashMap<String, (String, Instant)>>,
     /// İzlediğim oturumlar: oturum → durdurma jetonu.
-    watching: Mutex<HashMap<String, CancellationToken>>,
+    watching: Mutex<HashMap<String, (u64, CancellationToken)>>,
+    /// Her izlemeye verilen benzersiz numara (eski izleme yenisinin kaydını silmesin diye).
+    watch_seq: std::sync::atomic::AtomicU64,
+}
+
+impl State {
+    /// Ekran paylaşıyor ya da izliyor muyum? (Otomatik güncelleme bu sırada uygulamayı kapatmaz.)
+    pub fn busy(&self) -> bool {
+        self.sharing.lock().unwrap().is_some() || !self.watching.lock().unwrap().is_empty()
+    }
 }
 
 /// Ekranı yakalar ve JPEG'e çevirir (bloklayan iş; ayrı iş parçacığında çalışır).
@@ -262,9 +271,17 @@ impl Node {
             write_msg(&mut wr, &Message::ScreenStart { width: first.width, height: first.height }).await.map_err(|e| e.to_string())?;
             let mut frame = first;
             loop {
-                wr.write_all(&(frame.jpeg.len() as u32).to_be_bytes()).await.map_err(|e| e.to_string())?;
-                wr.write_all(&frame.jpeg).await.map_err(|e| e.to_string())?;
-                wr.flush().await.map_err(|e| e.to_string())?;
+                // İzleyici donarsa (okumayı bırakırsa) yazma sonsuza kadar beklemesin: görev, bağlantı
+                // ve kimse izlemezken süren ekran yakalama sızıyordu.
+                let send = async {
+                    wr.write_all(&(frame.jpeg.len() as u32).to_be_bytes()).await?;
+                    wr.write_all(&frame.jpeg).await?;
+                    wr.flush().await
+                };
+                tokio::select! {
+                    r = timeout(Duration::from_secs(15), send) => r.map_err(|_| "İzleyici yanıt vermiyor".to_string())?.map_err(|e| e.to_string())?,
+                    _ = stop.cancelled() => break,
+                }
                 tokio::select! {
                     r = rx.changed() => if r.is_err() { break },
                     _ = stop.cancelled() => break,
@@ -314,7 +331,7 @@ impl Node {
             }
         };
         if removed {
-            if let Some(t) = self.extras.screen.watching.lock().unwrap().remove(session) {
+            if let Some((_, t)) = self.extras.screen.watching.lock().unwrap().remove(session) {
                 t.cancel();
             }
             self.emit("screen-end", json!({ "session": session }));
@@ -332,7 +349,8 @@ impl Node {
         let sharer = self.extras.screen.offers.lock().unwrap().get(session).map(|o| o.0.clone()).ok_or("Bu paylaşım artık yok")?;
         let peer = self.peers().into_iter().find(|p| p.fingerprint == sharer).ok_or("Paylaşan kişi çevrimdışı")?;
         let stop = self.shutdown.child_token();
-        if let Some(old) = self.extras.screen.watching.lock().unwrap().insert(session.to_string(), stop.clone()) {
+        let my_id = self.extras.screen.watch_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some((_, old)) = self.extras.screen.watching.lock().unwrap().insert(session.to_string(), (my_id, stop.clone())) {
             old.cancel();
         }
         let result = async {
@@ -375,12 +393,19 @@ impl Node {
             Ok(())
         }
         .await;
-        self.extras.screen.watching.lock().unwrap().remove(session);
+        // Yalnızca kendi kaydımı sil: aynı oturum ikinci kez izlenmeye başlandıysa yenisinin
+        // durdurma jetonu silinmesin (silinirse yeni izleme durdurulamıyordu).
+        {
+            let mut watching = self.extras.screen.watching.lock().unwrap();
+            if watching.get(session).is_some_and(|(id, _)| *id == my_id) {
+                watching.remove(session);
+            }
+        }
         result
     }
 
     pub fn screen_watch_stop(&self, session: &str) {
-        if let Some(t) = self.extras.screen.watching.lock().unwrap().remove(session) {
+        if let Some((_, t)) = self.extras.screen.watching.lock().unwrap().remove(session) {
             t.cancel();
         }
     }

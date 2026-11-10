@@ -9,6 +9,7 @@ mod pipeline;
 mod protocol;
 mod resume;
 mod shell;
+mod store;
 mod tls;
 pub mod update;
 
@@ -43,8 +44,8 @@ struct Snapshot {
     game_catalog: Vec<games::GameDef>,
 }
 
-#[tauri::command]
 // async: ana iş parçacığında (pencere) çalışmasın; liste hesaplanırken arayüz donmasın.
+#[tauri::command]
 async fn get_snapshot(node: NodeState<'_>) -> Result<Snapshot, String> {
     Ok(snapshot_of(&node))
 }
@@ -540,8 +541,8 @@ fn poll_mark_seen(node: NodeState, id: String) {
 use node::game::{GameAction, GameView};
 
 #[tauri::command]
-fn game_list(node: NodeState) -> Vec<GameView> {
-    node.game_list()
+async fn game_list(node: NodeState<'_>) -> Result<Vec<GameView>, String> {
+    Ok(node.game_list())
 }
 
 #[tauri::command]
@@ -873,9 +874,11 @@ async fn import_update(node: NodeState<'_>, path: String) -> Result<UpdateState,
     Ok(update_state_of(&node))
 }
 
+// async: paket doğrulama ve kurulum dosyasının çıkarılması (yüzlerce MB olabilir) pencereyi
+// dondurmasın.
 #[tauri::command]
-fn install_update(app: AppHandle, node: NodeState) -> Result<(), String> {
-    start_install(&app, &node)
+async fn install_update(app: AppHandle, node: NodeState<'_>) -> Result<(), String> {
+    start_install(&app, node.inner().clone()).await
 }
 
 #[tauri::command]
@@ -883,8 +886,10 @@ fn postpone_update(gate: State<UpdateGate>) {
     *gate.postponed_until.lock().unwrap() = Some(Instant::now() + POSTPONE);
 }
 
-fn start_install(app: &AppHandle, node: &Node) -> Result<(), String> {
-    let (setup, version) = node.prepare_install()?;
+async fn start_install(app: &AppHandle, node: Arc<Node>) -> Result<(), String> {
+    // Diske yoğun iş: tokio işçi iş parçacıklarını meşgul etmesin.
+    let n2 = node.clone();
+    let (setup, version) = tauri::async_runtime::spawn_blocking(move || n2.prepare_install()).await.map_err(|e| e.to_string())??;
     let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     node.update_settings(|s| {
         s.install_attempt = version.clone();
@@ -954,8 +959,18 @@ fn spawn_auto_updater(app: AppHandle, node: Arc<Node>) {
             if since.elapsed() < AUTO_INSTALL_DELAY || postponed || node.is_busy() || recently_failed {
                 continue;
             }
-            if let Err(e) = start_install(&app, &node) {
+            if let Err(e) = start_install(&app, node.clone()).await {
                 eprintln!("[fastfiles] otomatik güncelleme: {e}");
+                // Meşgul olduğu için değil de kurulum hazırlanamadığı için (ör. antivirüs kurulum
+                // dosyasını kilitledi, disk dolu) başarısız olduysa bu sürüm 6 saat tekrar
+                // denenmez; eskiden her ~70 sn'de paket yeniden doğrulanıp çıkarılıyordu.
+                if !node.is_busy() {
+                    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+                    node.update_settings(|s| {
+                        s.install_attempt = version.clone();
+                        s.install_attempt_at = at;
+                    });
+                }
                 ready_since = Some((version, Instant::now()));
             }
         }

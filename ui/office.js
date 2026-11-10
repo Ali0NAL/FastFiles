@@ -505,6 +505,9 @@ export function createOffice(root, hooks = {}) {
     if (!s.person) return;
     s.g.remove(s.person.group);
     s.person.mats.forEach((m) => m.dispose());
+    // Kişiye özel oluşturulan geometriler (ör. kulaklık bandı) de bırakılır; ortak olanlar (G) kalır.
+    const shared = new Set(Object.values(G));
+    s.person.group.traverse((o) => { if (o.geometry && !shared.has(o.geometry)) o.geometry.dispose(); });
     s.person = null;
   }
 

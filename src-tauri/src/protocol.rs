@@ -258,9 +258,7 @@ pub async fn read_msg_max<R: AsyncRead + Unpin>(r: &mut R, max: usize) -> io::Re
     if len > max.min(MAX_FRAME) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "mesaj çok büyük"));
     }
-    let mut body = vec![0u8; len];
-    r.read_exact(&mut body).await?;
-    serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    read_body(r, len).await
 }
 
 pub async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Message> {
@@ -270,8 +268,17 @@ pub async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Message> {
     if len > MAX_FRAME {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "mesaj çok büyük"));
     }
-    let mut body = vec![0u8; len];
-    r.read_exact(&mut body).await?;
+    read_body(r, len).await
+}
+
+/// Gövdeyi geldikçe okur: bellek, bildirilen uzunluk kadar baştan ayrılmaz. Uzunluğu 64 MB
+/// bildirip hiç veri göndermeyen bağlantılar böylece bellek tüketemez.
+async fn read_body<R: AsyncRead + Unpin>(r: &mut R, len: usize) -> io::Result<Message> {
+    let mut body = Vec::with_capacity(len.min(64 * 1024));
+    let got = (&mut *r).take(len as u64).read_to_end(&mut body).await?;
+    if got != len {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "mesaj yarım kaldı"));
+    }
     serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 

@@ -30,6 +30,44 @@ struct Session {
 #[derive(Default)]
 pub struct State {
     session: Mutex<Option<Session>>,
+    /// Süren yükleme/indirme sayısı (otomatik güncelleme bunlar bitene kadar bekler).
+    active: std::sync::atomic::AtomicUsize,
+}
+
+impl State {
+    pub fn busy(&self) -> bool {
+        self.active.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+}
+
+/// Süren aktarımı sayar; nasıl biterse bitsin (hata, iptal) sayaç geri düşer.
+struct ActiveGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+impl<'a> ActiveGuard<'a> {
+    fn new(c: &'a std::sync::atomic::AtomicUsize) -> Self {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(c)
+    }
+}
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Dosyayı telefona akıtır. Telefon okumayı bırakırsa (tarayıcı indirmeyi duraklattı, ekran
+/// kapandı) 60 sn sonra vazgeçilir; eskiden görev ve dosya sonsuza kadar açık kalıyordu.
+async fn copy_with_stall_timeout(file: &mut tokio::fs::File, s: &mut TcpStream) -> Result<(), String> {
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buf).await.map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Ok(());
+        }
+        timeout(Duration::from_secs(60), s.write_all(&buf[..n]))
+            .await
+            .map_err(|_| "telefon yanıt vermiyor".to_string())?
+            .map_err(|e| e.to_string())?;
+    }
 }
 
 /// URL'deki %XX kodlarını çözer.
@@ -174,21 +212,29 @@ impl Node {
         let token = uuid::Uuid::new_v4().simple().to_string();
         let url = format!("http://{}:{port}/p/{token}", best_ip());
         let stop = self.shutdown.child_token();
-        *self.extras.phone.session.lock().unwrap() = Some(Session {
-
-            url: url.clone(),
-            stop: stop.clone(),
-            offered: Vec::new(),
-            last_activity: Instant::now(),
-        });
+        {
+            let mut session = self.extras.phone.session.lock().unwrap();
+            // Bu arada (adres alınırken) başka bir çağrı oturumu açtıysa onu kullan: iki sunucu
+            // açılıp biri sahipsiz (kapatılamaz) kalmasın.
+            if let Some(s) = session.as_mut() {
+                s.last_activity = Instant::now();
+                return Ok(json!({ "url": s.url, "svg": qr_svg(&s.url)?, "offered": offered_json(&s.offered) }));
+            }
+            *session = Some(Session { url: url.clone(), stop: stop.clone(), offered: Vec::new(), last_activity: Instant::now() });
+        }
         let node = self.clone();
         tokio::spawn(async move {
+            // Boşta kalma denetimi sabit aralıkla yapılır (gelen her bağlantıda yeniden kurulan bir
+            // zamanlayıcı, ağdaki tarayıcılar yüzünden hiç dolmayabiliyordu).
+            let mut idle_check = tokio::time::interval(Duration::from_secs(60));
+            idle_check.tick().await;
             loop {
                 let accepted = tokio::select! {
                     r = listener.accept() => r,
                     _ = stop.cancelled() => break,
-                    _ = sleep(Duration::from_secs(60)) => {
-                        let idle = node.extras.phone.session.lock().unwrap().as_ref().map_or(true, |s| s.last_activity.elapsed() > IDLE_STOP);
+                    _ = idle_check.tick() => {
+                        let idle = !node.extras.phone.busy()
+                            && node.extras.phone.session.lock().unwrap().as_ref().map_or(true, |s| s.last_activity.elapsed() > IDLE_STOP);
                         if idle {
                             node.phone_stop();
                             break;
@@ -283,8 +329,9 @@ impl Node {
                     "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\nContent-Disposition: attachment; filename=\"{ascii}\"; filename*=UTF-8''{}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
                     pct_encode(&name)
                 );
+                let _active = ActiveGuard::new(&self.extras.phone.active);
                 s.write_all(head.as_bytes()).await.map_err(|e| e.to_string())?;
-                tokio::io::copy(&mut file, &mut s).await.map_err(|e| e.to_string())?;
+                copy_with_stall_timeout(&mut file, &mut s).await?;
                 let _ = s.flush().await;
                 self.emit("phone", json!({ "kind": "downloaded", "name": name }));
             }
@@ -296,11 +343,11 @@ impl Node {
                 }
                 let dir = PathBuf::from(self.settings.lock().unwrap().download_dir.clone()).join("Telefon");
                 tokio::fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
+                let _active = ActiveGuard::new(&self.extras.phone.active);
                 let target = free_name(&dir, &name);
-                let part = target.with_extension(format!(
-                    "{}ffpart",
-                    target.extension().map(|e| format!("{}.", e.to_string_lossy())).unwrap_or_default()
-                ));
+                // Yarım dosyanın adı her yüklemeye özeldir: aynı adla iki yükleme (iki telefon ya
+                // da iki sekme) aynı anda gelirse birbirinin dosyasını ezmesin.
+                let part = dir.join(format!(".{}.{}.ffpart", uuid::Uuid::new_v4().simple(), name));
                 let mut out = BufWriter::with_capacity(1 << 20, tokio::fs::File::create(&part).await.map_err(|e| e.to_string())?);
                 let mut remaining = req.content_length;
                 let first = rest.len().min(remaining as usize);
@@ -331,9 +378,24 @@ impl Node {
                     respond(&mut s, "400 Bad Request", "text/plain; charset=utf-8", b"Yarida kaldi").await;
                     return Ok(());
                 }
-                // Bu arada aynı adla bir dosya geldiyse yine üzerine yazma.
-                let target = if target.exists() { free_name(&dir, &name) } else { target };
-                tokio::fs::rename(&part, &target).await.map_err(|e| e.to_string())?;
+                // Bu arada aynı adla bir dosya geldiyse yine üzerine yazma: son ad, yalnızca
+                // henüz yoksa oluşturularak (create_new) sahiplenilir, sonra üzerine taşınır.
+                let mut target = target;
+                let claimed = loop {
+                    match std::fs::OpenOptions::new().write(true).create_new(true).open(&target) {
+                        Ok(_) => break true,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => target = free_name(&dir, &name),
+                        Err(_) => break false,
+                    }
+                };
+                if !claimed || tokio::fs::rename(&part, &target).await.is_err() {
+                    let _ = tokio::fs::remove_file(&part).await;
+                    if claimed {
+                        let _ = tokio::fs::remove_file(&target).await; // sahiplenmek için açılan boş dosya
+                    }
+                    respond(&mut s, "500 Internal Server Error", "text/plain; charset=utf-8", b"Kaydedilemedi").await;
+                    return Ok(());
+                }
                 respond(&mut s, "200 OK", "application/json", b"{\"ok\":true}").await;
                 self.emit(
                     "phone",

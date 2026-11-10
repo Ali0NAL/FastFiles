@@ -649,8 +649,13 @@ impl Node {
     }
 
     /// Aktarım veya bekleyen istek varken güncelleme kurulmaz.
+    /// Uygulama şu an yeniden başlatılmamalı mı (otomatik güncelleme bekler)? Süren aktarım, onay
+    /// bekleyen istek, telefondan yükleme/indirme ya da ekran paylaşımı/izleme varsa evet.
     pub fn is_busy(&self) -> bool {
-        self.transfers.lock().unwrap().values().any(|t| !t.is_finished()) || !self.pending.lock().unwrap().is_empty()
+        self.transfers.lock().unwrap().values().any(|t| !t.is_finished())
+            || !self.pending.lock().unwrap().is_empty()
+            || self.extras.phone.busy()
+            || self.extras.screen.busy()
     }
 
     /// Kurulum dosyasını geçici klasöre çıkarır (yeniden doğrulayarak) ve yolunu döndürür.
@@ -964,11 +969,7 @@ impl Node {
             let drop: HashSet<String> = done.split_off(HISTORY_MAX).into_iter().map(|t| t.id).collect();
             self.transfers.lock().unwrap().retain(|id, _| !drop.contains(id));
         }
-        let write = || -> std::io::Result<()> {
-            let tmp = self.history_path.with_extension("json.tmp");
-            std::fs::write(&tmp, serde_json::to_vec(&done)?)?;
-            std::fs::rename(&tmp, &self.history_path)
-        };
+        let write = || -> std::io::Result<()> { crate::store::write_atomic(&self.history_path, &serde_json::to_vec(&done)?) };
         if let Err(e) = write() {
             eprintln!("[fastfiles] aktarım geçmişi yazılamadı: {e}");
         }
@@ -1300,7 +1301,10 @@ impl Node {
             let parts = sanitize_rel_path(&f.path).ok_or_else(|| format!("geçersiz yol: {}", f.path))?;
             sanitized.push((parts, f.size));
         }
-        if sanitized.is_empty() || sanitized.iter().map(|f| f.1).sum::<u64>() != total {
+        // Toplam taşmaz (sürüm derlemesinde taşma sessizce sarardı ve onay penceresi devasa bir
+        // gönderimi "1 KB" gösterebilirdi).
+        let sum = sanitized.iter().try_fold(0u64, |acc, f| acc.checked_add(f.1));
+        if sanitized.is_empty() || sum != Some(total) {
             let _ = write_msg(&mut wr, &Message::Decline { reason: "invalid".into() }).await;
             return Err("geçersiz teklif".into());
         }
@@ -2055,9 +2059,21 @@ impl Node {
             return Err("Bu aktarım tekrar gönderilemez".into());
         }
         let peer = self.peer(&t.peer_id).ok_or_else(|| format!("{} şu an çevrimdışı", t.peer_name))?;
-        let (entries, title) = scan_sources(&t.sources).await?;
-        let reuse = (t.status != Status::Done).then(|| t.id.clone());
-        Ok(self.start_send(peer, entries, title, t.sources.clone(), reuse, t.group_id.clone()))
+        // Klasör taranırken (saniyeler sürebilir) ikinci kez "Tekrar dene"ye basılırsa aynı
+        // aktarım iki göndericiyle başlamasın: birbirlerini kesip iptal edilemez hâle geliyorlardı.
+        let guard = format!("retry:{id}");
+        if !self.outbox_in_flight.lock().unwrap().insert(guard.clone()) {
+            return Err("Bu aktarım zaten yeniden başlatılıyor".into());
+        }
+        let result = match scan_sources(&t.sources).await {
+            Ok((entries, title)) => {
+                let reuse = (t.status != Status::Done).then(|| t.id.clone());
+                Ok(self.start_send(peer, entries, title, t.sources.clone(), reuse, t.group_id.clone()))
+            }
+            Err(e) => Err(e),
+        };
+        self.outbox_in_flight.lock().unwrap().remove(&guard);
+        result
     }
 
     /// Panodakini gönderir: kopyalanan dosyalar ve ekran görüntüsü dosya olarak, kısa metin
@@ -2553,7 +2569,7 @@ fn set_keepalive(tcp: &TcpStream) {
 
 /// Aktarım geçmişini yükler. Uygulama kapanırken süren aktarımlar "yarıda kaldı" olur.
 fn load_history(path: &Path) -> HashMap<String, Transfer> {
-    let list: Vec<Transfer> = std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let list: Vec<Transfer> = crate::store::read_json(path).unwrap_or_default();
     list.into_iter()
         .map(|mut t| {
             if !t.is_finished() {
@@ -4266,7 +4282,7 @@ mod tests {
         introduce_all(&[&alice, &bob, &mallory]);
         let all = [&alice, &bob, &mallory];
         let (afp, bfp, mfp) = (alice.identity.fingerprint.clone(), bob.identity.fingerprint.clone(), mallory.identity.fingerprint.clone());
-        let mv = |m: &str| GameAction::Move { mv: m.into() };
+        let mv = |m: &str| GameAction::Move { mv: m.into(), at: None };
 
         assert!(alice.game_invite("chess", &[], None).is_err(), "rakip gerekli");
         assert!(alice.game_invite("chess", &[bfp.clone(), mfp.clone()], None).is_err(), "satranç iki kişilik");
@@ -4352,11 +4368,11 @@ mod tests {
         bob.game_act(&id, GameAction::Join).unwrap();
         game_ticks(&all, || game_of(&bob, &id).is_some_and(|v| v.my_turn)).await;
         assert_eq!(game_of(&bob, &id).unwrap().my_seat, Some(0));
-        bob.game_act(&id, GameAction::Move { mv: "d2d4".into() }).unwrap();
+        bob.game_act(&id, GameAction::Move { mv: "d2d4".into(), at: None }).unwrap();
         bob.game_act(&id, GameAction::OfferDraw).unwrap();
         game_ticks(&all, || game_of(&alice, &id).is_some_and(|v| v.room.draw_offer.as_deref() == Some(bfp.as_str()) && v.needs_me)).await;
         // Alice hamle yaparak teklifi reddeder, sonra Bob pes eder.
-        alice.game_act(&id, GameAction::Move { mv: "d7d5".into() }).unwrap();
+        alice.game_act(&id, GameAction::Move { mv: "d7d5".into(), at: None }).unwrap();
         game_ticks(&all, || game_of(&bob, &id).is_some_and(|v| v.my_turn && v.room.draw_offer.is_none())).await;
         bob.game_act(&id, GameAction::Resign).unwrap();
         game_ticks(&all, || game_of(&alice, &id).is_some_and(|v| v.room.status == RoomStatus::Finished)).await;
@@ -4391,7 +4407,7 @@ mod tests {
         }
         let mut worst = Duration::ZERO;
         for (i, (who, other, m)) in [(&alice, &bob, "e2e4"), (&bob, &alice, "e7e5"), (&alice, &bob, "g1f3"), (&bob, &alice, "b8c6")].into_iter().enumerate() {
-            who.game_act(&id, GameAction::Move { mv: m.into() }).unwrap();
+            who.game_act(&id, GameAction::Move { mv: m.into(), at: None }).unwrap();
             let d = wait(|| game_of(other, &id).is_some_and(|v| v.room.moves.len() == i + 1) && game_of(who, &id).is_some_and(|v| v.room.moves.len() == i + 1 && !v.pending)).await;
             eprintln!("hamle {m}: {d:?}");
             worst = worst.max(d);
@@ -4440,7 +4456,7 @@ mod tests {
             carol.identity.fingerprint.clone(),
             dave.identity.fingerprint.clone(),
         );
-        let shot = |m: &str| GameAction::Move { mv: m.into() };
+        let shot = |m: &str| GameAction::Move { mv: m.into(), at: None };
 
         let id = alice.game_invite("golf", &[bfp.clone(), cfp.clone(), dfp.clone()], Some(0)).unwrap().room.id;
         game_ticks(&all, || [&bob, &carol, &dave].iter().all(|n| game_of(n, &id).is_some())).await;

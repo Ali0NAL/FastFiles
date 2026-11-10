@@ -606,6 +606,11 @@ impl Node {
                 }
                 let g = group.clone();
                 self.chats.lock().unwrap().with(&key, |c| {
+                    // Sürüm aynı kilit altında yeniden denetlenir: art arda iki güncelleme aynı anda
+                    // gelirse eskisi yenisinin üzerine yazılmasın.
+                    if c.group.as_ref().is_some_and(|cur| cur.rev >= g.rev) {
+                        return;
+                    }
                     c.name = g.name.clone();
                     c.group = Some(g);
                     c.left = left;

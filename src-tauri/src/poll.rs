@@ -85,6 +85,15 @@ pub(super) struct PollState {
     hidden: bool,
 }
 
+impl PollState {
+    /// Listeden kaldırılmış ve işi bitmiş oylama tamamen silinebilir. Başkasının hâlâ açık olan
+    /// oylaması silinmez (gizli kalır): silinirse sahibinden gelen bir sonraki güncelleme onu
+    /// "yeni oylama" bildirimiyle geri getiriyordu. Kapanmış oylamaya güncelleme gelmez.
+    fn removable(&self, me: &str) -> bool {
+        self.hidden && self.sync_pending.is_empty() && !self.vote_pending && (self.poll.closed || self.poll.owner == me)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PollView {
@@ -131,7 +140,7 @@ fn clean_poll(mut p: Poll) -> Option<Poll> {
 
 impl Node {
     pub(super) fn load_polls(&self) {
-        let list: Vec<PollState> = std::fs::read(&self.polls_path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let list: Vec<PollState> = crate::store::read_json(&self.polls_path).unwrap_or_default();
         let mut map = self.polls.lock().unwrap();
         for st in list {
             map.insert(st.poll.id.clone(), st);
@@ -141,10 +150,7 @@ impl Node {
     fn save_polls(&self, map: &HashMap<String, PollState>) {
         let list: Vec<&PollState> = map.values().collect();
         if let Ok(json) = serde_json::to_vec(&list) {
-            let tmp = self.polls_path.with_extension("json.tmp");
-            if std::fs::write(&tmp, json).is_ok() {
-                let _ = std::fs::rename(&tmp, &self.polls_path);
-            }
+            let _ = crate::store::write_atomic(&self.polls_path, &json);
         }
     }
 
@@ -340,7 +346,7 @@ impl Node {
                 self.retally(st);
             }
             st.hidden = true;
-            if st.sync_pending.is_empty() && !st.vote_pending {
+            if st.removable(&me) {
                 map.remove(id);
             }
             self.save_polls(&map);
@@ -361,7 +367,7 @@ impl Node {
             let mut map = self.polls.lock().unwrap();
             // Kaldırılmış ve işi bitmiş oylamaları temizle.
             let before = map.len();
-            map.retain(|_, s| !(s.hidden && s.sync_pending.is_empty() && !s.vote_pending));
+            map.retain(|_, s| !s.removable(&me));
             if map.len() != before {
                 self.save_polls(&map);
             }

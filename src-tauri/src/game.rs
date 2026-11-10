@@ -95,7 +95,14 @@ pub enum GameAction {
     Join,
     /// Daveti reddet (sahip için: daveti geri çek).
     Decline,
-    Move { mv: String },
+    Move {
+        mv: String,
+        /// Hamlenin odadaki sırası (oyuncu gönderirken doldurur). Yanıt kaybolup aynı hamle yeniden
+        /// gelirse sahip onu ikinci kez uygulamaz: golfte aynı oyuncu art arda vurabildiği için
+        /// yinelenen vuruş eskiden iki kez işleniyor ve oyuncu kalıcı olarak eşzamansız kalıyordu.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<usize>,
+    },
     Resign,
     OfferDraw,
     AcceptDraw,
@@ -132,6 +139,16 @@ pub(super) struct RoomState {
 }
 
 impl RoomState {
+    /// Listeden kaldırılmış ve işi bitmiş oda tamamen silinebilir. Sahibi olduğum ve hâlâ süren
+    /// bir oyun (ör. ben çekildikten sonra diğerlerinin oynamaya devam ettiği golf) silinmez:
+    /// silinirse diğer oyuncuların hamleleri "bilinmeyen oyun" diye reddedilir ve oyun donar.
+    fn removable(&self, me: &str) -> bool {
+        self.hidden
+            && self.sync_pending.is_empty()
+            && self.outbox.is_empty()
+            && !(self.room.host == me && matches!(self.room.status, RoomStatus::Active | RoomStatus::Invited))
+    }
+
     fn eval(&mut self) -> Option<&games::Eval> {
         let key = (self.room.players.len(), self.room.moves.len());
         if self.memo.as_ref().map(|m| (m.0, m.1)) != Some(key) {
@@ -264,7 +281,19 @@ fn apply(room: &GameRoom, sender: &str, action: &GameAction) -> Result<Option<Ga
             RoomStatus::Declined | RoomStatus::Cancelled => return Ok(None),
             _ => return Err("closed"),
         },
-        GameAction::Move { mv } => {
+        GameAction::Move { mv, at } => {
+            // Gönderildiği sıradan bu yana bu oyuncunun aynı hamlesi işlendiyse istek yinelenmiştir
+            // (arada başkası oyundan çekildiyse sıra kaymış olabilir).
+            if let Some(at) = *at {
+                for i in at..r.moves.len() {
+                    if r.moves[i] == *mv {
+                        let before = games::evaluate(&r.game, n, &r.moves[..i]).map_err(|_| "invalid")?;
+                        if games::move_actor(&r.game, &before, mv) == Some(seat) {
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
             if r.status != RoomStatus::Active {
                 return Err("closed");
             }
@@ -375,14 +404,14 @@ fn clean_room(mut r: GameRoom) -> Option<GameRoom> {
 
 impl Node {
     pub(super) fn load_games(&self) {
-        let list: Vec<RoomState> = std::fs::read(&self.games_path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let list: Vec<RoomState> = crate::store::read_json(&self.games_path).unwrap_or_default();
         let mut map = self.games.lock().unwrap();
         for mut st in list {
             // Eski kayıtlarda `outbox_moves` yoktu: bekleyen hamleler işlemlerden çıkarılır.
             while st.outbox_moves.len() < st.outbox.len() {
                 let i = st.outbox_moves.len();
                 st.outbox_moves.push(match &st.outbox[i] {
-                    GameAction::Move { mv } => Some(mv.clone()),
+                    GameAction::Move { mv, .. } => Some(mv.clone()),
                     _ => None,
                 });
             }
@@ -394,10 +423,7 @@ impl Node {
     fn save_games(&self, map: &HashMap<String, RoomState>) {
         let list: Vec<&RoomState> = map.values().collect();
         if let Ok(json) = serde_json::to_vec(&list) {
-            let tmp = self.games_path.with_extension("json.tmp");
-            if std::fs::write(&tmp, json).is_ok() {
-                let _ = std::fs::rename(&tmp, &self.games_path);
-            }
+            let _ = crate::store::write_atomic(&self.games_path, &json);
         }
     }
 
@@ -576,6 +602,10 @@ impl Node {
                 sim = n;
             }
         }
+        let mut action = action;
+        if let GameAction::Move { at, .. } = &mut action {
+            *at = Some(sim.moves.len());
+        }
         let Some(next) = apply(&sim, &me, &action).map_err(action_error)? else { return Ok(()) };
         match &action {
             GameAction::Join => st.claims.push("join".into()),
@@ -606,7 +636,7 @@ impl Node {
                 }
             }
             st.hidden = true;
-            if st.sync_pending.is_empty() && st.outbox.is_empty() {
+            if st.removable(&me) {
                 map.remove(id);
             }
             self.save_games(&map);
@@ -631,7 +661,7 @@ impl Node {
         {
             let mut map = self.games.lock().unwrap();
             let before = map.len();
-            map.retain(|_, s| !(s.hidden && s.sync_pending.is_empty() && s.outbox.is_empty()));
+            map.retain(|_, s| !s.removable(&me));
             if map.len() != before {
                 self.save_games(&map);
             }
@@ -797,6 +827,10 @@ impl Node {
                     if st.room.host != room.host {
                         return reject("not_owner");
                     }
+                    // Oyun türü sonradan değiştirilemez (ör. satranç odası golfe çevrilemez).
+                    if st.room.game != room.game {
+                        return reject("invalid");
+                    }
                     if room.rev <= st.room.rev {
                         return Message::GameReply { ok: true, reason: String::new(), room: None, host_name: String::new() };
                     }
@@ -916,20 +950,21 @@ impl Node {
                 Ok(None) => (true, String::new()),
                 Err(r) => (false, r.to_string()),
             };
+            // Yanıttan önce kaydedilir: sahip yanıttan hemen sonra kapanırsa yeniden açıldığında
+            // aynı sürüm numarasını farklı içerikle kullanıp oyuncuyu eşzamansız bırakmasın.
+            if changed {
+                self.save_games(&map);
+            }
             let st = &map[room_id];
             Message::GameReply { ok, reason, room: Some(st.room.clone()), host_name: st.host_name.clone() }
         };
         if changed {
-            // Yanıt hemen gitsin: diğer oyunculara iletim, diske kayıt, bildirim ve arayüz
-            // güncellemesi yanıtı bekletmez.
+            // Yanıt hemen gitsin: diğer oyunculara iletim, bildirim ve arayüz güncellemesi
+            // yanıtı bekletmez.
             self.flush_games();
             let node = self.clone();
             let id = room_id.to_string();
             tokio::spawn(async move {
-                {
-                    let map = node.games.lock().unwrap();
-                    node.save_games(&map);
-                }
                 if let Some((t, b)) = notify {
                     node.notify_game(&id, &t, &b);
                 }
@@ -1003,19 +1038,19 @@ mod tests {
         let (a, b, c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
         let r = room();
         assert_eq!(apply(&r, &c, &GameAction::Join), Err("not_player"));
-        assert_eq!(apply(&r, &b, &GameAction::Move { mv: "e2e4".into() }), Err("closed"));
+        assert_eq!(apply(&r, &b, &GameAction::Move { mv: "e2e4".into(), at: None }), Err("closed"));
         let r = apply(&r, &b, &GameAction::Join).unwrap().unwrap();
         assert_eq!(r.status, RoomStatus::Active);
         assert_eq!(apply(&r, &b, &GameAction::Join), Ok(None), "tekrar gelen kabul");
         // Beyaz (koltuk 0) Ali başlar.
-        assert_eq!(apply(&r, &b, &GameAction::Move { mv: "e7e5".into() }), Err("not_your_turn"));
-        assert_eq!(apply(&r, &a, &GameAction::Move { mv: "e2e5".into() }), Err("illegal"));
-        let r = apply(&r, &a, &GameAction::Move { mv: "e2e4".into() }).unwrap().unwrap();
+        assert_eq!(apply(&r, &b, &GameAction::Move { mv: "e7e5".into(), at: None }), Err("not_your_turn"));
+        assert_eq!(apply(&r, &a, &GameAction::Move { mv: "e2e5".into(), at: None }), Err("illegal"));
+        let r = apply(&r, &a, &GameAction::Move { mv: "e2e4".into(), at: None }).unwrap().unwrap();
         // Beraberlik: teklif → hamle teklifi düşürür → yeni teklif → kabul.
         let r = apply(&r, &a, &GameAction::OfferDraw).unwrap().unwrap();
         assert_eq!(r.draw_offer.as_deref(), Some(a.as_str()));
         assert_eq!(apply(&r, &a, &GameAction::AcceptDraw), Err("no_offer"), "kendi teklifini kabul edemez");
-        let r = apply(&r, &b, &GameAction::Move { mv: "e7e5".into() }).unwrap().unwrap();
+        let r = apply(&r, &b, &GameAction::Move { mv: "e7e5".into(), at: None }).unwrap().unwrap();
         assert!(r.draw_offer.is_none());
         let r2 = apply(&r, &b, &GameAction::OfferDraw).unwrap().unwrap();
         let done = apply(&r2, &a, &GameAction::AcceptDraw).unwrap().unwrap();
@@ -1025,17 +1060,39 @@ mod tests {
         let done = apply(&r, &b, &GameAction::Resign).unwrap().unwrap();
         assert_eq!(done.result.as_ref().unwrap().winner.as_deref(), Some(a.as_str()));
         assert_eq!(result_line(&done, &a), "Banu pes etti — kazandınız");
-        assert_eq!(apply(&done, &a, &GameAction::Move { mv: "d2d4".into() }), Err("closed"));
+        assert_eq!(apply(&done, &a, &GameAction::Move { mv: "d2d4".into(), at: None }), Err("closed"));
         // Mat ile biten hamle oyunu bitirir.
         let mut r = r;
         for (who, mv) in [(&a, "d1h5"), (&b, "b8c6"), (&a, "f1c4"), (&b, "g8f6"), (&a, "h5f7")] {
-            r = apply(&r, who, &GameAction::Move { mv: mv.into() }).unwrap().unwrap();
+            r = apply(&r, who, &GameAction::Move { mv: mv.into(), at: None }).unwrap().unwrap();
         }
         assert_eq!(r.status, RoomStatus::Finished);
         assert_eq!(result_line(&r, &b), "Ali kazandı (şah mat)");
         // Davet reddi / geri çekme.
         assert_eq!(apply(&room(), &b, &GameAction::Decline).unwrap().unwrap().status, RoomStatus::Declined);
         assert_eq!(apply(&room(), &a, &GameAction::Decline).unwrap().unwrap().status, RoomStatus::Cancelled);
+    }
+
+    /// Yanıtı kaybolan vuruş yeniden gelirse ikinci kez işlenmez — sıra yine aynı oyuncuda olsa bile.
+    #[test]
+    fn retried_golf_shot_is_not_applied_twice() {
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let mut r = room();
+        r.game = "golf".into();
+        r.status = RoomStatus::Active;
+        r.joined = vec![a.clone(), b.clone()];
+        // 1. delik: ikisi sırayla en hafif vuruşu yapar; Alice 8'e ulaşınca bitirir.
+        r.moves = vec!["a0p1".to_string(); 15];
+        let shot = GameAction::Move { mv: "a0p1".into(), at: Some(15) };
+        let next = apply(&r, &b, &shot).unwrap().unwrap();
+        assert_eq!(next.moves.len(), 16);
+        // Bob deliği bitirdi; 2. delik Bob ile başlar: sıra yine onda.
+        let e = games::evaluate("golf", 2, &next.moves).unwrap();
+        assert_eq!(e.turn, Some(1));
+        assert_eq!(apply(&next, &b, &shot), Ok(None), "aynı vuruş yinelendi, yeniden işlenmemeli");
+        // Yeni bir vuruş (yeni sıra numarasıyla) normal işlenir.
+        let again = GameAction::Move { mv: "a0p1".into(), at: Some(16) };
+        assert_eq!(apply(&next, &b, &again).unwrap().unwrap().moves.len(), 17);
     }
 
     #[test]
