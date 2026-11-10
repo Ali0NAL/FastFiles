@@ -3174,8 +3174,9 @@ function gameStatusText(g) {
   if (golf && g.info?.quit?.[g.mySeat]) return 'Çekildiniz · izliyorsunuz';
   if (g.pending) return golf ? 'Vuruşunuz iletiliyor…' : 'Hamleniz iletiliyor…';
   if (g.drawOffer && g.drawOffer !== me) return 'Beraberlik teklif ediyor';
-  if (g.myTurn) return golf ? `Sıra sizde · ${(g.info?.hole ?? 0) + 1}. delik` : g.info?.check ? 'Sıra sizde · Şah!' : 'Sıra sizde';
-  return `${g.players[g.turn]?.name || 'Rakip'} ${golf ? 'vuruyor…' : 'düşünüyor…'}`;
+  if (golf) return g.myTurn ? `Oynuyorsunuz · ${(g.info?.hole ?? 0) + 1}. delik` : `Diğerleri bekleniyor · ${(g.info?.hole ?? 0) + 1}. delik`;
+  if (g.myTurn) return g.info?.check ? 'Sıra sizde · Şah!' : 'Sıra sizde';
+  return `${g.players[g.turn]?.name || 'Rakip'} düşünüyor…`;
 }
 
 function renderGames() {
@@ -3190,7 +3191,7 @@ function renderGames() {
     const online = opp && !!peerByFp(opp.fingerprint);
     const cls = [g.id === gameState.open ? 'active' : '', g.needsMe ? 'unread' : '', gameOver(g) ? 'left' : ''].join(' ');
     const badge = !g.needsMe ? ''
-      : `<span class="badge vote">${g.status === 'invited' ? 'Davet' : g.myTurn ? 'Sıra sizde' : 'Yanıt bekliyor'}</span>`;
+      : `<span class="badge vote">${g.status === 'invited' ? 'Davet' : g.myTurn ? (g.game === 'golf' ? 'Oynuyor' : 'Sıra sizde') : 'Yanıt bekliyor'}</span>`;
     return `
       <div class="conv ${cls}" data-game="${esc(g.id)}">
         <div class="avatar" style="background:${grad(opp?.fingerprint || g.id)}">${opp ? face(opp.fingerprint, opp.name) : ''}</div>
@@ -3298,7 +3299,10 @@ function onGames(list) {
       toast(`${vsName(g)} ${g.title} davetinizi reddetti`, { type: 'error' });
     } else if (old.status !== 'finished' && g.status === 'finished') {
       toast(`${g.title} · ${gameResultText(g)}`, { action: 'Gör', timeout: 8000, onAction: () => openRoom(g.id) });
-    } else if (!old.myTurn && g.myTurn) {
+    } else if (g.game === 'golf' && g.myTurn && old.info?.hole !== g.info?.hole) {
+      // Golfte herkes aynı anda oynar: yalnızca yeni delik başlayınca haber verilir.
+      toast(`${g.title} · ${g.info.hole + 1}. delik başladı (${vsName(g)})`, { action: 'Oyuna git', timeout: 8000, onAction: () => openRoom(g.id) });
+    } else if (g.game !== 'golf' && !old.myTurn && g.myTurn) {
       toast(`${g.title} · sıra sizde (${vsName(g)})`, { action: 'Oyuna git', timeout: 8000, onAction: () => openRoom(g.id) });
     } else if (g.drawOffer && g.drawOffer !== myFp() && old.drawOffer !== g.drawOffer) {
       toast(`${vsName(g)} beraberlik teklif ediyor`, { action: 'Gör', timeout: 8000, onAction: () => openRoom(g.id) });
@@ -3531,12 +3535,12 @@ function renderRoomPanel(g) {
       break;
     case 'active': {
       if (isGolf) {
-        const cur = g.players[g.turn];
-        const curOnline = !!cur && (cur.fingerprint === me || !!peerByFp(cur.fingerprint));
+        const off = golfPlaying(g).map((s) => g.players[s]).filter((p) => p.fingerprint !== me && !peerByFp(p.fingerprint));
         if (g.info?.quit?.[g.mySeat]) status = 'Oyundan çekildiniz; oyunu izliyorsunuz.';
         else if (g.pending) status = 'Vuruşunuz iletiliyor…';
-        else if (g.myTurn) { status = '<b>Sıra sizde.</b> Topu geriye doğru çekip bırakın.'; tone = 'turn'; }
-        else if (cur) status = curOnline ? `<b>${esc(cur.name)}</b> vuruyor…` : `<b>${esc(cur.name)}</b> çevrimdışı; döndüğünde oyun sürer.`;
+        else if (g.myTurn) { status = '<b>Herkes aynı anda oynuyor.</b> Topu geriye doğru çekip bırakın.'; tone = 'turn'; }
+        else status = esc(golfWaitText(g));
+        if (off.length) status += `<div class="small muted">${esc(off.map((p) => p.name).join(', '))} çevrimdışı; dönünce oyun sürer.</div>`;
         if (!g.info?.quit?.[g.mySeat]) actions = roomBtn('resign', 'Oyundan çekil', 'ghost danger-text', g.pending);
         break;
       }
@@ -3590,14 +3594,22 @@ function renderMoves(g) {
 
 // ── Mini golf ──
 // Fizik arka uçtadır (games/golf.rs): arayüz yalnızca sahayı çizer, nişanı alır ve arka ucun
-// verdiği top yolunu (`lastShot.path`, ~40 nokta/sn) canlandırır. Saha 800×500 birimdir.
+// verdiği top yollarını (`shots[].path`, ~40 nokta/sn) canlandırır. Saha 800×500 birimdir.
+// Herkes aynı anda oynar: deliği bitirmemiş herkes istediği an vurur, başkalarının vuruşları da
+// aynı anda canlanır. Yeni delik herkes bitirince birlikte, kısa bir geri sayımla başlar.
 
 const golfCanvas = $('#golf-canvas');
-const golfView = { room: null, shots: -1, anim: null, aim: null, raf: 0, flashTimer: 0 };
+const golfView = { room: null, status: '', seen: 0, anims: [], aim: null, raf: 0, flashTimer: 0, shown: 0, introUntil: 0 };
 const GOLF_PULL = 220;           // bu kadar geri çekince %100 güç (saha birimi)
 const GOLF_POINT_MS = 25;        // yol noktaları arası süre (1/40 sn)
 const golfColor = (fp) => `hsl(${hue(fp)} 78% 52%)`;
-const shotCount = (g) => g.moves.filter((m) => m[0] === 'a').length;
+const GOLF_INTRO_MS = 2600;      // yeni delik başlarken geri sayım (herkes birlikte başlar)
+const golfShotMs = (shot) => Math.max(250, (shot.path.length - 1) * GOLF_POINT_MS);
+/** Deliği hâlâ oynayanlar (bitirmemiş ve çekilmemiş). */
+const golfPlaying = (g) => (g.status === 'active' ? g.players.map((p, s) => s).filter((s) => !g.info.quit[s] && !g.info.balls[s].done) : []);
+/** Şu an vurabilir miyim: sıram (deliği bitirmedim), kendi topum yolda değil, geri sayım bitti. */
+const golfCanShoot = (g, now = performance.now()) => !!g?.myTurn && golfView.shown === g.info.hole
+  && now >= golfView.introUntil && !golfView.anims.some((a) => a.shot.seat === g.mySeat);
 // Power-up'lar (kuralları games/golf.rs içindedir). `foe`: rakiplere etki eder.
 const GOLF_PUPS = {
   slow: { icon: '🐌', name: 'Yavaşlat', color: '#e5484d', foe: true, desc: 'Rakiplerin sonraki vuruşu %40 zayıf', now: 'vuruşunuz %40 zayıf' },
@@ -3611,16 +3623,26 @@ const pupIcons = (list) => (list || []).map((k) => GOLF_PUPS[k]?.icon || '').joi
 
 function renderGolf(g) {
   if (!g.info?.holes) return;
-  const n = shotCount(g);
+  const n = g.moves.length;
   if (golfView.room !== g.id) {
-    // Odaya yeni girildi: eski vuruş canlandırılmaz.
-    Object.assign(golfView, { room: g.id, shots: n, anim: null, aim: null });
+    // Odaya yeni girildi: eski vuruşlar canlandırılmaz. Hiç vuruş yoksa oyun yeni başlamıştır.
+    Object.assign(golfView, { room: g.id, seen: n, anims: [], aim: null, shown: g.info.hole,
+      introUntil: g.status === 'active' && n === 0 ? performance.now() + GOLF_INTRO_MS : 0 });
     $('#golf-flash').hidden = true;
-  } else if (n > golfView.shots) {
-    golfView.shots = n;
-    const s = g.info.lastShot;
-    if (s?.path?.length > 1) golfView.anim = { shot: s, start: performance.now() };
+  } else {
+    // Oyun şimdi başladı (son oyuncu daveti kabul etti): herkes birlikte başlar.
+    if (golfView.status === 'invited' && g.status === 'active') golfView.introUntil = performance.now() + GOLF_INTRO_MS;
+    if (n > golfView.seen) {
+      // Son güncellemeden bu yana gelen her vuruş, kimin olursa olsun aynı anda canlanır.
+      for (const s of g.info.shots || []) {
+        if (s.ply < golfView.seen || !(s.path?.length > 1)) continue;
+        golfView.anims = golfView.anims.filter((a) => a.shot.seat !== s.seat);
+        golfView.anims.push({ shot: s, start: null });
+      }
+    }
+    golfView.seen = n;
   }
+  golfView.status = g.status;
   if (!g.myTurn) golfView.aim = null;
   renderGolfHud(g);
   golfLoop();
@@ -3632,7 +3654,7 @@ function renderGolfHud(g) {
   const chips = g.players.map((p, seat) => {
     const b = info.balls[seat];
     const quit = info.quit[seat];
-    const cur = g.status === 'active' && g.turn === seat;
+    const cur = g.status === 'active' && !quit && !b.done;
     const state = quit ? 'çekildi' : b.done ? `⛳ ${b.strokes}` : b.strokes ? `${b.strokes} vuruş` : 'başlamadı';
     const fx = quit ? [] : info.effects?.[seat] || [];
     const fxTitle = fx.map((k) => `${GOLF_PUPS[k]?.icon} ${GOLF_PUPS[k]?.name}`).join(', ');
@@ -3648,11 +3670,20 @@ function renderGolfHud(g) {
   const mine = info.effects?.[g.mySeat] || [];
   if (g.status === 'finished') hint = gameResultText(g);
   else if (g.status !== 'active') hint = 'Herkes katılınca oyun başlar.';
+  else if (info.quit[g.mySeat]) hint = 'Oyundan çekildiniz; oyunu izliyorsunuz.';
   else if (g.myTurn && mine.length) hint = `Bu vuruşunuzda: ${mine.map((k) => `${GOLF_PUPS[k]?.icon} ${GOLF_PUPS[k]?.now || ''}`).join(' · ')}`;
-  else if (g.myTurn) hint = 'Topu tutup geriye doğru çekin ve bırakın. Toplanan power-up\'lar sonraki vuruşu etkiler. (Esc: vazgeç)';
+  else if (g.myTurn) hint = 'Herkes aynı anda vuruyor: topu tutup geriye doğru çekin ve bırakın. Toplanan power-up\'lar sonraki vuruşu etkiler. (Esc: vazgeç)';
   else if (g.pending) hint = 'Vuruşunuz iletiliyor…';
-  else hint = `${g.players[g.turn]?.name || ''} vuruyor…`;
+  else hint = golfWaitText(g);
   $('#golf-hint').textContent = hint;
+}
+
+/** Deliği bitirdim, diğerleri bekleniyor. */
+function golfWaitText(g) {
+  const names = golfPlaying(g).map((s) => g.players[s]?.name).filter(Boolean);
+  const last = g.info.hole + 1 >= g.info.holes.length;
+  if (!names.length) return '';
+  return `Deliği bitirdiniz. ${names.join(', ')} bitirince ${last ? 'oyun sona erer' : `${g.info.hole + 2}. delik herkes için birlikte başlar`}.`;
 }
 
 function golfLoop() {
@@ -3706,53 +3737,74 @@ function drawGolf(now) {
   ctx.setTransform(k, 0, 0, k, 0, 0);
   ctx.clearRect(0, 0, info.width, info.height);
 
-  let holeIdx = info.hole;
-  let animPos = null;
-  let animating = false;
-  const a = golfView.anim;
-  if (a) {
-    const dur = Math.max(250, (a.shot.path.length - 1) * GOLF_POINT_MS);
-    const t = Math.min(1, (now - a.start) / dur);
-    holeIdx = a.shot.hole;
-    animPos = pointAlong(a.shot.path, t);
-    animating = t < 1;
-    if (!animating) {
-      golfView.anim = null;
-      golfFlash(a.shot);
-      holeIdx = info.hole;
-      animPos = null;
-    }
+  // Biten canlandırmalar sonucu gösterir.
+  golfView.anims = golfView.anims.filter((a) => {
+    if (a.start == null || now - a.start < golfShotMs(a.shot)) return true;
+    golfFlash(a.shot);
+    return false;
+  });
+  // Gösterilen delik: canlandırması süren en eski delik (son vuruş bitmeden yeni delik açılmaz).
+  const shown = Math.min(info.hole, ...golfView.anims.map((a) => a.shot.hole));
+  if (shown > golfView.shown && g.status === 'active') golfView.introUntil = now + GOLF_INTRO_MS;
+  golfView.shown = shown;
+  for (const a of golfView.anims) if (a.start == null && a.shot.hole === shown) a.start = now;
+  const anims = golfView.anims.filter((a) => a.shot.hole === shown);
+  const progress = (a) => (a.start == null ? 0 : Math.min(1, (now - a.start) / golfShotMs(a.shot)));
+  const hole = info.holes[shown];
+  drawCourse(ctx, hole, info);
+  // Power-up'lar: top üstünden geçince kaybolur (yoldaki toplar henüz ulaşmadıysa görünür).
+  const avail = shown === info.hole ? (info.pupAvail || []).slice() : (anims[0]?.shot.avail || []).slice();
+  for (const a of anims) {
+    const f = progress(a) * (a.shot.path.length - 1);
+    for (const [i, , at] of a.shot.picked || []) avail[i] = f < at - 1 ? true : shown === info.hole ? avail[i] : false;
   }
-  drawCourse(ctx, info.holes[holeIdx], info);
-  // Power-up'lar: canlandırma sürerken vuruştan önceki hâl, top üstünden geçince kaybolur.
-  let avail = info.pupAvail || [];
-  if (animPos) {
-    const f = Math.min(1, (now - a.start) / Math.max(250, (a.shot.path.length - 1) * GOLF_POINT_MS)) * (a.shot.path.length - 1);
-    avail = (a.shot.avail || []).slice();
-    for (const [i, , at] of a.shot.picked || []) if (f >= at - 1) avail[i] = false;
-  } else if (holeIdx !== info.hole) avail = [];
-  drawPups(ctx, info.holes[holeIdx], avail, info);
-  const sameHole = holeIdx === info.hole;
-  const order = g.players.map((p, seat) => seat).sort((x, y) => (x === g.turn) - (y === g.turn));
+  drawPups(ctx, hole, avail, info);
+  const current = shown === info.hole;
+  const canShoot = golfCanShoot(g, now);
+  // Benim topum en üstte çizilir.
+  const order = g.players.map((p, seat) => seat).sort((x, y) => (x === g.mySeat) - (y === g.mySeat));
   let waiting = 0;
   for (const seat of order) {
     const p = g.players[seat];
     const b = info.balls[seat];
     if (info.quit[seat]) continue;
+    const a = anims.find((x) => x.shot.seat === seat);
     let pos = null;
-    if (animPos && a.shot.seat === seat) pos = animPos;
-    else if (sameHole && !b.done) pos = [b.x, b.y];
-    // Henüz vurmamış ve sırası gelmemiş toplar başlangıcın yanında sıraya dizilir (üst üste binmesin).
-    if (pos && !b.strokes && seat !== g.turn && !(animPos && a.shot.seat === seat)) {
+    if (a) pos = pointAlong(a.shot.path, progress(a));
+    else if (current && !b.done && !golfView.anims.some((x) => x.shot.seat === seat)) pos = [b.x, b.y];
+    // Henüz vurmamış rakip toplar başlangıcın yanında sıraya dizilir (üst üste binmesin).
+    if (pos && !a && !b.strokes && seat !== g.mySeat) {
       pos = [pos[0] - 24 - 16 * (waiting % 3), pos[1] + 18 * (Math.floor(waiting / 3) - 0.5)];
       waiting++;
     }
-    if (pos) drawBall(ctx, pos, info.ballR, golfColor(p.fingerprint), !animating && g.status === 'active' && seat === g.turn, now);
+    if (pos) drawBall(ctx, pos, info.ballR, golfColor(p.fingerprint), seat === g.mySeat && canShoot, now);
   }
-  const aiming = !!golfView.aim && !animating && g.myTurn;
+  if (golfView.aim && !canShoot) golfView.aim = null;
+  const aiming = !!golfView.aim;
   if (aiming) drawAim(ctx, info);
-  // Yalnızca canlandırma ve nişan sürerken çizmeye devam edilir (boştayken işlemci harcanmaz).
-  return animating || aiming;
+  const intro = now < golfView.introUntil && g.status === 'active';
+  if (intro) drawIntro(ctx, info, hole, shown, Math.ceil((golfView.introUntil - now) / 1000));
+  // Yalnızca canlandırma, geri sayım ve nişan sürerken çizmeye devam edilir.
+  return golfView.anims.length > 0 || aiming || intro;
+}
+
+/** Yeni delik başlarken herkesin ekranında aynı anda görünen geri sayım. */
+function drawIntro(ctx, info, hole, idx, secs) {
+  ctx.fillStyle = 'rgba(10, 20, 14, .55)';
+  ctx.fillRect(0, 0, info.width, info.height);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#fff';
+  ctx.font = '600 34px "Segoe UI", system-ui, sans-serif';
+  ctx.fillText(`${idx + 1}. delik · ${hole.name}`, info.width / 2, info.height / 2 - 46);
+  ctx.font = '18px "Segoe UI", system-ui, sans-serif';
+  ctx.fillStyle = 'rgba(255, 255, 255, .8)';
+  ctx.fillText(`Par ${hole.par} · herkes aynı anda vuruyor`, info.width / 2, info.height / 2 - 8);
+  ctx.font = '700 56px "Segoe UI", system-ui, sans-serif';
+  ctx.fillStyle = '#ffd166';
+  ctx.fillText(String(Math.max(1, secs)), info.width / 2, info.height / 2 + 50);
+  ctx.textAlign = 'start';
+  ctx.textBaseline = 'alphabetic';
 }
 
 function drawCourse(ctx, hole, info) {
@@ -3921,7 +3973,7 @@ function golfPoint(e) {
 
 golfCanvas.addEventListener('pointerdown', (e) => {
   const g = gameById(gameState.open);
-  if (e.button !== 0 || !g || g.game !== 'golf' || !g.myTurn || golfView.anim) return;
+  if (e.button !== 0 || !g || g.game !== 'golf' || !golfCanShoot(g)) return;
   const b = g.info.balls[g.mySeat];
   golfView.aim = { ball: [b.x, b.y], cur: golfPoint(e), pointerId: e.pointerId };
   golfCanvas.setPointerCapture(e.pointerId);
@@ -3941,7 +3993,7 @@ golfCanvas.addEventListener('pointerup', async (e) => {
   const { angle, power } = aimShot();
   golfView.aim = null;
   golfLoop();
-  if (!g?.myTurn || power < 0.04) return;
+  if (!golfCanShoot(g) || power < 0.04) return;
   const deg10 = ((Math.round((angle * 180 / Math.PI) * 10) % 3600) + 3600) % 3600;
   const mv = `a${deg10}p${Math.max(1, Math.min(100, Math.round(power * 100)))}`;
   await call('game_act', { id: g.id, action: { kind: 'move', mv } }).catch(() => {});
@@ -6483,7 +6535,7 @@ function createPreviewApi() {
       createdAt: now - 2 * 86400e3, updatedAt: now - 2 * 86400e3 + 600e3,
       info: { fen: 'r1bqkb1r/pppp1Qpp/2n2n2/4p3/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 0 4', check: true, lastMove: 'h5f7', san: ['e4', 'e5', 'Qh5', 'Nc6', 'Bc4', 'Nf6', 'Qxf7#'] } }),
   ];
-  // Örnek mini golf (gerçek arka uç çıktısı): Ahmet deliği 2 vuruşta bitirdi, sıra bizde.
+  // Örnek mini golf: Ahmet deliği 2 vuruşta bitirdi, Elif ve biz aynı anda oynuyoruz.
   snap.gameCatalog.push({ id: 'golf', name: 'Mini golf', description: '2–6 kişilik mini golf: 25 delikten her oyunda rastgele 6 delik. Duvar, kum, su, engeller ve rakipleri yavaşlatan power-up’lar var. En az vuruşla bitiren kazanır.', minPlayers: 2, maxPlayers: 6, seats: [] });
   const golfHoles = JSON.parse('[{"blocks":[],"bounds":[[80,150],[720,150],[720,350],[80,350]],"cup":[650,250],"name":"Isınma","par":2,"posts":[],"sand":[],"tee":[150,250],"water":[]},{"blocks":[[[385,80],[415,80],[415,320],[385,320]]],"bounds":[[60,80],[740,80],[740,420],[60,420]],"cup":[640,160],"name":"Duvar","par":3,"posts":[],"sand":[],"tee":[160,160],"water":[]},{"blocks":[],"bounds":[[60,60],[360,60],[360,290],[740,290],[740,440],[60,440]],"cup":[660,365],"name":"Dönemeç","par":3,"posts":[],"sand":[[430,380,120,60]],"tee":[200,130],"water":[]},{"blocks":[],"bounds":[[60,90],[740,90],[740,410],[60,410]],"cup":[670,190],"name":"Göl","par":3,"posts":[],"sand":[[330,350,140,60]],"tee":[130,250],"water":[[330,90,140,200]]},{"blocks":[],"bounds":[[60,70],[740,70],[740,430],[60,430]],"cup":[690,250],"name":"Direkler","par":3,"posts":[[300,180,22],[300,320,22],[450,250,28],[590,165,20],[590,335,20]],"sand":[],"tee":[120,250],"water":[]},{"blocks":[[[230,60],[260,60],[260,330],[230,330]],[[480,170],[510,170],[510,440],[480,440]]],"bounds":[[60,60],[740,60],[740,440],[60,440]],"cup":[650,380],"name":"Zikzak","par":4,"posts":[],"sand":[[560,60,180,60]],"tee":[140,120],"water":[]}]');
   // Power-up'lar ve seviye numaraları (arka uç her oyunda 25 delikten 6'sını rastgele seçer).
@@ -6492,44 +6544,82 @@ function createPreviewApi() {
   golfHoles.forEach((h, i) => Object.assign(h, { no: [1, 2, 3, 4, 5, 6][i], pups: mockPups[i] }));
   const golfPlayers = [{ fingerprint: fp1, name: 'Ahmet' }, { fingerprint: me, name: 'Nur' }, { fingerprint: fp2, name: 'Elif (Tasarım)' }];
   snap.games.unshift(gameMock({ id: 'gm3', game: 'golf', title: 'Mini golf', host: me, hostName: 'Nur', isHost: true, players: golfPlayers,
-    joined: golfPlayers.map((p) => p.fingerprint), status: 'active', mySeat: 1, turn: 1, myTurn: true, needsMe: true,
-    moves: ['a0p55', 'a3550p50', 'a50p45', 'a0p20'], createdAt: now - 10 * 60e3, updatedAt: now - 20e3,
+    joined: golfPlayers.map((p) => p.fingerprint), status: 'active', mySeat: 1, turn: null, myTurn: true, needsMe: true,
+    moves: ['s0a0p55', 's1a3550p50', 's0a50p45', 's2a0p20'], createdAt: now - 10 * 60e3, updatedAt: now - 20e3,
     info: { width: 800, height: 500, ballR: 7, cupR: 11, pupR: 13, levels: 25, maxStrokes: 8, holes: golfHoles, hole: 0, quit: [false, false, false],
       pupAvail: [true, true], effects: [[], ['magnet'], []],
       balls: [{ x: 650, y: 250, strokes: 2, done: true }, { x: 534.6, y: 216.4, strokes: 1, done: false }, { x: 475.8, y: 278.5, strokes: 1, done: false }],
-      scores: [[], [], []], totals: [0, 0, 0],
+      scores: [[], [], []], totals: [0, 0, 0], shots: [],
       lastShot: { seat: 0, hole: 0, result: 'in', strokes: 2, end: [650, 250], path: [[597.7, 250], [610, 250], [622, 250], [632.5, 250], [650, 250]] } } }));
   // Önizleme: vuruş düz bir çizgide, güce göre yol alır (gerçek fizik arka uçtadır).
   const golfMockShot = (g, seat, mv) => {
-    const [, a, p] = mv.match(/^a(\d+)p(\d+)$/).map(Number);
-    const b = g.info.balls[seat];
+    const [, a, p] = mv.match(/a(\d+)p(\d+)$/).map(Number);
+    const info = g.info;
+    const hole = info.holes[info.hole];
+    const [cx, cy] = hole.cup;
+    const b = info.balls[seat];
     const ang = (a / 10) * Math.PI / 180;
     const dist = p * 6;
     const steps = Math.max(2, Math.round(p / 3));
+    const xs = hole.bounds.map((q) => q[0]);
+    const ys = hole.bounds.map((q) => q[1]);
     const path = Array.from({ length: steps }, (_, i) => {
       const t = 1 - (1 - i / (steps - 1)) ** 2;
-      return [Math.max(90, Math.min(710, b.x + Math.cos(ang) * dist * t)), Math.max(160, Math.min(340, b.y + Math.sin(ang) * dist * t))];
+      return [Math.max(Math.min(...xs) + 10, Math.min(Math.max(...xs) - 10, b.x + Math.cos(ang) * dist * t)),
+        Math.max(Math.min(...ys) + 10, Math.min(Math.max(...ys) - 10, b.y + Math.sin(ang) * dist * t))];
     });
     const [x, y] = path.at(-1);
-    const holed = Math.hypot(x - 650, y - 250) < 14;
-    Object.assign(b, { x: holed ? 650 : x, y: holed ? 250 : y, strokes: b.strokes + 1, done: holed });
-    g.moves = [...g.moves, mv];
-    const avail = (g.info.pupAvail || []).slice();
+    const holed = Math.hypot(x - cx, y - cy) < 14;
+    Object.assign(b, { x: holed ? cx : x, y: holed ? cy : y, strokes: b.strokes + 1 });
+    b.done = holed || b.strokes >= info.maxStrokes;
+    const ply = g.moves.length;
+    g.moves = [...g.moves, `s${seat}a${a}p${p}`];
+    const avail = (info.pupAvail || []).slice();
     const picked = [];
-    g.info.holes[0].pups.forEach(([px, py, kind], i) => {
+    hole.pups.forEach(([px, py, kind], i) => {
       const at = path.findIndex(([qx, qy]) => Math.hypot(qx - px, qy - py) < 24);
       if (avail[i] && at >= 0) picked.push([i, kind, at]);
     });
-    const mods = g.info.effects[seat] || [];
-    g.info.effects[seat] = [];
+    const mods = info.effects[seat] || [];
+    info.effects[seat] = [];
     for (const [i, kind] of picked) {
-      g.info.pupAvail[i] = false;
-      if (['slow', 'shaky', 'ice'].includes(kind)) g.info.effects.forEach((e, s) => { if (s !== seat && !e.includes(kind)) e.push(kind); });
-      else g.info.effects[seat] = [kind];
+      info.pupAvail[i] = false;
+      if (['slow', 'shaky', 'ice'].includes(kind)) info.effects.forEach((e, s) => { if (s !== seat && !info.balls[s].done && !e.includes(kind)) e.push(kind); });
+      else info.effects[seat] = [kind];
     }
-    g.info.lastShot = { seat, hole: 0, result: holed ? 'in' : 'stop', strokes: b.strokes, end: [b.x, b.y], path, mods, shake: 0, picked, avail };
-    const next = [1, 2, 0].map((k) => (seat + k) % 3).find((s) => !g.info.balls[s].done);
-    Object.assign(g, { turn: next ?? null, myTurn: next === g.mySeat, needsMe: next === g.mySeat, updatedAt: Date.now() });
+    const shot = { ply, seat, hole: info.hole, result: holed ? 'in' : b.done ? 'max' : 'stop', strokes: b.strokes, end: [b.x, b.y], path, mods, shake: 0, picked, avail };
+    info.shots = [...(info.shots || []), shot].slice(-12);
+    info.lastShot = shot;
+    // Herkes bitirdi: sonraki delik herkes için birlikte başlar.
+    if (info.balls.every((q, s) => q.done || info.quit[s]) && info.hole + 1 < info.holes.length) {
+      info.balls.forEach((q, s) => info.scores[s].push(q.strokes));
+      info.totals = info.scores.map((r) => r.reduce((x, y) => x + y, 0));
+      info.hole += 1;
+      const tee = info.holes[info.hole].tee;
+      info.balls = info.balls.map(() => ({ x: tee[0], y: tee[1], strokes: 0, done: false }));
+      info.pupAvail = info.holes[info.hole].pups.map(() => true);
+      info.effects = info.balls.map(() => []);
+    }
+    const mine = !info.balls[g.mySeat].done;
+    Object.assign(g, { turn: null, myTurn: mine, needsMe: mine, rev: g.rev + 1, updatedAt: Date.now() });
+  };
+  // Önizleme: rakipler bizi beklemeden, kendi hızlarında vurur.
+  const golfBots = (g) => {
+    for (const seat of [0, 2]) {
+      const tick = () => {
+        if (g.status !== 'active') return;
+        const info = g.info;
+        const b = info.balls[seat];
+        if (!b.done && !info.quit[seat]) {
+          const [cx, cy] = info.holes[info.hole].cup;
+          const deg = (Math.atan2(cy - b.y, cx - b.x) * 180 / Math.PI + 360 + (Math.random() - 0.5) * 20) % 360;
+          golfMockShot(g, seat, `a${Math.round(deg * 10) % 3600}p${Math.max(5, Math.min(100, Math.round(Math.hypot(cx - b.x, cy - b.y) / 6 * (0.8 + Math.random() * 0.4))))}`);
+          emit('games', structuredClone(snap.games));
+        }
+        setTimeout(tick, 2200 + Math.random() * 2500);
+      };
+      setTimeout(tick, 1500 + seat * 900);
+    }
   };
   const fenPlacement = (b) => [7, 6, 5, 4, 3, 2, 1, 0].map((r) => b.slice(r * 8, r * 8 + 8)
     .reduce((s, p) => (p ? s + p : s.replace(/(\d?)$/, (d) => String(Number(d || 0) + 1))), '')).join('/');
@@ -6537,15 +6627,9 @@ function createPreviewApi() {
     const opp = g.players.find((p) => p.fingerprint !== me).fingerprint;
     const end = (result) => Object.assign(g, { status: 'finished', result, drawOffer: null, myTurn: false, needsMe: false, legal: [], turn: null });
     if (a.kind === 'move' && g.game === 'golf') {
+      if (!g.myTurn) throw 'Deliği bitirdiniz; diğerleri bekleniyor';
       golfMockShot(g, g.mySeat, a.mv);
-      // Diğer oyuncular da sırayla vurur.
-      const others = () => {
-        if (g.turn == null || g.turn === g.mySeat) return;
-        golfMockShot(g, g.turn, `a${[3400, 100, 0, 3550][Math.floor(Math.random() * 4)]}p${30 + Math.floor(Math.random() * 30)}`);
-        emit('games', structuredClone(snap.games));
-        setTimeout(others, 1800);
-      };
-      setTimeout(others, 1800);
+      if (!g.botsOn) { g.botsOn = true; golfBots(g); }
       return;
     }
     if (a.kind === 'move') {
@@ -6751,7 +6835,7 @@ function createPreviewApi() {
         const g = gameMock({ id: `gm${Date.now()}`, host: me, hostName: 'Nur', isHost: true, players, joined: [me], status: 'invited', mySeat: seat, createdAt: Date.now(), updatedAt: Date.now(),
           ...(golf ? { game: 'golf', title: 'Mini golf', info: { width: 800, height: 500, ballR: 7, cupR: 11, pupR: 13, levels: 25, maxStrokes: 8, holes: golfHoles, hole: 0, quit: players.map(() => false),
             pupAvail: golfHoles[0].pups.map(() => true), effects: players.map(() => []),
-            balls: players.map(() => ({ x: tee[0], y: tee[1], strokes: 0, done: false })), scores: players.map(() => []), totals: players.map(() => 0), lastShot: null } } : {}) });
+            balls: players.map(() => ({ x: tee[0], y: tee[1], strokes: 0, done: false })), scores: players.map(() => []), totals: players.map(() => 0), shots: [], lastShot: null } } : {}) });
         snap.games.unshift(g);
         setTimeout(() => emit('games', structuredClone(snap.games)), 40);
         return structuredClone(g);

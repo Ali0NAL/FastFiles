@@ -16,7 +16,7 @@ pub mod golf;
 use serde::Serialize;
 use serde_json::Value;
 
-/// Bir hamle metninin en fazla uzunluğu (satrançta `e7e8q`, golfte `a1800p65`).
+/// Bir hamle metninin en fazla uzunluğu (satrançta `e7e8q`, golfte `s1a1800p65`).
 pub const MAX_MOVE_CHARS: usize = 16;
 /// Bir oyundaki en fazla hamle sayısı. Satrançta 50 hamle kuralı bundan çok önce biter.
 pub const MAX_MOVES: usize = 1200;
@@ -72,8 +72,11 @@ pub struct Outcome {
 /// Hamle listesinden hesaplanan oyun durumu.
 #[derive(Debug, Clone)]
 pub struct Eval {
-    /// Sırası gelen koltuk (oyun bittiyse `None`).
+    /// Sırası gelen koltuk (oyun bittiyse ya da herkes aynı anda oynuyorsa `None`).
     pub turn: Option<usize>,
+    /// Şu an hamle yapabilecek koltuklar: sıralı oyunda yalnızca `turn`, golfte deliği henüz
+    /// bitirmemiş herkes (aynı anda oynanır).
+    pub movers: Vec<usize>,
     /// Sıradaki oyuncunun yapabileceği hamleler (sayılabiliyorsa; golfte boş).
     pub legal: Vec<String>,
     pub outcome: Option<Outcome>,
@@ -137,7 +140,17 @@ fn evaluate_uncached(game: &str, seed: &str, players: usize, moves: &[String]) -
     }
 }
 
-/// Sırası gelen oyuncu bu hamleyi yapabilir mi? (`before`: hamleden önceki durum)
+/// Oyuncunun gönderdiği hamlenin odaya yazılacak hâli. Golfte herkes aynı anda vurduğundan
+/// vuruşa vuranın koltuğu eklenir (`a900p50` → `s1a900p50`); diğer oyunlarda olduğu gibi kalır.
+pub fn own_move(game: &str, seat: usize, mv: &str) -> String {
+    match game {
+        "golf" => golf::seat_shot(seat, mv),
+        _ => mv.to_string(),
+    }
+}
+
+/// Bu hamle kurallara uygun mu? (`before`: hamleden önceki durum; kimin yaptığı ayrıca
+/// `move_actor` ve `Eval::movers` ile denetlenir.)
 pub fn move_allowed(game: &str, before: &Eval, mv: &str) -> bool {
     match game {
         "golf" => golf::parse_shot(mv).is_some(),
@@ -145,11 +158,11 @@ pub fn move_allowed(game: &str, before: &Eval, mv: &str) -> bool {
     }
 }
 
-/// Hamleyi hangi koltuk yaptı? Çoğu hamle sırası gelen oyuncunundur; golfte oyundan çekilme
-/// (`q<koltuk>`) sıradan bağımsızdır.
+/// Hamleyi hangi koltuk yaptı? Sıralı oyunda sırası gelen oyuncu; golfte vuruş ve oyundan
+/// çekilme (`q<koltuk>`) koltuğu kendisi taşır.
 pub fn move_actor(game: &str, before: &Eval, mv: &str) -> Option<usize> {
     match game {
-        "golf" => golf::parse_quit(mv).or(before.turn),
+        "golf" => golf::parse_quit(mv).or_else(|| golf::parse_shot(mv).map(|s| s.0)),
         _ => before.turn,
     }
 }
@@ -180,10 +193,17 @@ mod tests {
         assert!(move_allowed("chess", &e, "e2e4"));
         assert!(!move_allowed("chess", &e, "e2e5"));
         assert_eq!(forfeit_move("chess", 0), None);
+        assert_eq!(e.movers, vec![0]);
         let g = evaluate("golf", "r", 3, &[]).unwrap();
-        assert!(move_allowed("golf", &g, "a900p50"));
+        assert_eq!(g.turn, None);
+        assert_eq!(g.movers, vec![0, 1, 2], "golfte herkes aynı anda vurur");
+        assert_eq!(own_move("golf", 1, "a900p50"), "s1a900p50");
+        assert_eq!(own_move("golf", 1, "s2a900p50"), "s2a900p50");
+        assert_eq!(own_move("chess", 1, "e2e4"), "e2e4");
+        assert!(move_allowed("golf", &g, "s1a900p50"));
+        assert!(!move_allowed("golf", &g, "a900p50"), "koltuksuz vuruş odaya yazılmaz");
         assert!(!move_allowed("golf", &g, "q1"), "çekilme bir vuruş değildir");
         assert_eq!(move_actor("golf", &g, "q2"), Some(2));
-        assert_eq!(move_actor("golf", &g, "a900p50"), Some(0));
+        assert_eq!(move_actor("golf", &g, "s2a900p50"), Some(2));
     }
 }

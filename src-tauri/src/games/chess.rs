@@ -486,6 +486,7 @@ pub fn evaluate(moves: &[String]) -> Result<Eval, String> {
     }
     Ok(Eval {
         turn: outcome.is_none().then(|| pos.side.seat()),
+        movers: if outcome.is_none() { vec![pos.side.seat()] } else { Vec::new() },
         legal: if outcome.is_none() { legal.iter().map(Move::uci).collect() } else { Vec::new() },
         outcome,
         info: json!({

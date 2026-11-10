@@ -282,6 +282,8 @@ fn apply(room: &GameRoom, sender: &str, action: &GameAction) -> Result<Option<Ga
             _ => return Err("closed"),
         },
         GameAction::Move { mv, at } => {
+            // Golfte vuruşa vuranın koltuğu eklenir (herkes aynı anda vurur).
+            let mv = &games::own_move(&r.game, seat, mv);
             // Gönderildiği sıradan bu yana bu oyuncunun aynı hamlesi işlendiyse istek yinelenmiştir
             // (arada başkası oyundan çekildiyse sıra kaymış olabilir).
             if let Some(at) = *at {
@@ -301,10 +303,10 @@ fn apply(room: &GameRoom, sender: &str, action: &GameAction) -> Result<Option<Ga
                 return Err("illegal");
             }
             let now = games::evaluate(&r.game, &r.id, n, &r.moves).map_err(|_| "invalid")?;
-            if now.turn != Some(seat) {
+            if !now.movers.contains(&seat) {
                 return Err("not_your_turn");
             }
-            if !games::move_allowed(&r.game, &now, mv) {
+            if games::move_actor(&r.game, &now, mv) != Some(seat) || !games::move_allowed(&r.game, &now, mv) {
                 return Err("illegal");
             }
             r.moves.push(mv.clone());
@@ -435,7 +437,8 @@ impl Node {
         let active = room.status == RoomStatus::Active;
         let turn = if active { eval.as_ref().and_then(|e| e.turn) } else { None };
         let pending = !st.outbox.is_empty();
-        let my_turn = active && turn.is_some() && turn == seat && !pending;
+        let can_move = active && seat.is_some_and(|s| eval.as_ref().is_some_and(|e| e.movers.contains(&s)));
+        let my_turn = can_move && !pending;
         let invited = room.status == RoomStatus::Invited && seat.is_some() && !room.joined.contains(me) && !pending;
         let draw_for_me = active && !pending && room.draw_offer.as_ref().is_some_and(|d| d != me);
         GameView {
@@ -912,8 +915,8 @@ impl Node {
         if new.draw_offer.is_some() && new.draw_offer != old.draw_offer && new.draw_offer.as_deref() != Some(me) {
             return Some(("Beraberlik teklifi".into(), format!("{host} beraberlik teklif ediyor")));
         }
-        if new.moves.len() > old.moves.len() && new.status == RoomStatus::Active && eval.turn == new.seat_of(me) {
-            return Some((format!("Sıra sizde · {title}"), last_move_text(new, eval)));
+        if new.moves.len() > old.moves.len() && new.status == RoomStatus::Active {
+            return my_move_notice(old, new, eval, me);
         }
         None
     }
@@ -992,11 +995,30 @@ impl Node {
             GameAction::OfferDraw => Some(("Beraberlik teklifi".into(), format!("{who} beraberlik teklif ediyor"))),
             GameAction::Move { .. } => {
                 let eval = games::evaluate(&new.game, &new.id, new.players.len(), &new.moves).ok()?;
-                (eval.turn == new.seat_of(me)).then(|| (format!("Sıra sizde · {title}"), last_move_text(new, &eval)))
+                my_move_notice(old, new, &eval, me)
             }
             _ => None,
         }
     }
+}
+
+/// Hamle yapma sırası bana yeni geldiyse bildirim: satrançta "Sıra sizde", golfte (herkes aynı
+/// anda oynadığı için) yalnızca yeni delik başlarken.
+fn my_move_notice(old: &GameRoom, new: &GameRoom, eval: &games::Eval, me: &str) -> Option<(String, String)> {
+    let seat = new.seat_of(me)?;
+    if !eval.movers.contains(&seat) {
+        return None;
+    }
+    let was = games::evaluate(&old.game, &old.id, old.players.len(), &old.moves).ok();
+    if was.as_ref().is_some_and(|w| w.movers.contains(&seat)) {
+        return None;
+    }
+    let title = game_title(&new.game);
+    if eval.turn.is_none() {
+        let hole = eval.info["hole"].as_u64().unwrap_or(0) + 1;
+        return Some((format!("{title} · {hole}. delik başladı"), "Herkes aynı anda vuruyor".into()));
+    }
+    Some((format!("Sıra sizde · {title}"), last_move_text(new, eval)))
 }
 
 /// Bildirimde son hamlenin kısa anlatımı: satrançta "Ali: Vxf7", golfte "Ali vurdu · 3. delik".
@@ -1073,26 +1095,40 @@ mod tests {
         assert_eq!(apply(&room(), &a, &GameAction::Decline).unwrap().unwrap().status, RoomStatus::Cancelled);
     }
 
-    /// Yanıtı kaybolan vuruş yeniden gelirse ikinci kez işlenmez — sıra yine aynı oyuncuda olsa bile.
+    /// Golfte herkes aynı anda vurur. Yanıtı kaybolan vuruş yeniden gelirse, arada başkaları
+    /// vurmuş olsa bile ikinci kez işlenmez; kimse başkası adına vuramaz.
     #[test]
-    fn retried_golf_shot_is_not_applied_twice() {
+    fn simultaneous_golf_shots() {
         let (a, b) = ("a".repeat(64), "b".repeat(64));
         let mut r = room();
         r.game = "golf".into();
         r.status = RoomStatus::Active;
         r.joined = vec![a.clone(), b.clone()];
-        // 1. delik: ikisi sırayla en hafif vuruşu yapar; Alice 8'e ulaşınca bitirir.
-        r.moves = vec!["a0p1".to_string(); 15];
-        let shot = GameAction::Move { mv: "a0p1".into(), at: Some(15) };
-        let next = apply(&r, &b, &shot).unwrap().unwrap();
-        assert_eq!(next.moves.len(), 16);
-        // Bob deliği bitirdi; 2. delik Bob ile başlar: sıra yine onda.
-        let e = games::evaluate("golf", &next.id, 2, &next.moves).unwrap();
-        assert_eq!(e.turn, Some(1));
-        assert_eq!(apply(&next, &b, &shot), Ok(None), "aynı vuruş yinelendi, yeniden işlenmemeli");
-        // Yeni bir vuruş (yeni sıra numarasıyla) normal işlenir.
-        let again = GameAction::Move { mv: "a0p1".into(), at: Some(16) };
-        assert_eq!(apply(&next, &b, &again).unwrap().unwrap().moves.len(), 17);
+        let shot = |at| GameAction::Move { mv: "a0p1".into(), at: Some(at) };
+        // İkisi de sıra beklemeden vurur; vuruş vuranın koltuğuyla yazılır.
+        let r = apply(&r, &b, &shot(0)).unwrap().unwrap();
+        let r = apply(&r, &a, &shot(0)).unwrap().unwrap();
+        assert_eq!(r.moves, vec!["s1a0p1", "s0a0p1"]);
+        assert_eq!(apply(&r, &b, &shot(0)), Ok(None), "aynı vuruş yinelendi, yeniden işlenmemeli");
+        assert_eq!(apply(&r, &b, &shot(1)).unwrap().unwrap().moves.len(), 3, "yeni vuruş işlenir");
+        let forged = GameAction::Move { mv: "s0a0p1".into(), at: Some(2) };
+        assert_eq!(apply(&r, &b, &forged), Err("illegal"), "başkası adına vuruş");
+        // Banu deliği bitirince (8 vuruş) Ali bitirene kadar bekler.
+        let mut r = r;
+        for _ in 0..7 {
+            r = apply(&r, &b, &shot(r.moves.len())).unwrap().unwrap();
+        }
+        let e = games::evaluate("golf", &r.id, 2, &r.moves).unwrap();
+        assert_eq!(e.movers, vec![0]);
+        assert_eq!(e.info["hole"], 0);
+        assert_eq!(apply(&r, &b, &shot(r.moves.len())), Err("not_your_turn"));
+        for _ in 0..7 {
+            r = apply(&r, &a, &shot(r.moves.len())).unwrap().unwrap();
+        }
+        // Herkes bitirdi: 2. delik ikisi için birlikte başlar.
+        let e = games::evaluate("golf", &r.id, 2, &r.moves).unwrap();
+        assert_eq!(e.info["hole"], 1);
+        assert_eq!(e.movers, vec![0, 1]);
     }
 
     #[test]

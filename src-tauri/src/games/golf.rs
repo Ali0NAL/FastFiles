@@ -27,6 +27,8 @@ use serde_json::{json, Value};
 
 pub const MAX_STROKES: u32 = 8;
 /// Bir oyunda oynanan delik sayısı (`HOLES` içinden rastgele seçilir).
+/// Arayüze gönderilen son vuruş sayısı (aynı anda gelen vuruşlar birlikte canlandırılır).
+const RECENT_SHOTS: usize = 12;
 pub const HOLES_PER_GAME: usize = 6;
 const WIDTH: f64 = 800.0;
 const HEIGHT: f64 = 500.0;
@@ -499,12 +501,25 @@ pub fn quit_move(seat: usize) -> String {
     format!("q{seat}")
 }
 
-/// `a<açı>p<güç>` → (açı, güç). Yalnızca kanonik yazım kabul edilir (baştaki sıfır yok).
-pub fn parse_shot(mv: &str) -> Option<(u32, u32)> {
-    let rest = mv.strip_prefix('a')?;
+/// `s<koltuk>a<açı>p<güç>` → (koltuk, açı, güç). Yalnızca kanonik yazım kabul edilir (baştaki
+/// sıfır yok). Herkes aynı anda vurduğu için vuruş, kimin vuruşu olduğunu kendisi taşır.
+pub fn parse_shot(mv: &str) -> Option<(usize, u32, u32)> {
+    let rest = mv.strip_prefix('s')?;
+    let (s, rest) = rest.split_once('a')?;
     let (a, p) = rest.split_once('p')?;
-    let (a, p): (u32, u32) = (a.parse().ok()?, p.parse().ok()?);
-    (a < 3600 && (1..=100).contains(&p) && format!("a{a}p{p}") == mv).then_some((a, p))
+    let (s, a, p): (usize, u32, u32) = (s.parse().ok()?, a.parse().ok()?, p.parse().ok()?);
+    (s < 6 && a < 3600 && (1..=100).contains(&p) && format!("s{s}a{a}p{p}") == mv).then_some((s, a, p))
+}
+
+/// Arayüzün gönderdiği `a<açı>p<güç>` vuruşunu oyuncunun koltuğuyla tamamlar (zaten koltuklu
+/// ya da başka türden hamle olduğu gibi kalır; başkasının koltuğu yazılmışsa kurallar reddeder).
+pub fn seat_shot(seat: usize, mv: &str) -> String {
+    let full = format!("s{seat}{mv}");
+    if mv.starts_with('a') && parse_shot(&full).is_some() {
+        full
+    } else {
+        mv.to_string()
+    }
 }
 
 pub fn parse_quit(mv: &str) -> Option<usize> {
@@ -847,6 +862,9 @@ pub fn evaluate(seed: &str, players: usize, moves: &[String]) -> Result<Eval, St
     play(&course(seed), players, moves)
 }
 
+/// Herkes aynı anda oynar: deliği bitirmemiş her oyuncu istediği an vurabilir (vuruşlar
+/// sahibe ulaştığı sırayla işlenir). Bir sonraki delik, herkes bu deliği bitirince (ya da
+/// çekilince) herkes için birlikte başlar.
 fn play(course: &Course, players: usize, moves: &[String]) -> Result<Eval, String> {
     let n = players;
     if !(2..=6).contains(&n) {
@@ -859,14 +877,13 @@ fn play(course: &Course, players: usize, moves: &[String]) -> Result<Eval, Strin
     let mut fx = vec![Effects::default(); n];
     let mut avail = vec![true; holes[0].pups.len()];
     let mut scores: Vec<Vec<Option<u32>>> = vec![Vec::new(); n];
-    let mut last: Value = Value::Null;
+    // Son vuruşlar: arayüz, son güncellemeden bu yana gelen her vuruşu aynı anda canlandırır.
+    let mut recent: Vec<Value> = Vec::new();
     let mut outcome: Option<Outcome> = None;
     let mut shot_no = 0usize;
-    // Sıradaki oyuncu: `from` dahil, çekilmemiş ve deliği bitirmemiş ilk koltuk.
-    let pick = |from: usize, balls: &[Ball], quit: &[bool]| (0..n).map(|k| (from + k) % n).find(|&c| !quit[c] && !balls[c].done);
-    let mut turn = pick(0, &balls, &quit);
+    let playing = |s: usize, balls: &[Ball], quit: &[bool]| !quit[s] && !balls[s].done;
 
-    for mv in moves {
+    for (ply, mv) in moves.iter().enumerate() {
         if outcome.is_some() {
             return Err("oyun bitmişken hamle".into());
         }
@@ -875,17 +892,15 @@ fn play(course: &Course, players: usize, moves: &[String]) -> Result<Eval, Strin
                 return Err("geçersiz çekilme".into());
             }
             quit[seat] = true;
-            if turn == Some(seat) {
-                turn = pick((seat + 1) % n, &balls, &quit);
-            }
             let left: Vec<usize> = (0..n).filter(|&s| !quit[s]).collect();
             if left.len() <= 1 {
                 outcome = Some(Outcome { winner: left.first().copied(), reason: "forfeit" });
-                turn = None;
                 continue;
             }
-        } else if let Some((angle, power)) = parse_shot(mv) {
-            let s = turn.ok_or("sıra kimsede değil")?;
+        } else if let Some((s, angle, power)) = parse_shot(mv) {
+            if s >= n || !playing(s, &balls, &quit) {
+                return Err("bu oyuncu şu an vuramaz".into());
+            }
             let h = holes[hole];
             let start = balls[s].pos.unwrap_or(h.tee);
             let used = fx[s];
@@ -899,7 +914,8 @@ fn play(course: &Course, players: usize, moves: &[String]) -> Result<Eval, Strin
                 avail[i] = false;
                 let kind = course.kinds[hole][i];
                 if kind.hits_others() {
-                    for o in (0..n).filter(|&o| o != s && !quit[o]) {
+                    // Deliği hâlâ oynayan rakipler etkilenir.
+                    for o in (0..n).filter(|&o| o != s && playing(o, &balls, &quit)) {
                         match kind {
                             Pup::Slow => fx[o].slow = true,
                             Pup::Shaky => fx[o].shaky = true,
@@ -918,7 +934,8 @@ fn play(course: &Course, players: usize, moves: &[String]) -> Result<Eval, Strin
                 b.done = true;
                 b.strokes = b.strokes.min(MAX_STROKES);
             }
-            last = json!({
+            recent.push(json!({
+                "ply": ply,
                 "seat": s,
                 "hole": hole,
                 "result": match shot.result { ShotEnd::In => "in", ShotEnd::Water => "water", ShotEnd::Stop if b.done => "max", ShotEnd::Stop => "stop" },
@@ -929,13 +946,15 @@ fn play(course: &Course, players: usize, moves: &[String]) -> Result<Eval, Strin
                 "shake": r1(mods.shake),
                 "picked": picked,
                 "avail": before,
-            });
-            turn = pick((s + 1) % n, &balls, &quit);
+            }));
+            if recent.len() > RECENT_SHOTS {
+                recent.remove(0);
+            }
         } else {
             return Err(format!("geçersiz hamle: {mv}"));
         }
-        // Delik bitti mi?
-        if turn.is_none() {
+        // Delik herkes bitirince (ya da çekilince) biter; sonraki delik herkes için birlikte başlar.
+        if (0..n).all(|s| !playing(s, &balls, &quit)) {
             for s in 0..n {
                 scores[s].push((!quit[s]).then_some(balls[s].strokes));
             }
@@ -952,15 +971,18 @@ fn play(course: &Course, players: usize, moves: &[String]) -> Result<Eval, Strin
             } else {
                 hole += 1;
                 balls = vec![Ball::default(); n];
+                fx = vec![Effects::default(); n];
                 avail = vec![true; holes[hole].pups.len()];
-                turn = pick(hole % n, &balls, &quit);
             }
         }
     }
 
     let h = holes[hole];
+    let movers: Vec<usize> =
+        if outcome.is_none() { (0..n).filter(|&s| playing(s, &balls, &quit)).collect() } else { Vec::new() };
     Ok(Eval {
-        turn: if outcome.is_none() { turn } else { None },
+        turn: None,
+        movers,
         legal: Vec::new(),
         info: json!({
             "width": WIDTH,
@@ -981,7 +1003,8 @@ fn play(course: &Course, players: usize, moves: &[String]) -> Result<Eval, Strin
             "quit": quit,
             "scores": scores,
             "totals": scores.iter().map(|s| s.iter().flatten().sum::<u32>()).collect::<Vec<_>>(),
-            "lastShot": last,
+            "shots": recent,
+            "lastShot": recent.last().cloned().unwrap_or(Value::Null),
         }),
         outcome,
     })
@@ -1002,11 +1025,14 @@ mod tests {
 
     #[test]
     fn move_formats() {
-        assert_eq!(parse_shot("a1800p65"), Some((1800, 65)));
-        assert_eq!(parse_shot("a0p1"), Some((0, 1)));
-        for bad in ["a3600p50", "a10p0", "a10p101", "a010p5", "ap5", "a10", "b10p5", "a10p5x"] {
+        assert_eq!(parse_shot("s0a1800p65"), Some((0, 1800, 65)));
+        assert_eq!(parse_shot("s5a0p1"), Some((5, 0, 1)));
+        for bad in ["a1800p65", "s6a10p5", "s01a10p5", "sa10p5", "s1a3600p50", "s1a10p0", "s1a10p101", "s1a010p5", "s1ap5", "s1a10", "s1b10p5", "s1a10p5x"] {
             assert_eq!(parse_shot(bad), None, "{bad}");
         }
+        assert_eq!(seat_shot(2, "a10p5"), "s2a10p5");
+        assert_eq!(seat_shot(2, "q2"), "q2");
+        assert_eq!(seat_shot(2, "a10p0"), "a10p0");
         assert_eq!(parse_quit("q3"), Some(3));
         assert_eq!(parse_quit("q03"), None);
         assert!(evaluate("r", 3, &shots(&["q5"])).is_err());
@@ -1156,7 +1182,7 @@ mod tests {
         let h = &HOLES[0];
         let ang = ((195.0 - h.tee.1) as f64).atan2(400.0 - h.tee.0).to_degrees();
         let deg10 = ((ang * 10.0).round() as i64).rem_euclid(3600);
-        let shot = format!("a{deg10}p45");
+        let shot = format!("s0a{deg10}p45");
         assert!(parse_shot(&shot).is_some());
 
         let c = fixed(Pup::Slow);
@@ -1165,68 +1191,90 @@ mod tests {
         assert_eq!(e.info["lastShot"]["picked"][0][1], "slow");
         assert_eq!(e.info["effects"], json!([[], ["slow"], ["slow"]]));
         // Yavaşlatılan oyuncu aynı vuruşla daha kısa gider; etki bir vuruşta biter.
-        let e = play(&c, 3, &[shot.clone(), "a0p40".into()]).unwrap();
+        let e = play(&c, 3, &[shot.clone(), "s1a0p40".into()]).unwrap();
         assert_eq!(e.info["lastShot"]["mods"], json!(["slow"]));
         let slowed_x = e.info["balls"][1]["x"].as_f64().unwrap();
         assert_eq!(e.info["effects"], json!([[], [], ["slow"]]));
-        let e = play(&fixed(Pup::Turbo), 3, &[shot.clone(), "a0p40".into()]).unwrap();
+        let e = play(&fixed(Pup::Turbo), 3, &[shot.clone(), "s1a0p40".into()]).unwrap();
         assert_eq!(e.info["effects"], json!([["turbo"], [], []]), "kendine etki yalnızca alana");
         let normal_x = e.info["balls"][1]["x"].as_f64().unwrap();
         assert!(slowed_x < normal_x - 50.0, "{slowed_x} {normal_x}");
-        // Aynı power-up ikinci kez alınamaz.
-        let e = play(&c, 3, &[shot.clone(), shot.clone()]).unwrap();
+        // Aynı power-up ikinci kez alınamaz (Elif de aynı yere vursa).
+        let e = play(&c, 3, &[shot.clone(), shot.replace("s0", "s2")]).unwrap();
         assert_eq!(e.info["lastShot"]["picked"], json!([]));
         // Sapma etkisi oyunun tohumuyla herkeste aynı sonucu verir.
-        let a = play(&fixed(Pup::Shaky), 2, &[shot.clone(), "a0p40".into()]).unwrap();
-        let b = play(&fixed(Pup::Shaky), 2, &[shot.clone(), "a0p40".into()]).unwrap();
+        let a = play(&fixed(Pup::Shaky), 2, &[shot.clone(), "s1a0p40".into()]).unwrap();
+        let b = play(&fixed(Pup::Shaky), 2, &[shot.clone(), "s1a0p40".into()]).unwrap();
         assert_eq!(a.info, b.info);
         assert_ne!(a.info["lastShot"]["shake"], 0.0);
     }
 
     #[test]
-    fn turns_holes_and_scoring() {
+    fn holes_and_scoring() {
         // Herkes hep en hafif vuruşu yaparsa her delikte 8'e ulaşılır; berabere biter.
         let n = 3;
         let mut moves = Vec::new();
-        let mut first_turns = Vec::new();
         for hole in 0..HOLES_PER_GAME {
             let e = evaluate("oda", n, &moves).unwrap();
             assert_eq!(e.info["hole"], hole);
+            assert_eq!(e.movers, vec![0, 1, 2], "her delik herkes için birlikte başlar");
             assert_eq!(e.info["pupAvail"].as_array().unwrap().len(), e.info["holes"][hole]["pups"].as_array().unwrap().len());
-            first_turns.push(e.turn.unwrap());
-            for _ in 0..(MAX_STROKES as usize * n) {
-                moves.push("a0p1".to_string());
+            // Vuruş sırası serbest: önce 2 hep vurur, sonra 0 ve 1 karışık.
+            for _ in 0..MAX_STROKES {
+                moves.push("s2a0p1".to_string());
+            }
+            for _ in 0..MAX_STROKES {
+                moves.push("s0a0p1".to_string());
+                moves.push("s1a0p1".to_string());
             }
         }
-        assert_eq!(first_turns, vec![0, 1, 2, 0, 1, 2], "ilk vuruş her delikte sıradakine geçer");
         let e = evaluate("oda", n, &moves).unwrap();
         assert_eq!(e.outcome, Some(Outcome { winner: None, reason: "tie" }));
         assert_eq!(e.info["totals"], json!([48, 48, 48]));
-        assert!(evaluate("oda", n, &[moves.clone(), shots(&["a0p1"])].concat()).is_err(), "bitmiş oyuna vuruş olmaz");
+        assert!(e.movers.is_empty());
+        assert!(evaluate("oda", n, &[moves.clone(), shots(&["s0a0p1"])].concat()).is_err(), "bitmiş oyuna vuruş olmaz");
     }
 
     #[test]
-    fn quitting_and_turn_order() {
-        let e = evaluate("r", 3, &shots(&["a0p1"])).unwrap();
-        assert_eq!(e.turn, Some(1));
+    fn simultaneous_play_and_quitting() {
+        // Sıra yok: herkes istediği an, art arda da vurabilir.
+        let e = evaluate("r", 3, &shots(&["s2a0p1", "s2a0p1", "s0a0p1"])).unwrap();
+        assert_eq!(e.turn, None);
+        assert_eq!(e.movers, vec![0, 1, 2]);
+        assert_eq!(e.info["balls"][2]["strokes"], 2);
         assert_eq!(e.info["balls"][0]["strokes"], 1);
-        // Sıradaki oyuncu çekilirse sıra bir sonrakine geçer.
-        let e = evaluate("r", 3, &shots(&["a0p1", "q1"])).unwrap();
-        assert_eq!(e.turn, Some(2));
-        let e = evaluate("r", 3, &shots(&["a0p1", "q1", "a0p1"])).unwrap();
-        assert_eq!(e.turn, Some(0));
-        // Biri dışında herkes çekilirse kalan kazanır.
-        let e = evaluate("r", 3, &shots(&["a0p1", "q1", "q0"])).unwrap();
-        assert_eq!(e.outcome, Some(Outcome { winner: Some(2), reason: "forfeit" }));
-        // Deliği sokan oyuncu o delikte atlanır; en az vuruş kazanır.
+        assert_eq!(e.info["shots"].as_array().unwrap().len(), 3);
+        assert_eq!(e.info["shots"][2]["ply"], 2);
+        assert_eq!(e.info["lastShot"]["seat"], 0);
+        assert!(evaluate("r", 3, &shots(&["s3a0p1"])).is_err(), "olmayan koltuk");
+        // Deliği sokan oyuncu, diğerleri bitirene kadar bekler; sonra yeni delik herkese açılır.
         let c = fixed(Pup::Ghost);
         let p = (30..=90).find(|&p| simulate(&HOLES[0], HOLES[0].tee, 0, p).result == ShotEnd::In).unwrap();
-        let e = play(&c, 2, &shots(&[&format!("a0p{p}"), "a0p1"])).unwrap();
+        let ace = format!("s0a0p{p}");
+        let e = play(&c, 2, &shots(&[&ace, "s1a0p1"])).unwrap();
         assert_eq!(e.info["balls"][0]["done"], true);
-        assert_eq!(e.info["lastShot"]["seat"], 1);
-        assert_eq!(e.turn, Some(1));
+        assert_eq!(e.movers, vec![1]);
+        assert!(play(&c, 2, &shots(&[&ace, "s0a0p1"])).is_err(), "deliği bitiren tekrar vuramaz");
+        let e = play(&c, 2, &shots(&[&ace, &format!("s1a0p{p}")])).unwrap();
+        assert_eq!(e.info["hole"], 1);
+        assert_eq!(e.movers, vec![0, 1]);
+        assert_eq!(e.info["scores"], json!([[1], [1]]));
+        // Bekleyen tek oyuncu çekilirse delik biter.
+        let e = play(&c, 3, &shots(&[&ace, &format!("s1a0p{p}"), "q2"])).unwrap();
+        assert_eq!(e.info["hole"], 1);
+        assert_eq!(e.movers, vec![0, 1]);
+        // Çekilen vuramaz; biri dışında herkes çekilirse kalan kazanır.
+        assert!(evaluate("r", 3, &shots(&["q1", "s1a0p1"])).is_err());
+        let e = evaluate("r", 3, &shots(&["s0a0p1", "q1", "q0"])).unwrap();
+        assert_eq!(e.outcome, Some(Outcome { winner: Some(2), reason: "forfeit" }));
+        // Rakibe etki eden power-up deliği bitirmiş oyuncuya geçmez; etkiler yeni delikte sıfırlanır.
+        let h = &HOLES[0];
+        let ang = ((195.0 - h.tee.1) as f64).atan2(400.0 - h.tee.0).to_degrees();
+        let grab = format!("s1a{}p45", ((ang * 10.0).round() as i64).rem_euclid(3600));
+        let e = play(&fixed(Pup::Slow), 3, &shots(&[&ace, &grab])).unwrap();
+        assert_eq!(e.info["effects"], json!([[], [], ["slow"]]));
         // Aynı vuruş listesi her zaman aynı sonucu verir.
-        assert_eq!(evaluate("r", 2, &shots(&["a450p70", "a3000p55"])).unwrap().info, evaluate("r", 2, &shots(&["a450p70", "a3000p55"])).unwrap().info);
+        assert_eq!(evaluate("r", 2, &shots(&["s1a450p70", "s0a3000p55"])).unwrap().info, evaluate("r", 2, &shots(&["s1a450p70", "s0a3000p55"])).unwrap().info);
     }
 
     /// Her delik makul vuruşla bitirilebilir mi? Deliğe olan yürüme mesafesini (engelleri
