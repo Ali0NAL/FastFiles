@@ -1,0 +1,54 @@
+# macOS kurulum dosyası (.dmg) üretir. Hem Apple Silicon (M1/M2/M3...) hem Intel Mac'te çalışan
+# tek bir "universal" paket çıkar. Derlenen dosya, çalıştırmanın sayfasında "Artifacts" altında.
+#
+# Elle başlatmak için: GitHub → Actions → "macOS derlemesi" → Run workflow.
+name: macOS derlemesi
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src-tauri/**'
+      - 'ui/**'
+      - '.github/workflows/macos.yml'
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust kur
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cargo önbelleği
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Tauri CLI kur
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Derle (universal .dmg)
+        working-directory: src-tauri
+        run: cargo tauri build --target universal-apple-darwin --bundles app,dmg
+
+      - name: Sürümü oku
+        id: ver
+        run: echo "version=$(jq -r .version src-tauri/tauri.conf.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Kurulum dosyasını yükle
+        uses: actions/upload-artifact@v4
+        with:
+          name: FastFiles_${{ steps.ver.outputs.version }}_macOS
+          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 30

@@ -26,7 +26,7 @@
       <button class="btn small work-btn fun-only" id="btn-work-mode" title="Eğlence özelliklerini kapatıp iş moduna dönün">
         <svg viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="13" rx="2"/><path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M3 13h18"/></svg>Ofis moduna dön
       </button>
-      <button class="btn soft small office-btn fun-only" id="btn-office" title="Ofisin 3B görünümü: kim nerede oturuyor, kim kime ne gönderiyor">
+      <button class="btn soft small office-btn" id="btn-office" title="Ofisin 3B görünümü: kim nerede oturuyor, kim kime ne gönderiyor">
         <svg viewBox="0 0 24 24"><path d="M3 10h18l-1.5 2.5h-15z"/><path d="M6 12.5V20M18 12.5V20"/><circle cx="8" cy="5.5" r="1.8"/><circle cx="16" cy="5.5" r="1.8"/></svg>Ofis
       </button>
       <button class="btn soft small games-btn fun-only" id="btn-games" title="Arkadaşlarınızla oyun oynayın">
@@ -217,12 +217,16 @@
             <button class="btn soft small" id="share-add-files" title="Dosya ekle">
               <svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 11v6M9 14h6"/></svg>Ekle
             </button>
-            <button class="btn ghost small" id="share-add-folder" title="Klasör ekle">
+            <button class="btn ghost small" id="share-add-folder" title="Bilgisayardan klasör ekle">
               <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 10v6M9 13h6"/></svg>
             </button>
+            <button class="btn ghost small" id="share-mkdir" title="Seçili klasörün içinde yeni (boş) klasör oluştur">
+              <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M15 10.5v5M12.5 13h5" stroke-width="2.2"/></svg>Yeni klasör
+            </button>
           </div>
+          <div class="share-loc" id="share-loc"></div>
           <div class="share-files" id="share-files"></div>
-          <div class="composer-note" id="share-note">Dosyaları buraya sürükleyip bırakabilir veya Gezgin'de klasöre kopyalayabilirsiniz.</div>
+          <div class="composer-note" id="share-note">Dosyaları bir klasörün üzerine sürükleyip bırakabilir veya Gezgin'de klasöre kopyalayabilirsiniz.</div>
         </div>
       </div>
 
@@ -327,7 +331,7 @@
     </aside>
   </main>
 
-  <!-- Oyunlar, Arena, Sanal ofis, Birlikte izle ve ekran animasyonları yalnızca eğlence modunda
+  <!-- Oyunlar, Arena, Birlikte izle ve ekran animasyonları yalnızca eğlence modunda
        (logoya 3 sn basılı tutup "mola" şifresi). İş modunda `.fun-only` öğeler gizlenir. -->
 
   <!-- Oyunlar: sol tarafta oyun listesi, sağda oyun seçimi ya da açık oyun odası -->
@@ -408,7 +412,7 @@
   <div class="arena-screen fun-only" id="arena-screen" hidden></div>
 
   <!-- Sanal ofis: masanın 3B dijital ikizi -->
-  <section class="office-screen fun-only" id="office-screen" hidden>
+  <section class="office-screen" id="office-screen" hidden>
     <div class="office-stage" id="office-stage"></div>
     <div class="office-hud office-tl">
       <button class="icon-btn sm" id="office-close" title="Ofisten çık (Esc)"><svg viewBox="0 0 24 24"><path d="M15 18 9 12l6-6"/></svg></button>

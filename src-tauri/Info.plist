@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- macOS 15+: yerel ağ erişimi izni istenirken gösterilen açıklama. -->
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>FastFiles, aynı ağdaki bilgisayarları bulmak ve onlarla dosya alışverişi yapmak için yerel ağa erişir.</string>
+</dict>
+</plist>

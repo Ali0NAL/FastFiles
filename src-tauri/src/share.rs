@@ -8,6 +8,11 @@
 //! - Her dosya için bir kayıt tutulur: yol, boyut, dosyanın kendi değişim zamanı (mtime),
 //!   sürüm (`version`, değişikliğin fark edildiği an) ve yazan cihaz. Aynı dosyada çakışmada
 //!   (version, yazan) büyük olan kazanır. Silme bir "mezar taşı" kaydıdır, o da yayılır.
+//! - Klasörler de kayıttır (`dir`): boş klasörler ve alt klasör ağacı herkeste aynı olur. Klasör
+//!   silmesi en derindekinden başlayarak uygulanır ve klasör yalnızca boşsa kaldırılır.
+//! - Yeniden adlandırma/taşıma, eski yolun silinmesi + yeni yolun eklenmesi olarak yayılır; alıcı,
+//!   aynı boyut ve değişim zamanına sahip (ve adı ya da bulunduğu klasörü aynı) silinen dosyayı
+//!   indirmek yerine yeni yerine taşır. Büyük bir klasörü yeniden adlandırmak yeniden indirme gerektirmez.
 //! - Üzerine yazılacak veya silinecek yerel dosya önce `.fastfiles\silinen` klasörüne taşınır:
 //!   yanlışlıkla silme/çakışmada hiçbir şey kaybolmaz.
 //!
@@ -36,6 +41,91 @@ const UNLOCK_WINDOW: Duration = Duration::from_secs(300);
 const MIN_PASSWORD_CHARS: usize = 4;
 /// Paylaşılan klasörün içinde FastFiles'ın kendi kullandığı (taranmayan) klasör.
 pub const SHARE_META_DIR: &str = ".fastfiles";
+/// Klasör kayıtlarını anlayan ilk sürüm. Daha eski cihazlara klasör kaydı gönderilmez (boş
+/// klasörü dosya sanıp aynı adla boş dosya oluşturabilirlerdi).
+const DIRS_MIN_VERSION: (u64, u64, u64) = (1, 12, 0);
+
+fn supports_dirs(version: &str) -> bool {
+    crate::update::parse_version(version).map_or(false, |v| v >= DIRS_MIN_VERSION)
+}
+
+/// Karşı cihazın sürümüne göre gönderilecek kayıtlar.
+fn entries_for(entries: Vec<ShareEntry>, version: &str) -> Vec<ShareEntry> {
+    if supports_dirs(version) {
+        entries
+    } else {
+        entries.into_iter().filter(|e| !e.dir).collect()
+    }
+}
+
+/// `/` ile ayrılmış göreli yolu bu sistemin yoluna çevirir.
+fn rel_os(rel: &str) -> String {
+    rel.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
+/// Kullanıcının yazdığı klasör/dosya adı: tek parça, güvenli. Geçersizse hata.
+fn clean_item_name(name: &str) -> Result<String, String> {
+    let name = sanitize_text(name, 120);
+    if name.is_empty() {
+        return Err("Ad boş olamaz".into());
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("Ad / ya da \\ içeremez".into());
+    }
+    let parts = sanitize_rel_path(&name).ok_or("Geçersiz ad")?;
+    if parts.len() != 1 || parts[0].eq_ignore_ascii_case(SHARE_META_DIR) || ignored(&parts[0]) {
+        return Err("Bu ad kullanılamaz".into());
+    }
+    Ok(parts.into_iter().next().unwrap())
+}
+
+/// Ortak klasör içindeki göreli yolu temizler ("" = kök).
+fn clean_rel(rel: &str) -> Result<String, String> {
+    if rel.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let parts = sanitize_rel_path(rel).ok_or("Geçersiz yol")?;
+    if parts[0].eq_ignore_ascii_case(SHARE_META_DIR) {
+        return Err("Geçersiz yol".into());
+    }
+    Ok(parts.join("/"))
+}
+
+fn file_name_of(rel: &str) -> &str {
+    rel.rsplit('/').next().unwrap_or(rel)
+}
+
+fn parent_of(rel: &str) -> &str {
+    rel.rsplit_once('/').map_or("", |(p, _)| p)
+}
+
+/// Silinen yerel dosya ile yeni gelen dosya aynı içerik mi? (Yeniden adlandırma/taşıma tespiti.)
+fn same_content(old: &ShareEntry, new: &ShareEntry) -> bool {
+    !old.dir
+        && !new.dir
+        && old.size == new.size
+        && old.mtime == new.mtime
+        && (file_name_of(&old.path).eq_ignore_ascii_case(file_name_of(&new.path))
+            || parent_of(&old.path).eq_ignore_ascii_case(parent_of(&new.path)))
+}
+
+/// Klasör boşsa (ya da yalnızca sistem dosyaları varsa) kaldırır.
+fn remove_dir_if_empty(p: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(p) else { return false };
+    let mut junk = Vec::new();
+    for e in rd.flatten() {
+        let is_file = e.file_type().map_or(false, |t| t.is_file());
+        if is_file && ignored(&e.file_name().to_string_lossy()) {
+            junk.push(e.path());
+        } else {
+            return false;
+        }
+    }
+    for j in junk {
+        let _ = std::fs::remove_file(j);
+    }
+    std::fs::remove_dir(p).is_ok()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
@@ -81,6 +171,9 @@ pub struct ShareEntry {
     pub author: String,
     #[serde(default)]
     pub deleted: bool,
+    /// Klasör kaydı (boyut ve zaman 0). 1.12.0'dan eski sürümlere gönderilmez.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dir: bool,
 }
 
 impl ShareEntry {
@@ -154,6 +247,8 @@ pub struct ShareFileView {
     pub author: String,
     pub author_name: String,
     pub full_path: String,
+    /// Klasör mü (ağaç görünümü; boş klasörler de listelenir)?
+    pub dir: bool,
 }
 
 fn key_of(path: &str) -> String {
@@ -233,7 +328,7 @@ fn digest_of(entries: &HashMap<String, ShareEntry>) -> String {
     let mut h = Sha256::new();
     for k in keys {
         let e = &entries[k];
-        h.update(format!("{}|{}|{}|{}|{}|{}\n", e.path, e.size, e.mtime, e.version, e.author, e.deleted));
+        h.update(format!("{}|{}|{}|{}|{}|{}|{}\n", e.path, e.size, e.mtime, e.version, e.author, e.deleted, e.dir));
     }
     hex::encode(h.finalize())[..16].to_string()
 }
@@ -292,9 +387,9 @@ fn chrono_stamp() -> String {
     format!("{}", now_ms())
 }
 
-/// Klasördeki dosyaları listeler (FastFiles'ın kendi klasörü ve geçici dosyalar hariç).
-/// İkinci değer: listeleme eksiksiz mi (okunamayan alt klasör/dosya yoksa `true`).
-fn list_dir(dir: &Path) -> (Vec<(String, u64, u64)>, bool) {
+/// Klasördeki dosya ve alt klasörleri listeler (FastFiles'ın kendi klasörü ve geçici dosyalar
+/// hariç): (yol, boyut, zaman, klasör mü). İkinci değer: listeleme eksiksiz mi.
+fn list_dir(dir: &Path) -> (Vec<(String, u64, u64, bool)>, bool) {
     let mut out = Vec::new();
     let mut complete = true;
     let walker = walkdir::WalkDir::new(dir).follow_links(false).into_iter().filter_entry(|e| {
@@ -305,16 +400,21 @@ fn list_dir(dir: &Path) -> (Vec<(String, u64, u64)>, bool) {
             complete = false;
             continue;
         };
-        if !entry.file_type().is_file() || ignored(&entry.file_name().to_string_lossy()) {
+        let is_dir = entry.file_type().is_dir();
+        if entry.depth() == 0 || !(is_dir || entry.file_type().is_file()) || ignored(&entry.file_name().to_string_lossy()) {
             continue;
         }
         let Ok(rel) = entry.path().strip_prefix(dir) else { continue };
+        let rel = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/");
+        if is_dir {
+            out.push((rel, 0, 0, true));
+            continue;
+        }
         let Ok(meta) = entry.metadata() else {
             complete = false;
             continue;
         };
-        let rel = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/");
-        out.push((rel, meta.len(), meta.modified().map(system_ms).unwrap_or(0)));
+        out.push((rel, meta.len(), meta.modified().map(system_ms).unwrap_or(0), false));
     }
     (out, complete)
 }
@@ -346,7 +446,7 @@ impl Node {
 
     fn summary_of(&self, st: &ShareState) -> ShareSummary {
         let me = &self.identity.fingerprint;
-        let live: Vec<&ShareEntry> = st.entries.values().filter(|e| !e.deleted).collect();
+        let live: Vec<&ShareEntry> = st.entries.values().filter(|e| !e.deleted && !e.dir).collect();
         ShareSummary {
             id: st.info.id.clone(),
             name: st.info.name.clone(),
@@ -396,6 +496,7 @@ impl Node {
                     st.info.member_name(&e.author).map(str::to_string).or_else(|| self.known_name_any(&e.author)).unwrap_or_else(|| "Bilinmeyen".into())
                 },
                 full_path: dir.join(e.path.replace('/', std::path::MAIN_SEPARATOR_STR)).to_string_lossy().into_owned(),
+                dir: e.dir,
             })
             .collect();
         files.sort_by(|a, b| b.mtime.cmp(&a.mtime));
@@ -641,15 +742,97 @@ impl Node {
     }
 
     /// Dosya/klasörleri ortak klasöre kopyalar (sonraki taramada diğer üyelere gider).
-    pub async fn share_add_files(self: &Arc<Self>, id: &str, paths: Vec<String>) -> Result<usize, String> {
-        let dir = {
-            let map = self.shares.lock().unwrap();
-            let st = map.get(id).ok_or("Klasör bulunamadı")?;
-            if st.left || !st.info.can_access(&self.identity.fingerprint) {
-                return Err("Bu klasöre dosya ekleyemezsiniz".into());
+    /// Yazılabilir ortak klasörün yerel yolu.
+    fn share_writable_dir(&self, id: &str) -> Result<PathBuf, String> {
+        let map = self.shares.lock().unwrap();
+        let st = map.get(id).ok_or("Klasör bulunamadı")?;
+        if st.left || !st.info.can_access(&self.identity.fingerprint) {
+            return Err("Bu klasörü değiştiremezsiniz".into());
+        }
+        Ok(PathBuf::from(&st.dir))
+    }
+
+    /// Ortak klasörün içinde (kökte ya da `parent` altında) yeni klasör oluşturur; göreli yolu döner.
+    pub async fn share_mkdir(&self, id: &str, parent: &str, name: &str) -> Result<String, String> {
+        let root = self.share_writable_dir(id)?;
+        let parent = clean_rel(parent)?;
+        let name = clean_item_name(name)?;
+        if !parent.is_empty() && !root.join(rel_os(&parent)).is_dir() {
+            return Err("Üst klasör bulunamadı".into());
+        }
+        let rel = if parent.is_empty() { name } else { format!("{parent}/{name}") };
+        let p = root.join(rel_os(&rel));
+        if p.exists() {
+            return Err("Bu adda bir klasör ya da dosya zaten var".into());
+        }
+        std::fs::create_dir_all(&p).map_err(|e| format!("Klasör oluşturulamadı: {e}"))?;
+        self.share_scan(id).await;
+        Ok(rel)
+    }
+
+    /// Dosya ya da klasörü aynı yerde yeniden adlandırır; yeni göreli yolu döner.
+    pub async fn share_rename(&self, id: &str, path: &str, new_name: &str) -> Result<String, String> {
+        let root = self.share_writable_dir(id)?;
+        let rel = clean_rel(path)?;
+        if rel.is_empty() {
+            return Err("Kök klasör buradan yeniden adlandırılamaz".into());
+        }
+        let name = clean_item_name(new_name)?;
+        let src = root.join(rel_os(&rel));
+        if !src.exists() {
+            return Err("Dosya ya da klasör bulunamadı".into());
+        }
+        let parent = parent_of(&rel);
+        let new_rel = if parent.is_empty() { name } else { format!("{parent}/{name}") };
+        if new_rel == rel {
+            return Ok(rel);
+        }
+        let dst = root.join(rel_os(&new_rel));
+        // Yalnızca harf büyüklüğü değişiyorsa aynı dosyadır; değilse var olanın üzerine yazılmaz.
+        if dst.exists() && !new_rel.eq_ignore_ascii_case(&rel) {
+            return Err("Bu adda bir klasör ya da dosya zaten var".into());
+        }
+        std::fs::rename(&src, &dst).map_err(|e| format!("Yeniden adlandırılamadı (dosya açık olabilir): {e}"))?;
+        self.share_scan(id).await;
+        Ok(new_rel)
+    }
+
+    /// Dosya ya da klasörü siler: yerelde `.fastfiles\silinen` içine taşınır, silme diğer üyelere yayılır.
+    pub async fn share_remove_path(&self, id: &str, path: &str) -> Result<(), String> {
+        let root = self.share_writable_dir(id)?;
+        let rel = clean_rel(path)?;
+        if rel.is_empty() {
+            return Err("Kök klasör buradan silinemez".into());
+        }
+        let src = root.join(rel_os(&rel));
+        if src.is_dir() {
+            let trash = root.join(SHARE_META_DIR).join("silinen");
+            std::fs::create_dir_all(&trash).map_err(|e| e.to_string())?;
+            let dst = trash.join(format!("{} {}", chrono_stamp(), rel.replace('/', " - ")));
+            std::fs::rename(&src, &dst).map_err(|e| format!("Klasör silinemedi (içinde açık dosya olabilir): {e}"))?;
+        } else if src.exists() {
+            if !move_to_trash(&root, &rel) {
+                return Err("Dosya silinemedi (açık olabilir)".into());
             }
-            PathBuf::from(&st.dir)
-        };
+        } else {
+            return Err("Dosya ya da klasör bulunamadı".into());
+        }
+        self.share_scan(id).await;
+        Ok(())
+    }
+
+    pub async fn share_add_files(self: &Arc<Self>, id: &str, paths: Vec<String>) -> Result<usize, String> {
+        self.share_add_files_to(id, paths, "").await
+    }
+
+    /// Dosya/klasörleri ortak klasörün içindeki `target` alt klasörüne kopyalar ("" = kök).
+    pub async fn share_add_files_to(self: &Arc<Self>, id: &str, paths: Vec<String>, target: &str) -> Result<usize, String> {
+        let root = self.share_writable_dir(id).map_err(|_| "Bu klasöre dosya ekleyemezsiniz".to_string())?;
+        let target = clean_rel(target)?;
+        let dir = if target.is_empty() { root.clone() } else { root.join(rel_os(&target)) };
+        if !dir.is_dir() {
+            return Err("Hedef klasör bulunamadı".into());
+        }
         let copied = tokio::task::spawn_blocking(move || -> Result<usize, String> {
             let entries = collect_entries(&paths.iter().map(PathBuf::from).collect::<Vec<_>>())?;
             let mut n = 0;
@@ -659,13 +842,14 @@ impl Node {
                 for p in &parts {
                     dst.push(p);
                 }
-                if dst.starts_with(dir.join(SHARE_META_DIR)) {
+                if dst.starts_with(root.join(SHARE_META_DIR)) {
                     continue;
                 }
                 if let Some(parent) = dst.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
-                if dst.exists() && !move_to_trash(&dir, &parts.join("/")) {
+                let rel = if target.is_empty() { parts.join("/") } else { format!("{target}/{}", parts.join("/")) };
+                if dst.exists() && !move_to_trash(&root, &rel) {
                     return Err(format!("{}: mevcut dosya yedeklenemediği için üzerine yazılmadı", e.path));
                 }
                 std::fs::copy(&src, &dst).map_err(|err| format!("{} kopyalanamadı: {err}", e.path))?;
@@ -733,25 +917,30 @@ impl Node {
             let Some(st) = map.get_mut(id) else { return false };
             let mut changed = false;
             let mut seen = HashSet::new();
-            for (path, size, mtime) in listing {
+            for (path, size, mtime, is_dir) in listing {
                 let key = key_of(&path);
                 seen.insert(key.clone());
                 // Yazılmakta olan dosyayı yarım yayınlamamak için birkaç saniye bekle.
-                if mtime <= now && now - mtime < SCAN_SETTLE_MS {
+                if !is_dir && mtime <= now && now - mtime < SCAN_SETTLE_MS {
                     continue;
                 }
                 let current = st.entries.get(&key);
-                let same = current.map_or(false, |e| !e.deleted && e.size == size && e.mtime == mtime);
+                // Yol karşılaştırması büyük/küçük harf değişikliğini de yakalar (yeniden adlandırma).
+                let same = current.map_or(false, |e| {
+                    !e.deleted && e.dir == is_dir && e.path == path && (is_dir || (e.size == size && e.mtime == mtime))
+                });
                 if !same {
                     let version = now.max(current.map_or(0, |e| e.version.saturating_add(1)));
-                    st.entries.insert(key, ShareEntry { path, size, mtime, version, author: me.clone(), deleted: false });
+                    st.entries.insert(key, ShareEntry { path, size, mtime, version, author: me.clone(), deleted: false, dir: is_dir });
                     changed = true;
                 }
             }
             for (key, e) in st.entries.iter_mut() {
                 // Listeleme eksikse (okunamayan klasör) silme yayılmaz. Listelemeden sonra
                 // indirilen dosya da (yarış) burada yeniden kontrol edilir.
-                if !e.deleted && !seen.contains(key) && complete && !dir.join(e.path.replace('/', std::path::MAIN_SEPARATOR_STR)).exists() {
+                let p = dir.join(e.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+                let gone = if e.dir { !p.is_dir() } else { !p.exists() };
+                if !e.deleted && !seen.contains(key) && complete && gone {
                     e.deleted = true;
                     e.version = now.max(e.version.saturating_add(1));
                     e.author = me.clone();
@@ -887,7 +1076,7 @@ impl Node {
                 let (entries, digest) = {
                     let map = self.shares.lock().unwrap();
                     let Some(st) = map.get(&id) else { return true };
-                    (st.entries.values().cloned().collect::<Vec<_>>(), st.digest.clone())
+                    (entries_for(st.entries.values().cloned().collect::<Vec<_>>(), &peer.version), st.digest.clone())
                 };
                 match self.share_request(peer, &Message::ShareManifest { device, share_id: id.clone(), entries }).await {
                     Ok(Message::ShareManifest { entries, .. }) => {
@@ -902,30 +1091,94 @@ impl Node {
         }
     }
 
-    /// Karşı tarafın kayıtlarını birleştirir: daha yeni silmeleri uygular, daha yeni dosyaları indirme listesine ekler.
+    /// Karşı tarafın kayıtlarını birleştirir: daha yeni silmeleri uygular, daha yeni dosyaları indirme
+    /// listesine ekler, klasörleri oluşturur/kaldırır.
+    ///
+    /// Sıra önemlidir: önce dosya silmeleri (silinen dosyalar çöpe, yeniden adlandırma için akılda
+    /// tutulur), sonra yeni dosyalar (aynı içerikli silinen dosya varsa indirmek yerine taşınır),
+    /// sonra klasörler (üstten alta), en son klasör silmeleri (en derinden başlayarak).
     fn merge_manifest(&self, id: &str, from: &str, entries: Vec<ShareEntry>) {
         let mut changed = false;
         {
             let mut map = self.shares.lock().unwrap();
             let Some(st) = map.get_mut(id) else { return };
             let dir = PathBuf::from(&st.dir);
-            for e in entries.into_iter().filter_map(clean_entry) {
+            let mut incoming: Vec<ShareEntry> = entries
+                .into_iter()
+                .filter_map(clean_entry)
+                .filter(|e| st.entries.get(&key_of(&e.path)).map_or(true, |l| e.newer_than(l)))
+                .collect();
+            let rank = |e: &ShareEntry| match (e.dir, e.deleted) {
+                (false, true) => 0,
+                (false, false) => 1,
+                (true, false) => 2,
+                (true, true) => 3,
+            };
+            let depth = |e: &ShareEntry| e.path.matches('/').count();
+            incoming.sort_by(|a, b| {
+                rank(a).cmp(&rank(b)).then_with(|| if rank(a) == 3 { depth(b).cmp(&depth(a)) } else { depth(a).cmp(&depth(b)) })
+            });
+            let mut trashed: Vec<(ShareEntry, PathBuf)> = Vec::new();
+            for e in incoming {
                 let key = key_of(&e.path);
-                let local = st.entries.get(&key);
-                if local.map_or(false, |l| !e.newer_than(l)) {
-                    continue;
-                }
-                if e.deleted {
-                    if local.map_or(false, |l| !l.deleted) && !move_to_trash(&dir, &local.unwrap().path) {
-                        // Yedeklenemeyen dosya silinmez; sonraki taramada yeniden yayınlanır.
-                        continue;
+                let local = st.entries.get(&key).cloned();
+                match (e.dir, e.deleted) {
+                    (false, true) => {
+                        if let Some(l) = local.as_ref().filter(|l| !l.deleted) {
+                            if l.dir {
+                                continue;
+                            }
+                            match move_to_trash_undoable(&dir, &l.path) {
+                                Ok(Some(p)) => trashed.push((l.clone(), p)),
+                                Ok(None) => {}
+                                // Yedeklenemeyen dosya silinmez; sonraki taramada yeniden yayınlanır.
+                                Err(()) => continue,
+                            }
+                        }
+                        st.wanted.remove(&key);
+                        st.entries.insert(key, e);
+                        changed = true;
                     }
-                    st.wanted.remove(&key);
-                    st.entries.insert(key, e);
-                    changed = true;
-                } else if st.wanted.get(&key).map_or(true, |(w, _)| e.newer_than(w)) {
-                    st.wanted.insert(key, (e, from.to_string()));
-                    changed = true;
+                    (false, false) => {
+                        // Yeniden adlandırma/taşıma: içerik zaten bizde, ağdan indirme.
+                        if let Some(pos) = trashed.iter().position(|(old, _)| same_content(old, &e)) {
+                            let target = dir.join(rel_os(&e.path));
+                            let placed = target.parent().map_or(false, |p| std::fs::create_dir_all(p).is_ok())
+                                && !target.is_dir()
+                                && matches!(move_to_trash_undoable(&dir, &e.path), Ok(_))
+                                && std::fs::rename(&trashed[pos].1, &target).is_ok();
+                            if placed {
+                                trashed.remove(pos);
+                                st.wanted.remove(&key);
+                                st.entries.insert(key, e);
+                                changed = true;
+                                continue;
+                            }
+                        }
+                        if st.wanted.get(&key).map_or(true, |(w, _)| e.newer_than(w)) {
+                            st.wanted.insert(key, (e, from.to_string()));
+                            changed = true;
+                        }
+                    }
+                    (true, false) => {
+                        let p = dir.join(rel_os(&e.path));
+                        // Aynı adda dosya varsa (çakışma) klasör oluşturulmaz; sonraki eşitlemede düzelir.
+                        if p.is_file() || std::fs::create_dir_all(&p).is_err() {
+                            continue;
+                        }
+                        st.entries.insert(key, e);
+                        changed = true;
+                    }
+                    (true, true) => {
+                        let p = dir.join(rel_os(&e.path));
+                        // İçinde hâlâ dosya varsa klasör kalır; sonraki taramada yeniden yayılır.
+                        if p.is_dir() {
+                            remove_dir_if_empty(&p);
+                        }
+                        st.wanted.remove(&key);
+                        st.entries.insert(key, e);
+                        changed = true;
+                    }
                 }
             }
             if changed {
@@ -1127,6 +1380,8 @@ impl Node {
             return Message::ChatReject { reason: reason.into() };
         }
         let mine: Vec<ShareEntry> = self.shares.lock().unwrap().get(id).map(|s| s.entries.values().cloned().collect()).unwrap_or_default();
+        let version = self.peers().into_iter().find(|p| p.fingerprint == sender).map(|p| p.version).unwrap_or_default();
+        let mine = entries_for(mine, &version);
         self.merge_manifest(id, sender, entries);
         Message::ShareManifest { device: self.device_info(), share_id: id.to_string(), entries: mine }
     }
@@ -1248,7 +1503,7 @@ mod tests {
     }
 
     fn live_files(node: &Node, id: &str) -> usize {
-        node.shares.lock().unwrap().get(id).unwrap().entries.values().filter(|e| !e.deleted).count()
+        node.shares.lock().unwrap().get(id).unwrap().entries.values().filter(|e| !e.deleted && !e.dir).count()
     }
 
     /// Klasör erişilemezse (sürücü takılı değil / silinmiş) tarama "her şey silindi" sonucuna
@@ -1303,7 +1558,7 @@ mod tests {
     #[test]
     fn absurd_versions_from_network_are_rejected() {
         let fp = "a".repeat(64);
-        let e = ShareEntry { path: "a.txt".into(), size: 1, mtime: 1, version: u64::MAX, author: fp, deleted: true };
+        let e = ShareEntry { path: "a.txt".into(), size: 1, mtime: 1, version: u64::MAX, author: fp, deleted: true, dir: false };
         assert!(clean_entry(e).is_none());
     }
 
@@ -1319,10 +1574,61 @@ mod tests {
     #[test]
     fn entry_paths_are_sanitized() {
         let fp = "a".repeat(64);
-        let mk = |p: &str| ShareEntry { path: p.into(), size: 1, mtime: 1, version: 1, author: fp.clone(), deleted: false };
+        let mk = |p: &str| ShareEntry { path: p.into(), size: 1, mtime: 1, version: 1, author: fp.clone(), deleted: false, dir: false };
         assert!(clean_entry(mk("../../Windows/x.dll")).is_none());
         assert!(clean_entry(mk(".fastfiles/tmp/x")).is_none());
         assert!(clean_entry(mk("a/~$rapor.docx")).is_none());
         assert_eq!(clean_entry(mk("Belgeler\\rapor.pdf")).unwrap().path, "Belgeler/rapor.pdf");
+    }
+
+    #[test]
+    fn item_names_and_dir_support() {
+        assert_eq!(clean_item_name("  Raporlar 2026 ").unwrap(), "Raporlar 2026");
+        assert!(clean_item_name("").is_err());
+        assert!(clean_item_name("..").is_err());
+        assert!(clean_item_name("a/b").is_err());
+        assert!(clean_item_name(".fastfiles").is_err());
+        assert_eq!(clean_item_name("Rapor: son?").unwrap(), "Rapor_ son_");
+        assert!(supports_dirs("1.12.0") && supports_dirs("2.0.0"));
+        assert!(!supports_dirs("1.11.0") && !supports_dirs(""));
+        let fp = "a".repeat(64);
+        let d = ShareEntry { path: "A".into(), size: 0, mtime: 0, version: 1, author: fp.clone(), deleted: false, dir: true };
+        let f = ShareEntry { dir: false, path: "A/x.txt".into(), ..d.clone() };
+        assert_eq!(entries_for(vec![d.clone(), f.clone()], "1.11.0"), vec![f.clone()]);
+        assert_eq!(entries_for(vec![d.clone(), f.clone()], "1.12.0").len(), 2);
+        // Yeniden adlandırma tespiti: aynı boyut/zaman ve aynı ad ya da aynı klasör.
+        let old = ShareEntry { path: "Eski/rapor.pdf".into(), size: 10, mtime: 5, ..f.clone() };
+        assert!(same_content(&old, &ShareEntry { path: "Yeni/rapor.pdf".into(), ..old.clone() }));
+        assert!(same_content(&old, &ShareEntry { path: "Eski/rapor-son.pdf".into(), ..old.clone() }));
+        assert!(!same_content(&old, &ShareEntry { path: "Baska/diger.pdf".into(), ..old.clone() }));
+        assert!(!same_content(&old, &ShareEntry { path: "Yeni/rapor.pdf".into(), size: 11, ..old.clone() }));
+    }
+
+    /// Boş alt klasörler taranır; klasör kaldırılınca mezar taşı olur.
+    #[tokio::test]
+    async fn empty_folders_are_tracked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = test_node(tmp.path());
+        let id = node.share_create("Proje", &[], None).unwrap().id;
+        let rel = node.share_mkdir(&id, "", "Tasarım").await.unwrap();
+        let sub = node.share_mkdir(&id, &rel, "Logolar").await.unwrap();
+        assert_eq!(sub, "Tasarım/Logolar");
+        assert!(node.share_mkdir(&id, "", "Tasarım").await.is_err(), "aynı ad");
+        assert!(node.share_mkdir(&id, "Yok", "x").await.is_err(), "olmayan üst klasör");
+        let dirs: Vec<String> = node.share_files(&id).unwrap().into_iter().filter(|f| f.dir).map(|f| f.path).collect();
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(node.share_list()[0].file_count, 0, "klasörler dosya sayılmaz");
+
+        let renamed = node.share_rename(&id, "Tasarım/Logolar", "Simgeler").await.unwrap();
+        assert_eq!(renamed, "Tasarım/Simgeler");
+        let mut dirs: Vec<String> = node.share_files(&id).unwrap().into_iter().filter(|f| f.dir).map(|f| f.path).collect();
+        dirs.sort();
+        assert_eq!(dirs, vec!["Tasarım".to_string(), "Tasarım/Simgeler".to_string()]);
+
+        node.share_remove_path(&id, "Tasarım").await.unwrap();
+        assert!(node.share_files(&id).unwrap().is_empty());
+        let st = node.shares.lock().unwrap();
+        let entries = &st.get(&id).unwrap().entries;
+        assert!(entries.values().filter(|e| e.dir).all(|e| e.deleted), "silinen klasörler mezar taşı olur");
     }
 }

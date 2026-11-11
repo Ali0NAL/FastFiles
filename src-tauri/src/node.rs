@@ -490,6 +490,11 @@ impl Node {
 
     /// Kurulmayı bekleyen (çalışandan yeni) güncelleme sürümü.
     pub fn pending_update(&self) -> Option<String> {
+        // Paketler Windows kurulum dosyası içerir: diğer sistemlerde kurulacak güncelleme yok
+        // (paket yine de ağdaki Windows cihazlara dağıtılır).
+        if !cfg!(windows) {
+            return None;
+        }
         self.update_pkg
             .lock()
             .unwrap()
@@ -4157,7 +4162,7 @@ mod tests {
     }
 
     fn share_paths(node: &Node, id: &str) -> Vec<String> {
-        let mut v: Vec<String> = node.share_files(id).map(|f| f.into_iter().map(|x| x.path).collect()).unwrap_or_default();
+        let mut v: Vec<String> = node.share_files(id).map(|f| f.into_iter().filter(|x| !x.dir).map(|x| x.path).collect()).unwrap_or_default();
         v.sort();
         v
     }
@@ -4205,6 +4210,49 @@ mod tests {
         })
         .await;
         assert_eq!(share_paths(&bob, &s.id), vec!["Sunum/slayt1.txt".to_string()]);
+    }
+
+    /// Klasör ağacı: boş alt klasörler eşitlenir, alt klasöre dosya eklenir, klasör yeniden
+    /// adlandırılınca içindekiler yeniden indirilmeden taşınır, silinen klasör herkesten kalkar.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_folder_tree_rename_and_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        introduce_all(&[&alice, &bob]);
+        let all = [&alice, &bob];
+        let s = alice.share_create("Ekip", &[bob.identity.fingerprint.clone()], None).unwrap();
+        share_ticks(&all, || bob.share_list().len() == 1).await;
+
+        // Boş alt klasörler de karşıya gider.
+        let proje = alice.share_mkdir(&s.id, "", "Proje").await.unwrap();
+        alice.share_mkdir(&s.id, &proje, "Taslaklar").await.unwrap();
+        share_ticks(&all, || share_dir(&bob, &s.id).join("Proje").join("Taslaklar").is_dir()).await;
+
+        // Alt klasöre dosya eklenir.
+        let src = tmp.path().join("rapor.txt");
+        write_old(&src, b"ceyrek raporu");
+        alice.share_add_files_to(&s.id, vec![src.to_string_lossy().into()], "Proje").await.unwrap();
+        share_ticks(&all, || share_dir(&bob, &s.id).join("Proje").join("rapor.txt").is_file()).await;
+
+        // Yeniden adlandırma: Bob'da dosya yeniden indirilmeden yeni yerine taşınır.
+        alice.share_rename(&s.id, "Proje", "Proje 2026").await.unwrap();
+        let bob_dir = share_dir(&bob, &s.id);
+        share_ticks(&all, || {
+            bob_dir.join("Proje 2026").join("rapor.txt").is_file()
+                && bob_dir.join("Proje 2026").join("Taslaklar").is_dir()
+                && !bob_dir.join("Proje").exists()
+        })
+        .await;
+        assert_eq!(std::fs::read(bob_dir.join("Proje 2026").join("rapor.txt")).unwrap(), b"ceyrek raporu");
+        let trash = bob_dir.join(".fastfiles").join("silinen");
+        let leftovers = std::fs::read_dir(&trash).map(|r| r.flatten().filter(|e| e.file_name().to_string_lossy().contains("rapor")).count()).unwrap_or(0);
+        assert_eq!(leftovers, 0, "taşınan dosya çöpte kalmamalı (yeniden indirilmemeli)");
+
+        // Bob alt klasörü siler → Alice'ten de kalkar.
+        bob.share_remove_path(&s.id, "Proje 2026/Taslaklar").await.unwrap();
+        share_ticks(&all, || !share_dir(&alice, &s.id).join("Proje 2026").join("Taslaklar").exists()).await;
+        assert!(share_dir(&alice, &s.id).join("Proje 2026").join("rapor.txt").is_file());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

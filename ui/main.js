@@ -5,6 +5,25 @@ import { YTPlayer, YT, parseYouTube, ytThumb, ytWatchUrl, fmtClock } from './ytp
 import { workAvatarSvg, WORK_AVATARS } from './workavatars.js';
 
 const T = window.__TAURI__;
+// macOS'ta kısayollar ⌘ ile gösterilir, dosya yöneticisinin adı Finder'dır.
+const IS_MAC = /Mac/i.test(navigator.platform || navigator.userAgent || '');
+const K = (s) => IS_MAC
+  ? s.replace(/Ctrl\+Shift\+PrtSc/g, '⌘⇧2').replace(/Ctrl\+Shift\+/g, '⌘⇧').replace(/Ctrl\+/g, '⌘')
+  : s;
+const FM_DE = IS_MAC ? "Finder'da" : "Gezgin'de";
+// index.html'deki sabit metinleri Mac'e uyarlar (Ctrl → ⌘, Gezgin → Finder).
+function macifyStatic(root = document.body) {
+  if (!IS_MAC || !root) return;
+  const fix = (s) => K(s).replace(/Gezgin'den/g, "Finder'dan").replace(/Gezgin'de/g, "Finder'da").replace(/Gezgin/g, 'Finder');
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    if (/Ctrl\+|Gezgin/.test(n.nodeValue)) n.nodeValue = fix(n.nodeValue);
+  }
+  root.querySelectorAll('[title]').forEach((el) => {
+    if (/Ctrl\+|Gezgin/.test(el.title)) el.title = fix(el.title);
+  });
+}
+macifyStatic();
 const api = T ? {
   invoke: (cmd, args) => T.core.invoke(cmd, args),
   invokeRaw: (cmd, body, headers) => T.core.invoke(cmd, body, { headers }),
@@ -274,7 +293,7 @@ function peerInner(p) {
       <div class="actions">
         <button class="btn soft small" data-act="files">${ic.file}Dosya</button>
         <button class="btn soft small" data-act="folder">${ic.folder}Klasör</button>
-        <button class="btn soft small sq-btn" data-act="clip" title="Panodakini gönder (Ctrl+V): metin, ekran görüntüsü veya kopyalanan dosyalar">${ic.clip}</button>
+        <button class="btn soft small sq-btn" data-act="clip" title="Panodakini gönder (${K('Ctrl+V')}): metin, ekran görüntüsü veya kopyalanan dosyalar">${ic.clip}</button>
         <button class="btn soft small chat-btn" data-act="chat" title="Mesaj gönder">${ic.chat}${unreadOf(p.fingerprint) ? `<span class="dot-badge">${unreadOf(p.fingerprint)}</span>` : ''}</button>
       </div>
       <div class="drop-label">Bırak → ${esc(p.name)}</div>`;
@@ -859,10 +878,10 @@ function showSettings() {
       <select class="input" id="s-limit">${limitOptions(s.speedLimitMb || 0)}</select>
       <span class="help">Büyük gönderimler ofis ağını tıkamasın diye bu bilgisayarın toplam gönderim hızını sınırlar. Alım hızı etkilenmez.</span>
     </div>
-    <label class="check"><input type="checkbox" id="s-shell" ${s.shellMenu !== false ? 'checked' : ''} />
+    <label class="check" ${IS_MAC ? 'style="display:none"' : ''}><input type="checkbox" id="s-shell" ${s.shellMenu !== false ? 'checked' : ''} />
       <span>Gezgin'de sağ tık menüsüne "FastFiles ile gönder" ekle<br><span class="muted small">Dosya ve klasörlere sağ tıklayıp doğrudan gönderin. Windows 11'de "Diğer seçenekleri göster" altında; çok sayıda dosya için "Gönder" menüsünde de bulunur.</span></span></label>
     <label class="check"><input type="checkbox" id="s-hotkeys" ${s.hotkeys !== false ? 'checked' : ''} />
-      <span>Genel kısayollar<br><span class="muted small"><b>Ctrl+Shift+Boşluk</b>: hangi programda olursanız olun hızlı gönderim · <b>Ctrl+Shift+PrtSc</b>: ekran görüntüsü al, üzerine çiz, gönder. Uygulama içinde <b>Ctrl+K</b> de hızlı gönderimi açar. Başka bir programın kısayoluyla çakışırsa kapatın.</span></span></label>
+      <span>Genel kısayollar<br><span class="muted small"><b>${K('Ctrl+Shift+Boşluk')}</b>: hangi programda olursanız olun hızlı gönderim · <b>${K('Ctrl+Shift+PrtSc')}</b>: ekran görüntüsü al, üzerine çiz, gönder. Uygulama içinde <b>${K('Ctrl+K')}</b> de hızlı gönderimi açar. Başka bir programın kısayoluyla çakışırsa kapatın.</span></span></label>
     <label class="check"><input type="checkbox" id="s-compress" ${s.compress !== false ? 'checked' : ''} />
       <span>Uygun dosyaları sıkıştırarak gönder<br><span class="muted small">Metin, log, CSV, kaynak kod gibi dosyalar özellikle Wi-Fi'da birkaç kat hızlı gider. Zip, video, fotoğraf gibi zaten sıkıştırılmış dosyalar olduğu gibi gider. Karşı tarafta FastFiles'ın güncel sürümü olmalı.</span></span></label>
     <hr class="sep" />
@@ -2600,6 +2619,7 @@ function openShare(id) {
   $('#poll-view').hidden = true;
   state.openShare = id;
   state.shareFiles = [];
+  shareUi.editing = null;
   $('#share-search').value = '';
   $('#share-view').hidden = false;
   renderShareHead();
@@ -2632,8 +2652,9 @@ function renderShareHead() {
   const canAdd = s.canAccess && !s.left;
   $('#share-add-files').disabled = !canAdd;
   $('#share-add-folder').disabled = !canAdd;
+  $('#share-mkdir').disabled = !canAdd;
   $('#share-note').textContent = canAdd
-    ? 'Dosyaları buraya sürükleyip bırakabilir veya Gezgin\'de klasöre kopyalayabilirsiniz.'
+    ? `Dosyaları buraya sürükleyip bırakabilir veya ${FM_DE} klasöre kopyalayabilirsiniz.`
     : s.left ? 'Bu klasör artık eşitlenmiyor; dosyalar bilgisayarınızda kalır.' : '';
 }
 
@@ -2651,49 +2672,275 @@ async function loadShareFiles() {
   renderShareFiles();
 }
 
-function renderShareFiles() {
-  const q = $('#share-search').value.trim().toLocaleLowerCase('tr-TR');
-  const files = q ? state.shareFiles.filter((f) => f.path.toLocaleLowerCase('tr-TR').includes(q)) : state.shareFiles;
-  const box = $('#share-files');
-  if (!files.length) {
-    box.innerHTML = `<div class="empty small-empty"><p>${q ? 'Eşleşen dosya yok.' : 'Klasör boş. Eklediğiniz dosyalar üyelerin bilgisayarına otomatik kopyalanır.'}</p></div>`;
-    return;
-  }
-  box.innerHTML = files.slice(0, 500).map((f) => {
+// ── Klasör ağacı ──
+// Ortak klasör ağaç olarak gösterilir: klasörler açılıp kapanır, seçili klasör "Ekle" ve
+// "Yeni klasör" için hedeftir. Boş klasörler de (arka uçtaki klasör kayıtları) listelenir.
+ic.chevron = '<svg viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg>';
+ic.folderPlus = '<svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M15 10.5v5M12.5 13h5"/></svg>';
+ic.rename = '<svg viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="m13.5 6.5 4 4"/></svg>';
+const shareUi = { expanded: new Map(), sel: new Map(), editing: null };
+const shareExpanded = (id) => {
+  if (!shareUi.expanded.has(id)) shareUi.expanded.set(id, new Set());
+  return shareUi.expanded.get(id);
+};
+const shareSel = () => shareUi.sel.get(state.openShare) || '';
+const trLower = (s) => s.toLocaleLowerCase('tr-TR');
+
+function buildShareTree(files) {
+  const mk = (name, rel) => ({ name, rel, dirs: new Map(), files: [], count: 0, size: 0, mtime: 0, fullPath: '' });
+  const root = mk('', '');
+  const ensure = (rel) => {
+    let node = root;
+    if (!rel) return node;
+    let acc = '';
+    for (const part of rel.split('/')) {
+      acc = acc ? `${acc}/${part}` : part;
+      const k = trLower(part);
+      if (!node.dirs.has(k)) node.dirs.set(k, mk(part, acc));
+      node = node.dirs.get(k);
+    }
+    return node;
+  };
+  for (const f of files) {
+    if (f.dir) { ensure(f.path).fullPath = f.fullPath; continue; }
     const slash = f.path.lastIndexOf('/');
-    const dir = slash >= 0 ? f.path.slice(0, slash + 1) : '';
-    const name = f.path.slice(slash + 1);
-    return `
-      <div class="sfile" data-path="${esc(f.fullPath)}" title="${esc(f.path)} — açmak için tıklayın">
-        <div class="ficon">${ic.file}</div>
-        <div>
-          <div class="fname"><span class="fdir">${esc(dir)}</span>${esc(name)}</div>
-          <div class="fmeta">${esc(f.authorName)} · ${esc(shortTime(f.mtime))} · ${fmtBytes(f.size)}</div>
-        </div>
-        <button class="icon-btn sm fact" data-reveal="${esc(f.fullPath)}" title="Klasörde göster">${ic.reveal}</button>
-      </div>`;
-  }).join('') + (files.length > 500 ? `<div class="more muted small" style="padding:8px">+ ${files.length - 500} dosya daha (aramayı daraltın)</div>` : '');
+    ensure(slash >= 0 ? f.path.slice(0, slash) : '').files.push({ ...f, name: f.path.slice(slash + 1) });
+  }
+  const agg = (n) => {
+    n.count = n.files.length;
+    n.size = n.files.reduce((t, f) => t + f.size, 0);
+    n.mtime = n.files.reduce((t, f) => Math.max(t, f.mtime), 0);
+    for (const d of n.dirs.values()) {
+      agg(d);
+      n.count += d.count;
+      n.size += d.size;
+      n.mtime = Math.max(n.mtime, d.mtime);
+    }
+  };
+  agg(root);
+  return root;
 }
+
+function dirFullPath(node) {
+  const s = shareById(state.openShare);
+  return node.fullPath || (s ? `${s.dir}\\${node.rel.replaceAll('/', '\\')}` : '');
+}
+
+function renderShareLoc() {
+  const s = shareById(state.openShare);
+  const sel = shareSel();
+  const parts = sel ? sel.split('/') : [];
+  const crumbs = [`<button data-crumb="" class="${sel ? '' : 'on'}">${ic.folder}${esc(s?.name || 'Klasör')}</button>`];
+  parts.forEach((p, i) => {
+    const rel = parts.slice(0, i + 1).join('/');
+    crumbs.push(`<span class="sep">›</span><button data-crumb="${esc(rel)}" class="${i === parts.length - 1 ? 'on' : ''}">${esc(p)}</button>`);
+  });
+  $('#share-loc').innerHTML = `<span class="loc-label">Hedef:</span>${crumbs.join('')}`;
+  $('#share-mkdir').title = `“${sel ? parts.at(-1) : s?.name || 'Klasör'}” içinde yeni klasör oluştur`;
+}
+
+function renderShareFiles() {
+  const id = state.openShare;
+  const q = trLower($('#share-search').value.trim());
+  const box = $('#share-files');
+  // Seçili klasör silindiyse köke dön.
+  const tree = buildShareTree(state.shareFiles);
+  const findDir = (rel) => {
+    let n = tree;
+    for (const p of rel ? rel.split('/') : []) {
+      n = n.dirs.get(trLower(p));
+      if (!n) return null;
+    }
+    return n;
+  };
+  if (shareSel() && !findDir(shareSel())) shareUi.sel.set(id, '');
+  renderShareLoc();
+  const open = shareExpanded(id);
+  const s = shareById(id);
+  const canEdit = !!s && s.canAccess && !s.left && !s.deleted;
+  const ed = shareUi.editing;
+  const matches = (name) => !q || trLower(name).includes(q);
+  // Aramada: eşleşen dosya/klasör ve üst klasörleri gösterilir, klasörler açık gelir.
+  const visible = (n) => matches(n.name) || n.files.some((f) => matches(f.name)) || [...n.dirs.values()].some(visible);
+  const byName = (a, b) => a.name.localeCompare(b.name, 'tr', { numeric: true, sensitivity: 'base' });
+  let rows = 0;
+  const LIMIT = 2000;
+  const nameCell = (rel, name, kind) => (ed && ed.rel === rel && ed.mode === 'rename'
+    ? `<input class="tname-input" data-edit="rename" value="${esc(name)}" spellcheck="false" />`
+    : `<span class="tname" title="${esc(rel)}">${esc(name)}</span>`) + (kind === 'dir' ? '' : '');
+  const newRow = (parentRel, depth) => (ed && ed.mode === 'mkdir' && ed.rel === parentRel
+    ? `<div class="tnode dir editing" style="--d:${depth}"><span class="tchev"></span><span class="ticon">${ic.folder}</span>
+        <input class="tname-input" data-edit="mkdir" placeholder="Yeni klasör adı" spellcheck="false" /></div>`
+    : '');
+  const tools = (rel, isDir, full) => `<span class="tacts">
+      ${canEdit && isDir ? `<button class="icon-btn sm" data-tact="mkdir" title="İçinde yeni klasör">${ic.folderPlus}</button>` : ''}
+      ${canEdit ? `<button class="icon-btn sm" data-tact="rename" title="Yeniden adlandır (F2)">${ic.rename}</button>` : ''}
+      <button class="icon-btn sm" data-reveal="${esc(full)}" title="Klasörde göster">${ic.reveal}</button>
+      ${canEdit ? `<button class="icon-btn sm" data-tact="delete" title="Sil">${ic.trash}</button>` : ''}
+    </span>`;
+  const walk = (node, depth) => {
+    let html = newRow(node.rel, depth);
+    for (const d of [...node.dirs.values()].sort(byName)) {
+      if (q && !visible(d)) continue;
+      if (rows++ > LIMIT) break;
+      const isOpen = q ? true : open.has(trLower(d.rel));
+      const sel = shareSel() === d.rel;
+      html += `<div class="tnode dir${isOpen ? ' open' : ''}${sel ? ' sel' : ''}" data-rel="${esc(d.rel)}" data-kind="dir" style="--d:${depth}">
+          <span class="tchev">${d.dirs.size || d.files.length ? ic.chevron : ""}</span><span class="ticon">${ic.folder}</span>
+          ${nameCell(d.rel, d.name, 'dir')}
+          <span class="tmeta">${d.count ? `${d.count} dosya · ${fmtBytes(d.size)}` : 'boş'}</span>
+          ${tools(d.rel, true, dirFullPath(d))}
+        </div>`;
+      if (isOpen) html += walk(d, depth + 1);
+    }
+    for (const f of [...node.files].sort(byName)) {
+      if (!matches(f.name) && !(q && matches(node.name))) continue;
+      if (rows++ > LIMIT) break;
+      html += `<div class="tnode file" data-rel="${esc(f.path)}" data-kind="file" data-path="${esc(f.fullPath)}" style="--d:${depth}" title="${esc(f.path)} — açmak için çift tıklayın">
+          <span class="tchev"></span><span class="ticon">${ic.file}</span>
+          ${nameCell(f.path, f.name, 'file')}
+          <span class="tmeta">${esc(f.authorName)} · ${esc(shortTime(f.mtime))} · ${fmtBytes(f.size)}</span>
+          ${tools(f.path, false, f.fullPath)}
+        </div>`;
+    }
+    return html;
+  };
+  const html = walk(tree, 0);
+  if (!html) {
+    box.innerHTML = `<div class="empty small-empty"><p>${q ? 'Eşleşen dosya ya da klasör yok.' : 'Klasör boş. "Yeni klasör" ile alt klasör oluşturabilir, dosya ekleyebilirsiniz; her şey üyelerin bilgisayarına otomatik kopyalanır.'}</p></div>`;
+  } else {
+    box.innerHTML = html + (rows > LIMIT ? '<div class="more muted small" style="padding:8px">Liste kısaltıldı; aramayı daraltın.</div>' : '');
+  }
+  const input = box.querySelector('.tname-input');
+  if (input) {
+    input.focus();
+    if (input.dataset.edit === 'rename') {
+      const dot = input.value.lastIndexOf('.');
+      input.setSelectionRange(0, ed.kind === 'file' && dot > 0 ? dot : input.value.length);
+    }
+  }
+}
+
+function startShareEdit(mode, rel, kind) {
+  if (mode === 'mkdir' && rel) shareExpanded(state.openShare).add(trLower(rel));
+  shareUi.editing = { mode, rel, kind };
+  renderShareFiles();
+}
+
+async function commitShareEdit(input) {
+  const ed = shareUi.editing;
+  if (!ed) return;
+  const id = state.openShare;
+  const name = input.value.trim();
+  shareUi.editing = null;
+  if (!name) return renderShareFiles();
+  try {
+    if (ed.mode === 'mkdir') {
+      const rel = await call('share_mkdir', { id, parent: ed.rel, name });
+      shareUi.sel.set(id, rel);
+      if (ed.rel) shareExpanded(id).add(trLower(ed.rel));
+      toast(`“${name}” klasörü oluşturuldu; üyelerde de oluşacak`, { type: 'success', timeout: 3000 });
+    } else {
+      const old = ed.rel.split('/').pop();
+      if (name === old) return renderShareFiles();
+      const rel = await call('share_rename', { id, path: ed.rel, name });
+      // Açık/seçili klasör yolları yeni ada taşınır.
+      const exp = shareExpanded(id);
+      const from = trLower(ed.rel);
+      for (const k of [...exp]) {
+        if (k === from || k.startsWith(`${from}/`)) { exp.delete(k); exp.add(trLower(rel) + k.slice(from.length)); }
+      }
+      const sel = shareSel();
+      if (sel === ed.rel || sel.startsWith(`${ed.rel}/`)) shareUi.sel.set(id, rel + sel.slice(ed.rel.length));
+    }
+    await loadShareFiles();
+  } catch {
+    renderShareFiles();
+  }
+}
+
+$('#share-files').addEventListener('keydown', (e) => {
+  const input = e.target.closest('.tname-input');
+  if (!input) return;
+  if (e.key === 'Enter') { e.preventDefault(); commitShareEdit(input); }
+  if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); shareUi.editing = null; renderShareFiles(); }
+});
+$('#share-files').addEventListener('focusout', (e) => {
+  const input = e.target.closest?.('.tname-input');
+  if (input && shareUi.editing) commitShareEdit(input);
+});
+
 $('#share-search').addEventListener('input', renderShareFiles);
-$('#share-files').addEventListener('click', (e) => {
+$('#share-files').addEventListener('click', async (e) => {
+  if (e.target.closest('.tname-input')) return;
   const reveal = e.target.closest('[data-reveal]');
   if (reveal) return call('reveal_path', { path: reveal.dataset.reveal });
-  const row = e.target.closest('[data-path]');
-  if (row) call('open_path', { path: row.dataset.path });
+  const row = e.target.closest('.tnode[data-rel]');
+  if (!row) return;
+  const rel = row.dataset.rel;
+  const kind = row.dataset.kind;
+  const act = e.target.closest('[data-tact]')?.dataset.tact;
+  if (act === 'mkdir') return startShareEdit('mkdir', rel, kind);
+  if (act === 'rename') return startShareEdit('rename', rel, kind);
+  if (act === 'delete') {
+    const name = rel.split('/').pop();
+    const ok = await confirmDialog(kind === 'dir' ? `“${name}” klasörü silinsin mi?` : `“${name}” silinsin mi?`,
+      kind === 'dir'
+        ? 'Klasör ve içindeki her şey tüm üyelerden silinir. Bu bilgisayarda .fastfiles\\silinen klasörüne taşınır, kaybolmaz.'
+        : 'Dosya tüm üyelerden silinir. Bu bilgisayarda .fastfiles\\silinen klasörüne taşınır, kaybolmaz.',
+      'Sil', true);
+    if (!ok) return;
+    try {
+      await call('share_remove_path', { id: state.openShare, path: rel });
+      await loadShareFiles();
+    } catch { /* toast gösterildi */ }
+    return;
+  }
+  if (kind === 'dir') {
+    // Tıklama: klasörü seçer; seçiliyse ya da ok'a tıklandıysa açar/kapar.
+    const exp = shareExpanded(state.openShare);
+    const k = trLower(rel);
+    const onChevron = !!e.target.closest('.tchev');
+    if (onChevron || shareSel() === rel) { if (exp.has(k)) exp.delete(k); else exp.add(k); }
+    else exp.add(k);
+    shareUi.sel.set(state.openShare, rel);
+    renderShareFiles();
+  } else {
+    // Dosya: seçim üst klasöre geçer.
+    shareUi.sel.set(state.openShare, rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '');
+    renderShareLoc();
+  }
 });
+$('#share-files').addEventListener('dblclick', (e) => {
+  const row = e.target.closest('.tnode.file[data-path]');
+  if (row && !e.target.closest('.tacts, .tname-input')) call('open_path', { path: row.dataset.path });
+});
+$('#share-files').addEventListener('keydown', (e) => {
+  if (e.key !== 'F2' || shareUi.editing) return;
+  const row = document.querySelector('#share-files .tnode.sel');
+  if (row) startShareEdit('rename', row.dataset.rel, row.dataset.kind);
+});
+$('#share-loc').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-crumb]');
+  if (!b) return;
+  shareUi.sel.set(state.openShare, b.dataset.crumb);
+  renderShareFiles();
+});
+$('#share-mkdir').onclick = () => startShareEdit('mkdir', shareSel(), 'dir');
 $('#share-open').onclick = () => { const s = shareById(state.openShare); if (s) call('open_path', { path: s.dir }); };
 
-async function addToShare(id, paths) {
+async function addToShare(id, paths, target = state.openShare === id ? shareSel() : '') {
   if (!paths?.length) return;
   try {
-    const n = await call('share_add_files', { id, paths });
-    toast(`${n} dosya ortak klasöre eklendi; üyelere gönderiliyor`, { type: 'success' });
+    const n = await call('share_add_files', { id, paths, target: target || null });
+    toast(`${n} dosya ${target ? `“${target.split('/').pop()}” klasörüne` : 'ortak klasöre'} eklendi; üyelere gönderiliyor`, { type: 'success' });
     if (state.openShare === id) loadShareFiles();
   } catch { /* toast gösterildi */ }
 }
 const pickIntoShare = async (directory) => {
   const id = state.openShare;
-  const sel = await api.pick({ multiple: true, directory, title: directory ? 'Ortak klasöre eklenecek klasörler' : 'Ortak klasöre eklenecek dosyalar' });
+  const where = shareSel() ? `“${shareSel().split('/').pop()}” klasörüne` : 'Ortak klasöre';
+  const sel = await api.pick({ multiple: true, directory, title: directory ? `${where} eklenecek klasörler` : `${where} eklenecek dosyalar` });
   if (sel) addToShare(id, Array.isArray(sel) ? sel : [sel]);
 };
 $('#share-add-files').onclick = () => pickIntoShare(false);
@@ -6005,7 +6252,7 @@ function openShotEditor(blob, target) {
           <span class="tsep"></span>
           ${colors.map((c, n) => `<button class="color${n === 0 ? ' on' : ''}" data-color="${c}" style="--c:${c}" title="${c}"></button>`).join('')}
           <span class="tsep"></span>
-          <button class="tool" data-undo title="Geri al (Ctrl+Z)">↶</button>
+          <button class="tool" data-undo title="Geri al (${K('Ctrl+Z')})">↶</button>
         </div>
       </div>
       <div class="shot-stage"><canvas id="shot-canvas"></canvas><input class="shot-text" id="shot-text" hidden placeholder="Yazı + Enter"></div>
@@ -6192,9 +6439,9 @@ function paletteItems(q) {
     .sort((a, b) => lastAt(b.fingerprint) - lastAt(a.fingerprint))
     .forEach((c) => items.push({ kind: 'group', key: c.fingerprint, label: c.name, sub: `${c.group.members.length} kişilik grup` }));
   const actions = [
-    { kind: 'action', id: 'shot', label: '📸 Ekran görüntüsü al, çiz, gönder', sub: 'Ctrl+Shift+PrtSc' },
+    { kind: 'action', id: 'shot', label: '📸 Ekran görüntüsü al, çiz, gönder', sub: K('Ctrl+Shift+PrtSc') },
     { kind: 'action', id: 'phone', label: '📱 Telefon bağla (QR)', sub: 'Telefondan bilgisayara, bilgisayardan telefona' },
-    { kind: 'action', id: 'office', label: '🏢 Ofisi aç', sub: '3B görünüm', fun: true },
+    { kind: 'action', id: 'office', label: '🏢 Ofisi aç', sub: '3B görünüm' },
   ].filter((a) => match(a.label) && (!a.fun || funMode()));
   return q ? [...items, ...actions] : [...actions, ...items];
 }
@@ -7130,7 +7377,7 @@ document.addEventListener('keydown', (e) => {
 
 // ───────────────────────────── İş / eğlence modu ─────────────────────────────
 // Uygulama her açılışta iş modunda başlar: yalnızca ofiste kullanılan özellikler görünür.
-// Eğlence modu (oyunlar, sanal ofis, birlikte izle, ekran animasyonları, dürtme) sol üstteki
+// Eğlence modu (oyunlar, birlikte izle, ekran animasyonları, dürtme) sol üstteki
 // logoya 3 sn basılı tutup "mola" şifresi yazılınca açılır; üst çubuktaki "Ofis moduna dön"
 // düğmesiyle kapanır. İş modunda `.fun-only` öğeler CSS ile gizlenir, bu özelliklerden gelen
 // olaylar (davet, animasyon, dürtme) yok sayılır ve arka uç da bunların Windows bildirimlerini
@@ -7151,12 +7398,12 @@ function setFunMode(on, { quiet = false } = {}) {
     closeFxMenu();
     if (arenaOpen()) closeArena();
     if (gamesOpen()) closeGames();
-    if (officeOpen()) closeOffice();
     if (wp.open) closeWatchPlayer(true);
     $('#chat-more-menu').hidden = true;
   }
   renderGames();
   renderWatchBar();
+  officeGames();
   renderMe();
   renderPeers();
   renderConvs();
@@ -7341,6 +7588,7 @@ function officeOnTransfer(prev, t) {
 
 function officeGames() {
   if (!officeState.mod) return;
+  if (!funMode()) return officeState.mod.setGames([]);
   officeState.mod.setGames(state.games
     .filter((g) => g.status === 'active' && g.game === 'chess' && g.players.length === 2)
     .map((g) => ({ id: g.id, a: g.players[0].fingerprint, b: g.players[1].fingerprint })));
@@ -7484,6 +7732,7 @@ function chatDropAt(pos) {
 }
 
 function endDrag() {
+  markShareDrop(null);
   officeState.mod?.setDropTarget(null);
   document.body.classList.remove('dragging');
   document.querySelectorAll('.peer.drop-target').forEach((el) => el.classList.remove('drop-target'));
@@ -7494,6 +7743,18 @@ function shareDropAt(pos) {
   if (!pos || !shareOpen()) return false;
   const r = window.devicePixelRatio || 1;
   return !!document.elementFromPoint(pos.x / r, pos.y / r)?.closest('#share-view');
+}
+
+// Ortak klasörde bırakma hedefi: üzerine gelinen klasör satırı, yoksa seçili klasör.
+function shareDropFolder(pos) {
+  const r = window.devicePixelRatio || 1;
+  const row = pos && document.elementFromPoint(pos.x / r, pos.y / r)?.closest('#share-files .tnode');
+  if (row) return row.dataset.kind === 'dir' ? row.dataset.rel : (row.dataset.rel.includes('/') ? row.dataset.rel.slice(0, row.dataset.rel.lastIndexOf('/')) : '');
+  return shareSel();
+}
+function markShareDrop(rel) {
+  document.querySelectorAll('#share-files .tnode.drop').forEach((el) => el.classList.remove('drop'));
+  if (rel) document.querySelector(`#share-files .tnode.dir[data-rel="${CSS.escape(rel)}"]`)?.classList.add('drop');
 }
 
 // Bırakma noktası (kullanılamaz durumdaki) sohbet/klasör panelinin üzerinde mi?
@@ -7513,7 +7774,11 @@ api.onDragDrop((event) => {
     document.body.classList.add('dragging');
     if (batch) $('#drop-msg').textContent = 'Listeye eklemek için bırakın';
     else if (chatDropAt(p.position)) $('#drop-msg').textContent = `Bırak → ${state.chats.get(state.openChat)?.name || 'sohbet'}`;
-    else if (shareDropTarget() && shareDropAt(p.position)) $('#drop-msg').textContent = `“${shareDropTarget().name}” klasörüne eklemek için bırakın`;
+    else if (shareDropTarget() && shareDropAt(p.position)) {
+      const rel = shareDropFolder(p.position);
+      markShareDrop(rel);
+      $('#drop-msg').textContent = `“${rel ? rel.split('/').pop() : shareDropTarget().name}” klasörüne eklemek için bırakın`;
+    }
     else updateDragTarget(p.position);
   } else if (p.type === 'leave') {
     endDrag();
@@ -7530,7 +7795,7 @@ api.onDragDrop((event) => {
     // Açık sohbetin üzerine bırakıldıysa o sohbete (kişiye ya da gruba) gider.
     if (!modalKind && chatDropAt(p.position)) return sendToChat(paths);
     // Açık (ve kilidi açık) ortak klasörün üzerine bırakıldıysa oraya eklenir.
-    if (!modalKind && shareDropTarget() && shareDropAt(p.position)) return addToShare(shareDropTarget().id, paths);
+    if (!modalKind && shareDropTarget() && shareDropAt(p.position)) return addToShare(shareDropTarget().id, paths, shareDropFolder(p.position));
     // Kullanılamayan bir sohbet/klasör panelinin üzerine bırakıldı (çevrimdışı kişi, ayrılınan
     // grup, kilitli klasör): başka birine gitmesin.
     if (!modalKind && !id && sidePanelAt(p.position)) {
@@ -7773,6 +8038,9 @@ function createPreviewApi() {
       { path: 'Görseller/logo.png', size: 1.3e6, mtime: now - 3 * 3600e3, author: fp1, authorName: 'Ahmet' },
       { path: 'Görseller/arka-plan.jpg', size: 4.8e6, mtime: now - 26 * 3600e3, author: fp2, authorName: 'Elif (Tasarım)' },
       { path: 'Notlar.txt', size: 3.1e3, mtime: now - 4 * 86400e3, author: me, authorName: 'Siz' },
+      { path: 'Görseller/Kampanya/Kasım/afis-final.psd', size: 86e6, mtime: now - 2 * 3600e3, author: fp2, authorName: 'Elif (Tasarım)' },
+      { path: 'Görseller/Kampanya', size: 0, mtime: 0, author: fp2, authorName: 'Elif (Tasarım)', dir: true },
+      { path: 'Arşiv 2025', size: 0, mtime: 0, author: me, authorName: 'Siz', dir: true },
     ].map((f) => ({ ...f, fullPath: `C:\\Ortak\\${f.path}` })),
   };
   snap.shares = [
@@ -8214,7 +8482,7 @@ function createPreviewApi() {
     if (location.hash.includes('share')) { setTab('shares'); openShare('sh1'); }
     if (location.hash.includes('locked')) { setTab('shares'); openShare('sh2'); }
     if (location.hash.includes('poll')) openPoll(location.hash.includes('poll-closed') ? 'pl0' : 'pl2');
-    if (/game|office|watch|fun/.test(location.hash)) setFunMode(true, { quiet: true });
+    if (/game|watch|fun/.test(location.hash)) setFunMode(true, { quiet: true });
     if (location.hash.includes('games')) openGames();
     if (location.hash.includes('game-play')) openRoom('gm1');
     if (location.hash.includes('game-invite')) openRoom('gm2');
@@ -8268,6 +8536,26 @@ function createPreviewApi() {
       }
       if (cmd === 'chat_image_open') return null;
       if (cmd === 'share_files') return structuredClone(shareFilesMock[args.id] || []);
+      if (cmd === 'share_mkdir' || cmd === 'share_rename' || cmd === 'share_remove_path') {
+        const list = (shareFilesMock[args.id] ||= []);
+        const full = (p) => `C:\\Ortak\\${p.replaceAll('/', '\\')}`;
+        if (cmd === 'share_mkdir') {
+          const rel = args.parent ? `${args.parent}/${args.name}` : args.name;
+          if (list.some((f) => f.path.toLowerCase() === rel.toLowerCase())) throw 'Bu adda bir klasör ya da dosya zaten var';
+          list.push({ path: rel, size: 0, mtime: Date.now(), author: me, authorName: 'Siz', fullPath: full(rel), dir: true });
+          return rel;
+        }
+        const parent = args.path.includes('/') ? args.path.slice(0, args.path.lastIndexOf('/')) : '';
+        const to = cmd === 'share_rename' ? (parent ? `${parent}/${args.name}` : args.name) : null;
+        shareFilesMock[args.id] = list.flatMap((f) => {
+          const under = f.path === args.path || f.path.startsWith(`${args.path}/`);
+          if (!under) return [f];
+          if (!to) return [];
+          const p = to + f.path.slice(args.path.length);
+          return [{ ...f, path: p, fullPath: full(p) }];
+        });
+        return to;
+      }
       if (cmd === 'share_unlock') {
         if (args.password !== '1234') throw 'Şifre yanlış';
         const s = snap.shares.find((x) => x.id === args.id);

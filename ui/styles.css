@@ -1682,3 +1682,43 @@ svg.wa { stroke: none; stroke-width: 1; }
 .peer .avatar > svg.wa { position: absolute; inset: 0; }
 .preset > svg.wa { width: 100%; height: 100%; display: block; }
 .preset.on { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent); }
+
+/* ─── Ortak klasör: ağaç görünümü ─── */
+.share-tools { flex-wrap: wrap; }
+.share-tools #share-search { flex: 1 1 140px; min-width: 0; }
+.share-loc { display: flex; align-items: center; gap: 2px; flex-wrap: nowrap; overflow: hidden; padding: 6px 12px; border-bottom: 1px solid var(--border); font-size: 12.5px; min-height: 34px; }
+.share-loc .loc-label { color: var(--muted); margin-right: 4px; }
+.share-loc button { display: inline-flex; align-items: center; gap: 5px; border: 0; background: none; font: inherit; color: var(--muted); padding: 3px 6px; border-radius: 7px; cursor: pointer; max-width: 110px; flex-shrink: 1; min-width: 28px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.share-loc button svg { width: 14px; height: 14px; }
+.share-loc button:hover { background: var(--surface-2); color: var(--text); }
+.share-loc button.on { color: var(--accent); font-weight: 700; }
+.share-loc .sep { color: var(--muted); opacity: .6; }
+.tnode {
+  display: flex; align-items: center; gap: 6px; padding: 5px 8px 5px calc(6px + var(--d, 0) * 18px);
+  border-radius: 9px; cursor: pointer; min-height: 34px; position: relative;
+}
+.tnode:hover { background: var(--surface-2); }
+.tnode.sel { background: var(--accent-soft); }
+.tnode.drop { background: var(--accent-soft); box-shadow: inset 0 0 0 2px var(--accent); }
+.tnode .tchev { width: 16px; height: 16px; flex-shrink: 0; display: grid; place-items: center; color: var(--muted); }
+.tnode .tchev svg { width: 14px; height: 14px; transition: transform .12s; }
+.tnode.open > .tchev svg { transform: rotate(90deg); }
+.tnode .ticon { width: 24px; height: 24px; flex-shrink: 0; border-radius: 7px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent); }
+.tnode .ticon svg { width: 14px; height: 14px; }
+.tnode.dir .ticon { background: color-mix(in srgb, #f5b52a 22%, transparent); color: #c98a06; }
+.tnode.dir.open .ticon { color: #e09a00; }
+.tnode .tname { flex: 1 1 auto; min-width: 0; font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tnode.file .tname { font-weight: 500; }
+.tnode .tmeta { flex-shrink: 1; min-width: 0; color: var(--muted); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 46%; }
+.tnode .tacts { display: none; gap: 1px; flex-shrink: 0; }
+.tnode:hover .tacts, .tnode.sel .tacts { display: flex; }
+.tnode:hover .tmeta, .tnode.sel .tmeta { display: none; }
+.tnode .tacts .icon-btn { width: 26px; height: 26px; }
+.tnode .tacts .icon-btn svg { width: 14px; height: 14px; }
+.tname-input {
+  flex: 1; min-width: 0; font: inherit; font-size: 13px; font-weight: 600; color: var(--text); background: var(--surface);
+  border: 1.5px solid var(--accent); border-radius: 7px; padding: 4px 8px; outline: none; box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.tnode.editing { background: var(--surface-2); }
+.share-loc button.on { flex-shrink: 0; max-width: 150px; }
+.share-loc .loc-label { flex-shrink: 0; }

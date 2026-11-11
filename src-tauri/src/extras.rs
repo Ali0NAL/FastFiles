@@ -97,7 +97,23 @@ pub fn idle_time() -> Duration {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub fn idle_time() -> Duration {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventSourceSecondsSinceLastEventType(source_state: i32, event_type: u32) -> f64;
+    }
+    // kCGEventSourceStateCombinedSessionState = 0, kCGAnyInputEventType = !0
+    // SAFETY: parametreleri sabit, yan etkisiz CoreGraphics çağrısı.
+    let secs = unsafe { CGEventSourceSecondsSinceLastEventType(0, u32::MAX) };
+    if secs.is_finite() && secs > 0.0 {
+        Duration::from_secs_f64(secs)
+    } else {
+        Duration::ZERO
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn idle_time() -> Duration {
     Duration::ZERO
 }
@@ -571,9 +587,43 @@ impl Node {
         Err("Ekran görüntüsü alınmadı".into())
     }
 
-    #[cfg(not(windows))]
+    /// macOS'un `screencapture` aracıyla alan seçtirir ve seçilen alanı PNG olarak döndürür.
+    #[cfg(target_os = "macos")]
     pub async fn screen_clip(&self) -> Result<Vec<u8>, String> {
-        Err("Bu özellik yalnızca Windows'ta var".into())
+        self.extras.clip_cancel.store(false, Ordering::Relaxed);
+        let out = std::env::temp_dir().join(format!("fastfiles-clip-{}.png", uuid::Uuid::new_v4()));
+        // -i: alan/pencere seçimi, -x: deklanşör sesi yok. Esc ile vazgeçilirse dosya oluşmaz.
+        let mut child = tokio::process::Command::new("/usr/sbin/screencapture")
+            .arg("-i")
+            .arg("-x")
+            .arg(&out)
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("Ekran görüntüsü aracı açılamadı: {e}"))?;
+        let start = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                if !status.success() {
+                    let _ = std::fs::remove_file(&out);
+                    return Err("Ekran görüntüsü alınmadı".into());
+                }
+                break;
+            }
+            if self.extras.clip_cancel.load(Ordering::Relaxed) || start.elapsed() >= CLIP_WAIT {
+                let _ = child.kill().await;
+                let _ = std::fs::remove_file(&out);
+                return Err(if start.elapsed() >= CLIP_WAIT { "Ekran görüntüsü alınmadı" } else { "İptal edildi" }.into());
+            }
+            sleep(Duration::from_millis(150)).await;
+        }
+        let bytes = tokio::fs::read(&out).await.map_err(|_| "Ekran görüntüsü alınmadı".to_string());
+        let _ = std::fs::remove_file(&out);
+        bytes
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    pub async fn screen_clip(&self) -> Result<Vec<u8>, String> {
+        Err("Bu özellik bu işletim sisteminde yok".into())
     }
 
     pub fn screen_clip_cancel(&self) {

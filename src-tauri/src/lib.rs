@@ -377,13 +377,22 @@ fn shake_window(app: &AppHandle) {
     });
 }
 
+/// Windows: Ctrl+Shift+Boşluk. macOS: ⌘⇧Boşluk.
 fn quick_send_shortcut() -> tauri_plugin_global_shortcut::Shortcut {
     use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
-    Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space)
+    #[cfg(target_os = "macos")]
+    let m = Modifiers::SUPER | Modifiers::SHIFT;
+    #[cfg(not(target_os = "macos"))]
+    let m = Modifiers::CONTROL | Modifiers::SHIFT;
+    Shortcut::new(Some(m), Code::Space)
 }
 
+/// Windows: Ctrl+Shift+PrtSc. macOS: ⌘⇧2 (Mac klavyesinde PrtSc yok; sistemin ⌘⇧3/4/5'inin yanında).
 fn quick_shot_shortcut() -> tauri_plugin_global_shortcut::Shortcut {
     use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
+    #[cfg(target_os = "macos")]
+    return Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Digit2);
+    #[cfg(not(target_os = "macos"))]
     Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::PrintScreen)
 }
 
@@ -648,8 +657,26 @@ async fn game_remove(node: NodeState<'_>, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn share_add_files(node: NodeState<'_>, id: String, paths: Vec<String>) -> Result<usize, String> {
-    node.inner().share_add_files(&id, paths).await
+async fn share_add_files(node: NodeState<'_>, id: String, paths: Vec<String>, target: Option<String>) -> Result<usize, String> {
+    node.inner().share_add_files_to(&id, paths, target.as_deref().unwrap_or("")).await
+}
+
+/// Ortak klasörde yeni (alt) klasör: `parent` "" ise kökte. Göreli yolu döner.
+#[tauri::command]
+async fn share_mkdir(node: NodeState<'_>, id: String, parent: String, name: String) -> Result<String, String> {
+    node.inner().share_mkdir(&id, &parent, &name).await
+}
+
+/// Ortak klasördeki dosya ya da klasörü yeniden adlandırır; yeni göreli yolu döner.
+#[tauri::command]
+async fn share_rename(node: NodeState<'_>, id: String, path: String, name: String) -> Result<String, String> {
+    node.inner().share_rename(&id, &path, &name).await
+}
+
+/// Ortak klasördeki dosya ya da klasörü siler (yerelde çöpe taşınır, silme herkese yayılır).
+#[tauri::command]
+async fn share_remove_path(node: NodeState<'_>, id: String, path: String) -> Result<(), String> {
+    node.inner().share_remove_path(&id, &path).await
 }
 
 #[tauri::command]
@@ -1360,6 +1387,9 @@ pub fn run() {
             arena_send,
             arena_leave,
             share_add_files,
+            share_mkdir,
+            share_rename,
+            share_remove_path,
             remove_avatar,
             update_state,
             import_update,
@@ -1397,12 +1427,16 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("FastFiles başlatılamadı");
 
-    app.run(|app, event| {
-        if let RunEvent::Exit = event {
+    app.run(|app, event| match event {
+        RunEvent::Exit => {
             let node = app.state::<Arc<Node>>();
             node.shutdown.cancel();
             discovery::send_bye(&node);
         }
+        // macOS: pencere tepsiye gizliyken Dock simgesine tıklanınca yeniden aç.
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen { .. } => show_main(app),
+        _ => {}
     });
 }
 
