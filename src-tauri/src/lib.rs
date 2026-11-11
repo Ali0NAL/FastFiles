@@ -586,8 +586,37 @@ async fn game_list(node: NodeState<'_>) -> Result<Vec<GameView>, String> {
 }
 
 #[tauri::command]
-async fn game_invite(node: NodeState<'_>, game: String, players: Vec<String>, seat: Option<usize>) -> Result<GameView, String> {
-    node.game_invite(&game, &players, seat)
+async fn game_invite(
+    node: NodeState<'_>,
+    game: String,
+    players: Vec<String>,
+    seat: Option<usize>,
+    variant: Option<String>,
+) -> Result<GameView, String> {
+    node.game_invite_variant(&game, &players, seat, variant.as_deref())
+}
+
+// ───────────── Arena (gerçek zamanlı FPS) ─────────────
+
+#[tauri::command]
+fn arena_info(node: NodeState) -> serde_json::Value {
+    node.arena_info()
+}
+
+#[tauri::command]
+async fn arena_connect(node: NodeState<'_>, id: String) -> Result<serde_json::Value, String> {
+    node.arena_connect(&id).await
+}
+
+/// Saniyede ~30 kez çağrılır: yalnızca kuyruğa koyar (ya da sahipte doğrudan uygular), beklemez.
+#[tauri::command]
+fn arena_send(node: NodeState, packet: node::arena::Up) {
+    node.arena_send(packet);
+}
+
+#[tauri::command]
+fn arena_leave(node: NodeState) {
+    node.arena_leave();
 }
 
 #[tauri::command]
@@ -1306,6 +1335,10 @@ pub fn run() {
             game_invite,
             game_act,
             game_remove,
+            arena_info,
+            arena_connect,
+            arena_send,
+            arena_leave,
             share_add_files,
             remove_avatar,
             update_state,

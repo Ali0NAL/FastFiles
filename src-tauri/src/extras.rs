@@ -44,6 +44,7 @@ pub struct State {
     pub screen: screen::State,
     pub phone: phone::State,
     pub watch: watch::State,
+    pub arena: arena::State,
 }
 
 impl State {

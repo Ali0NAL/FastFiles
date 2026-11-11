@@ -76,6 +76,12 @@ pub struct GameRoom {
     pub rev: u64,
     pub created_at: u64,
     pub updated_at: u64,
+    /// Daveti gönderenin seçtiği tür (arenada harita). Türü olmayan oyunlarda boş.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub variant: String,
+    /// Gerçek zamanlı oyunun sonu: koltuk başına (öldürme, ölüm). Sahip maç bitince yazar.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stats: Vec<[u32; 2]>,
 }
 
 impl GameRoom {
@@ -202,6 +208,8 @@ fn reason_text(reason: &str) -> &'static str {
         "score" => "en az vuruş",
         "tie" => "eşit vuruş",
         "forfeit" => "diğerleri çekildi",
+        "kills" => "en çok öldürme",
+        "kills_tie" => "eşit öldürme",
         "points" => "sayı",
         "tie_points" => "eşit sayı",
         "team_forfeit" => "rakip takım çekildi",
@@ -409,6 +417,15 @@ fn clean_room(mut r: GameRoom) -> Option<GameRoom> {
     if r.draw_offer.as_ref().is_some_and(|d| !players.contains(d)) {
         r.draw_offer = None;
     }
+    // Tür, oyunun tanımladıklarından biri olmalı (türü olmayan oyunda boş).
+    if def.variants.is_empty() {
+        r.variant.clear();
+    } else if !def.variants.iter().any(|v| v.id == r.variant) {
+        return None;
+    }
+    if r.stats.len() > r.players.len() {
+        return None;
+    }
     if let Some(res) = &mut r.result {
         res.reason = sanitize_text(&res.reason, 24);
         if res.winner.as_ref().is_some_and(|w| !players.contains(w)) || res.by.as_ref().is_some_and(|b| !players.contains(b)) {
@@ -522,11 +539,58 @@ impl Node {
         }
     }
 
+    /// Odanın güncel hâli (gerçek zamanlı oyunlar için).
+    pub(super) fn game_room(&self, id: &str) -> Option<GameRoom> {
+        self.games.lock().unwrap().get(id).map(|s| s.room.clone())
+    }
+
+    /// (Sahip) gerçek zamanlı maç bitti: sonucu ve skorları odaya yazar, herkese iletir.
+    pub(super) fn game_finish_realtime(self: &Arc<Self>, id: &str, winner: Option<usize>, reason: &str, stats: Vec<[u32; 2]>) {
+        let me = self.identity.fingerprint.clone();
+        let notice = {
+            let mut map = self.games.lock().unwrap();
+            let Some(st) = map.get_mut(id) else { return };
+            if st.room.host != me || st.room.status != RoomStatus::Active {
+                return;
+            }
+            let w = winner.and_then(|s| st.room.players.get(s)).map(|p| p.fingerprint.clone());
+            st.room.stats = stats;
+            finish(&mut st.room, w, reason, None);
+            self.touch_room(st);
+            self.save_games(&map);
+            let st = &map[id];
+            (!st.hidden).then(|| (format!("{} bitti", game_title(&st.room.game)), result_line(&st.room, &me)))
+        };
+        self.flush_games();
+        self.emit_game(id);
+        if let Some((t, b)) = notice {
+            self.notify_game(id, &t, &b);
+        }
+    }
+
     // ───────────── Kullanıcı işlemleri ─────────────
 
     /// Oyun daveti gönderir. `my_seat`: sahibin koltuğu (satrançta 0 beyaz, 1 siyah); boşsa rastgele.
+    /// Uygulama doğrudan `game_invite_variant`'ı çağırır; bu kısayol testler içindir.
+    #[cfg(test)]
     pub fn game_invite(self: &Arc<Self>, game: &str, opponents: &[String], my_seat: Option<usize>) -> Result<GameView, String> {
+        self.game_invite_variant(game, opponents, my_seat, None)
+    }
+
+    /// `game_invite` gibi; `variant`: oyunun türlerinden biri (arenada harita), boşsa ilki.
+    pub fn game_invite_variant(
+        self: &Arc<Self>,
+        game: &str,
+        opponents: &[String],
+        my_seat: Option<usize>,
+        variant: Option<&str>,
+    ) -> Result<GameView, String> {
         let def = games::def(game).ok_or("Bilinmeyen oyun")?;
+        let variant = match (def.variants.first(), variant) {
+            (None, _) => String::new(),
+            (Some(first), None) => first.id.to_string(),
+            (Some(_), Some(v)) => def.variants.iter().find(|x| x.id == v).ok_or("Bilinmeyen harita")?.id.to_string(),
+        };
         let me = self.identity.fingerprint.clone();
         let my_name = self.device_info().name;
         let mut others: Vec<GroupMember> = Vec::new();
@@ -572,6 +636,8 @@ impl Node {
             rev: 1,
             created_at: now,
             updated_at: now,
+            variant,
+            stats: Vec::new(),
         };
         let mut st = RoomState {
             sync_pending: room.players.iter().map(|p| p.fingerprint.clone()).filter(|f| *f != me).collect(),
@@ -847,8 +913,8 @@ impl Node {
                     if st.room.host != room.host {
                         return reject("not_owner");
                     }
-                    // Oyun türü sonradan değiştirilemez (ör. satranç odası golfe çevrilemez).
-                    if st.room.game != room.game {
+                    // Oyun türü ve harita sonradan değiştirilemez (ör. satranç odası golfe çevrilemez).
+                    if st.room.game != room.game || st.room.variant != room.variant {
                         return reject("invalid");
                     }
                     if room.rev <= st.room.rev {

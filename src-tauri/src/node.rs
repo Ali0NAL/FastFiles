@@ -19,6 +19,8 @@ pub mod extras;
 pub mod screen;
 #[path = "phone.rs"]
 pub mod phone;
+#[path = "arena.rs"]
+pub mod arena;
 #[path = "watch.rs"]
 pub mod watch;
 
@@ -1280,6 +1282,12 @@ impl Node {
                 }
                 let (_rd, wr) = (rd, wr);
                 self.serve_screen(device.fingerprint.clone(), session, wr).await
+            }
+            Message::ArenaJoin { device, room_id } => {
+                if device.fingerprint != client_fp {
+                    return Err("cihaz kimliği sertifikayla eşleşmiyor".into());
+                }
+                self.clone().serve_arena(client_fp, room_id, rd, wr).await
             }
             Message::WatchUpdate { device, room, host_name, event } => {
                 if device.fingerprint != client_fp {
@@ -4599,6 +4607,80 @@ mod tests {
         game_ticks(&all, || game_of(&carol, &id).is_some_and(|v| v.room.status == RoomStatus::Finished)).await;
         let res = game_of(&alice, &id).unwrap().room.result.unwrap();
         assert_eq!((res.winner.as_deref(), res.reason.as_str()), (Some(afp.as_str()), "forfeit"));
+    }
+
+    // ───────────── Arena (gerçek zamanlı FPS) testleri ─────────────
+
+    /// Davet → kabul → iki oyuncu bağlanır, maç başlar; keskin nişancıyla kafadan öldürme,
+    /// yeniden doğma, duvar arkasına atılan vuruşun reddi, öldürme sınırında maç sonu ve sonucun
+    /// iki tarafa yazılması.
+    #[tokio::test]
+    async fn arena_match_hits_kills_and_finishes() {
+        use crate::games::arena as rules;
+        use arena::{Hit, Up};
+        use game::{GameAction, RoomStatus};
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        let mallory = make_node(tmp.path(), "mallory").await;
+        introduce_all(&[&alice, &bob, &mallory]);
+        let all = [&alice, &bob];
+        let (afp, bfp) = (alice.identity.fingerprint.clone(), bob.identity.fingerprint.clone());
+
+        assert!(alice.game_invite_variant("arena", &[bfp.clone()], Some(0), Some("yok")).is_err(), "bilinmeyen harita");
+        let id = alice.game_invite_variant("arena", &[bfp.clone()], Some(0), Some("depo")).unwrap().room.id;
+        game_ticks(&all, || game_of(&bob, &id).is_some()).await;
+        assert_eq!(game_of(&bob, &id).unwrap().room.variant, "depo", "harita davetle gelir");
+        assert!(bob.arena_connect(&id).await.is_err(), "oda açılmadan maça girilmez");
+        bob.game_act(&id, GameAction::Join).unwrap();
+        game_ticks(&all, || game_of(&alice, &id).is_some_and(|v| v.room.status == RoomStatus::Active)).await;
+        game_ticks(&all, || game_of(&bob, &id).is_some_and(|v| v.room.status == RoomStatus::Active)).await;
+
+        // Sahip yerelde, Bob ağdan bağlanır; davet edilmeyen bağlanamaz.
+        assert_eq!(alice.arena_connect(&id).await.unwrap()["seat"], 0);
+        assert_eq!(bob.arena_connect(&id).await.unwrap()["map"], "depo");
+        assert!(mallory.arena_connect(&id).await.is_err());
+        wait_for("maç başlasın", || alice.arena_debug(&id).is_some_and(|(started, ps)| started && ps.iter().all(|p| p.6 && p.1))).await;
+
+        // Görüş hattı açık iki nokta: Bob, Alice'in kafasına nişan alır.
+        let place = |a: rules::V3, b: rules::V3| {
+            alice.arena_place(&id, 0, a);
+            alice.arena_place(&id, 1, b);
+        };
+        let head_shot = |from: rules::V3, to: rules::V3, w: u8| {
+            let o = [from[0], from[1] + rules::EYE, from[2]];
+            let d = rules::normalize([to[0] - o[0], to[1] + 1.65 - o[1], to[2] - o[2]]).unwrap();
+            Up::Fire { w, o, d, hits: vec![Hit { s: 0, h: true, n: 1, d: None }] }
+        };
+        let (a_pos, b_pos) = ([-18.0, 0.0, 20.0], [-18.0, 0.0, 12.0]);
+        place(a_pos, b_pos);
+        bob.arena_send(head_shot(b_pos, a_pos, 1));
+        wait_for("ilk öldürme", || alice.arena_debug(&id).is_some_and(|(_, ps)| !ps[0].1 && ps[1].2 == 1 && ps[0].3 == 1)).await;
+        wait_for("yeniden doğma", || alice.arena_debug(&id).is_some_and(|(_, ps)| ps[0].1 && ps[0].0 == rules::MAX_HP)).await;
+
+        // Orta platformun arkasındaki hedefe tüfekle "vurdum" demek kabul edilmez.
+        let (a_hidden, b_other) = ([8.0, 0.0, 0.0], [-8.0, 0.0, 0.0]);
+        place(a_hidden, b_other);
+        bob.arena_send(head_shot(b_other, a_hidden, 0));
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(alice.arena_debug(&id).unwrap().1[0].0, rules::MAX_HP, "duvarın arkasından vuruş olmaz");
+
+        // İkinci öldürme (keskin nişancının atış aralığı beklenir) maçı bitirir.
+        sleep(Duration::from_millis(rules::WEAPONS[1].interval_ms)).await;
+        place(a_pos, b_pos);
+        bob.arena_send(head_shot(b_pos, a_pos, 1));
+        game_ticks(&all, || {
+            [&alice, &bob].iter().all(|n| game_of(n, &id).is_some_and(|v| v.room.status == RoomStatus::Finished))
+        })
+        .await;
+        for n in [&alice, &bob] {
+            let v = game_of(n, &id).unwrap();
+            let r = v.room.result.unwrap();
+            assert_eq!((r.winner.as_deref(), r.reason.as_str()), (Some(bfp.as_str()), "kills"));
+            assert_eq!(v.room.stats, vec![[0, 2], [2, 0]]);
+        }
+        assert!(alice.arena_connect(&id).await.is_err(), "biten maça girilmez");
+        let _ = afp;
     }
 
     // ───────────── Oylama testleri ─────────────

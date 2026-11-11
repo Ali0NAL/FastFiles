@@ -10,6 +10,7 @@
 //! Oda yönetimi, davet, ağ ve kayıt (bkz. `node/game.rs`) oyundan bağımsızdır; arayüzde de
 //! yalnızca oyun alanının çizimi oyuna özeldir.
 
+pub mod arena;
 pub mod basket;
 pub mod chess;
 mod common;
@@ -39,6 +40,17 @@ pub struct GameDef {
     /// Takımlı oyun: çift koltuklar bir takım, tek koltuklar diğer takım; takımlar eşit sayıda.
     /// Sonuçtaki `winner` kazanan takımın ilk koltuğudur (0 ya da 1).
     pub teams: bool,
+    /// Daveti gönderenin seçebildiği türler (ör. arenada harita). Boşsa seçim yok; varsa ilki
+    /// varsayılandır.
+    pub variants: &'static [Variant],
+    /// Gerçek zamanlı oyun: hamle listesi yerine canlı bağlantıyla oynanır (`node/arena.rs`).
+    pub realtime: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Variant {
+    pub id: &'static str,
+    pub name: &'static str,
 }
 
 pub const CATALOG: &[GameDef] = &[
@@ -51,6 +63,8 @@ pub const CATALOG: &[GameDef] = &[
         seats: &["Beyaz", "Siyah"],
         draw_offers: true,
         teams: false,
+        variants: &[],
+        realtime: false,
     },
     GameDef {
         id: "golf",
@@ -61,6 +75,8 @@ pub const CATALOG: &[GameDef] = &[
         seats: &[],
         draw_offers: false,
         teams: false,
+        variants: &[],
+        realtime: false,
     },
     GameDef {
         id: "basket",
@@ -71,6 +87,20 @@ pub const CATALOG: &[GameDef] = &[
         seats: &[],
         draw_offers: false,
         teams: true,
+        variants: &[],
+        realtime: false,
+    },
+    GameDef {
+        id: "arena",
+        name: "Arena",
+        description: "2–8 kişilik birinci şahıs nişancı: herkes tek başına, ölüm maçı. Tüfek, keskin nişancı ve pompalı; iki harita. 5 dakikada ya da 20 öldürmede biter, en çok öldüren kazanır.",
+        min_players: 2,
+        max_players: 8,
+        seats: &[],
+        draw_offers: false,
+        teams: false,
+        variants: &[Variant { id: "depo", name: "Depo" }, Variant { id: "avlu", name: "Avlu" }],
+        realtime: true,
     },
 ];
 
@@ -154,6 +184,7 @@ fn evaluate_uncached(game: &str, seed: &str, players: usize, moves: &[String]) -
         "chess" => chess::evaluate(moves),
         "golf" => golf::evaluate(seed, players, moves),
         "basket" => basket::evaluate(seed, players, moves),
+        "arena" => arena::evaluate(players, moves),
         _ => Err("bilinmeyen oyun".into()),
     }
 }
@@ -181,6 +212,7 @@ pub fn move_allowed(game: &str, before: &Eval, mv: &str) -> bool {
 pub fn move_actor(game: &str, before: &Eval, mv: &str) -> Option<usize> {
     match game {
         "golf" | "basket" => common::parse_quit(mv).or_else(|| common::parse_shot(mv).map(|s| s.0)),
+        "arena" => common::parse_quit(mv),
         _ => before.turn,
     }
 }
@@ -189,7 +221,7 @@ pub fn move_actor(game: &str, before: &Eval, mv: &str) -> Option<usize> {
 /// İki kişilik oyunlarda (satranç) `None`: pes eden kaybeder, oyun biter.
 pub fn forfeit_move(game: &str, seat: usize) -> Option<String> {
     match game {
-        "golf" | "basket" => Some(common::quit_move(seat)),
+        "golf" | "basket" | "arena" => Some(common::quit_move(seat)),
         _ => None,
     }
 }

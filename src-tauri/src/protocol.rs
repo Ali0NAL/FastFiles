@@ -196,6 +196,9 @@ pub enum Message {
     /// İzleme isteği (izleyici → paylaşan). Yanıt: ScreenStart + JPEG kareleri ya da ChatReject.
     /// Kareler `u32 (big-endian) uzunluk + JPEG` olarak akar; uzunluk 0 = paylaşım bitti.
     ScreenWatch { device: DeviceInfo, session: String },
+    /// Arena maçına katılım (oda sahibine). Ardından bağlantı gerçek zamanlı çerçevelerle sürer
+    /// (bkz. `node/arena.rs`); ret `ChatReject` ile gelir.
+    ArenaJoin { device: DeviceInfo, room_id: String },
     ScreenStart { width: u32, height: u32 },
     /// Birlikte izle odası (yalnızca oda sahibinden kabul edilir). Yanıt: GroupAck / ChatReject.
     WatchUpdate {

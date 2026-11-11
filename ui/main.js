@@ -3146,6 +3146,7 @@ const RESULT_REASON = {
   points: 'sayı', tie_points: 'eşit sayı', team_forfeit: 'rakip takım çekildi',
 };
 const GAME_ART = {
+  arena: '<span class="gc-golf gc-arena"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="7.5"/><circle cx="12" cy="12" r="2"/><path d="M12 1.5v5M12 17.5v5M1.5 12h5M17.5 12h5"/></svg></span>',
   chess: `<span class="gc-piece">${PIECE_GLYPH.n}︎</span>`,
   basket: '<span class="gc-golf gc-basket"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3v18M5.6 5.6c3.2 3 3.2 9.8 0 12.8M18.4 5.6c-3.2 3-3.2 9.8 0 12.8"/></svg></span>',
   golf: '<span class="gc-golf"><svg viewBox="0 0 24 24"><path d="M8 20V3l8 3.5L8 10"/><path d="M3 20.5c0-1.4 2.5-2.5 6-2.5s6 1.1 6 2.5"/><circle cx="18.5" cy="18.5" r="2"/></svg></span>',
@@ -3184,6 +3185,10 @@ function gameStatusText(g) {
     case 'declined': return g.isHost ? 'Davet reddedildi' : 'Daveti reddettiniz';
     case 'cancelled': return 'Davet geri çekildi';
     case 'finished': return gameResultText(g);
+  }
+  if (g.game === 'arena') {
+    if (g.info?.quit?.[g.mySeat]) return 'Maçtan çekildiniz';
+    return arenaState.roomId === g.id ? 'Maçtasınız' : 'Maç sürüyor · girmek için açın';
   }
   const golf = g.game === 'golf';
   if (golf && g.info?.quit?.[g.mySeat]) return 'Çekildiniz · izliyorsunuz';
@@ -3337,6 +3342,21 @@ function renderRoom() {
   const g = gameById(gameState.open);
   const isGolf = g?.game === 'golf';
   const isBasket = g?.game === 'basket';
+  const isArena = g?.game === 'arena';
+  $('#arena-col').hidden = !isArena;
+  if (isArena) {
+    $('#games-screen').classList.add('room-open');
+    $('#games-screen').classList.remove('wide-room');
+    $('#game-lobby').hidden = true;
+    $('#game-room').hidden = false;
+    $('#chess-col').hidden = true;
+    $('#golf-col').hidden = true;
+    $('#basket-col').hidden = true;
+    $('#moves-head').textContent = 'Skor tablosu';
+    renderRoomPanel(g);
+    renderArenaLobby(g);
+    return;
+  }
   $('#games-screen').classList.toggle('room-open', !!g);
   // Golf ve basket sahası geniş: açıkken oyun listesi gizlenir (geri düğmesi listeye döner).
   $('#games-screen').classList.toggle('wide-room', isGolf || isBasket);
@@ -3563,6 +3583,15 @@ function renderRoomPanel(g) {
       }
       break;
     case 'active': {
+      if (g.game === 'arena') {
+        const quit = g.info?.quit?.[g.mySeat];
+        const hostOff = !g.isHost && !peerByFp(g.host);
+        if (quit) status = 'Maçtan çekildiniz.';
+        else if (hostOff) status = `<b>${esc(g.hostName)}</b> (oda sahibi) çevrimdışı; maç onun bilgisayarında oynanır.`;
+        else { status = '<b>Maç sürüyor.</b> "Maça gir" ile tam ekran oynayın; istediğiniz an çıkıp yeniden girebilirsiniz.'; tone = 'turn'; }
+        if (!quit) actions = roomBtn('arena', 'Maça gir', '', hostOff) + roomBtn('resign', 'Maçtan çekil', 'ghost danger-text');
+        break;
+      }
       if (isGolf) {
         const off = golfPlaying(g).map((s) => g.players[s]).filter((p) => p.fingerprint !== me && !peerByFp(p.fingerprint));
         if (g.info?.quit?.[g.mySeat]) status = 'Oyundan çekildiniz; oyunu izliyorsunuz.';
@@ -4555,8 +4584,11 @@ $('#room-actions').addEventListener('click', async (e) => {
   if (!b || !g) return;
   const act = b.dataset.roomAct;
   if (act === 'rematch') return rematch(g);
+  if (act === 'arena') return openArena(g);
   if (act === 'resign') {
-    const ok = g.game === 'basket'
+    const ok = g.game === 'arena'
+      ? await confirmDialog('Maçtan çekilmek istiyor musunuz?', 'Maç diğerleriyle sürer; skorunuz sayılmaz. Tek kişi kalırsa o kazanır.', 'Çekil', true)
+      : g.game === 'basket'
       ? await confirmDialog('Oyundan çekilmek istiyor musunuz?', g.players.length > 2 ? 'Atışlarınızı takım arkadaşınız yapar; takımınızda kimse kalmazsa rakip takım kazanır.' : 'Rakibiniz kazanmış sayılır.', 'Çekil', true)
       : g.game === 'golf'
       ? await confirmDialog('Oyundan çekilmek istiyor musunuz?', 'Diğer oyuncular oyuna devam eder; tek kişi kalırsa o kazanır.', 'Çekil', true)
@@ -4568,12 +4600,113 @@ $('#room-actions').addEventListener('click', async (e) => {
   await call('game_act', { id: g.id, action: { kind } }).catch(() => {});
 });
 
+// ── Arena (FPS) ──
+// Maç tam ekranda ui/arena.js ile oynanır; burada oda paneli (harita, oyuncular, skor) ve maça
+// giriş/çıkış var. Haritalar ve silahlar arka uçtan (`arena_info`) gelir.
+
+const arenaState = { info: null, game: null, roomId: null, loading: false };
+const ARENA_MAP_DESC = {};
+const arenaOpen = () => !$('#arena-screen').hidden;
+const playerColor = (fp) => `hsl(${hue(fp)} 72% 55%)`;
+
+async function loadArenaInfo() {
+  if (arenaState.info) return arenaState.info;
+  arenaState.info = await api.invoke('arena_info');
+  for (const m of arenaState.info?.maps || []) ARENA_MAP_DESC[m.id] = m.description;
+  return arenaState.info;
+}
+
+function renderArenaLobby(g) {
+  const info = arenaState.info;
+  const map = info?.maps?.find((m) => m.id === g.variant);
+  const mapName = map?.name || gameDef('arena')?.variants?.find((v) => v.id === g.variant)?.name || g.variant;
+  const rules = info?.rules;
+  const players = g.players.map((p, s) => {
+    const on = p.fingerprint === myFp() || !!peerByFp(p.fingerprint);
+    const quit = g.info?.quit?.[s];
+    const joined = g.joined.includes(p.fingerprint);
+    const st = quit ? 'çekildi' : g.status === 'invited' && !joined ? 'davet bekliyor' : on ? 'çevrimiçi' : 'çevrimdışı';
+    return `<div class="ar-lp${quit ? ' quit' : ''}"><i style="background:${playerColor(p.fingerprint)}"></i><b>${esc(p.fingerprint === myFp() ? `${p.name} (siz)` : p.name)}</b><span>${esc(st)}</span>${p.fingerprint === g.host ? '<em>sunucu</em>' : ''}</div>`;
+  }).join('');
+  const weapons = (info?.weapons || []).map((w, i) => `<span><kbd>${i + 1}</kbd> ${esc(w.name)}</span>`).join('');
+  $('#arena-col').innerHTML = `
+    <div class="arena-card">
+      <div class="arena-hero arena-map-${esc(g.variant)}">
+        <div class="arena-hero-art">${GAME_ART.arena}</div>
+        <div><div class="arena-title">Arena · ${esc(mapName)}</div><div class="arena-desc">${esc(map?.description || '')}</div></div>
+      </div>
+      <div class="arena-rules">
+        <span>Herkes tek başına · ölüm maçı</span>
+        ${rules ? `<span>${Math.round(rules.matchSecs / 60)} dk ya da ${rules.killLimit} öldürme</span><span>${rules.respawnMs / 1000} sn'de yeniden doğma</span>` : ''}
+      </div>
+      <div class="arena-weapons">${weapons}</div>
+      <div class="arena-players">${players}</div>
+      ${g.status === 'active' && !g.info?.quit?.[g.mySeat] ? '<button class="btn arena-go" data-arena-go>Maça gir</button>' : ''}
+    </div>`;
+  renderArenaStats(g);
+}
+
+function renderArenaStats(g) {
+  const stats = g.stats || [];
+  if (!stats.length) {
+    $('#moves').innerHTML = `<div class="mv-empty">${g.status === 'finished' ? 'Skor yok' : 'Skor maç bitince burada görünür; maç sırasında Tab tuşuyla görün.'}</div>`;
+    return;
+  }
+  const rows = g.players.map((p, s) => ({ p, s, k: stats[s]?.[0] ?? 0, d: stats[s]?.[1] ?? 0 })).sort((a, b) => b.k - a.k || a.d - b.d);
+  $('#moves').innerHTML = `<table class="golf-scores arena-scores"><tr><th></th><th>Öldürme</th><th>Ölüm</th></tr>${rows.map((x) => `
+    <tr class="${g.result?.winner === x.p.fingerprint ? 'win' : ''}"><td class="who"><i style="background:${playerColor(x.p.fingerprint)}"></i>${esc(x.p.fingerprint === myFp() ? 'Siz' : x.p.name)}</td><td>${x.k}</td><td>${x.d}</td></tr>`).join('')}</table>`;
+}
+
+$('#arena-col').addEventListener('click', (e) => {
+  const g = gameById(gameState.open);
+  if (g && e.target.closest('[data-arena-go]')) openArena(g);
+});
+
+async function openArena(g) {
+  if (arenaState.loading || arenaOpen()) return;
+  arenaState.loading = true;
+  try {
+    const info = await loadArenaInfo();
+    const joined = await call('arena_connect', { id: g.id });
+    const mod = await import('./arena.js');
+    closeEmoji();
+    $('#arena-screen').hidden = false;
+    document.body.classList.add('arena-open');
+    arenaState.roomId = g.id;
+    arenaState.game = mod.createArena($('#arena-screen'), {
+      info,
+      mapId: joined.map,
+      seat: joined.seat,
+      players: g.players.map((p) => ({ name: p.name, color: playerColor(p.fingerprint) })),
+      send: (packet) => { api.invoke('arena_send', { packet }).catch(() => {}); },
+      onExit: closeArena,
+      debug: !T,
+    });
+    arenaState.game.lock();
+  } catch (e) {
+    if (!String(e).includes('çevrimdışı')) console.warn(e);
+  } finally {
+    arenaState.loading = false;
+  }
+}
+
+function closeArena() {
+  arenaState.game?.destroy();
+  arenaState.game = null;
+  arenaState.roomId = null;
+  api.invoke('arena_leave').catch(() => {});
+  $('#arena-screen').hidden = true;
+  document.body.classList.remove('arena-open');
+  renderGames();
+  if (gamesOpen()) renderRoom();
+}
+
 async function rematch(g) {
   const two = g.players.length === 2 && g.mySeat != null;
   // Takımlı oyunda takımlar korunur (aynı koltuklar); iki kişilikte taraflar değişir.
   const seat = isTeamGame(g) && !two ? g.mySeat : two ? 1 - g.mySeat : null;
   try {
-    const n = await call('game_invite', { game: g.game, players: opponentsOf(g).map((p) => p.fingerprint), seat });
+    const n = await call('game_invite', { game: g.game, players: opponentsOf(g).map((p) => p.fingerprint), seat, variant: g.variant || null });
     if (!gameById(n.id)) state.games = [n, ...state.games];
     openRoom(n.id);
     toast(`Davet gönderildi → ${vsName(n)}`, { type: 'success' });
@@ -4746,6 +4879,8 @@ function showGameCreate({ game, fp } = {}) {
   let chosen = gameDef(game) || defs[0];
   const selected = new Set(fp && !isBlocked(fp) ? [fp] : []);
   let seat = 'random';
+  // Türü olan oyunlarda (arenada harita) seçilen tür; boşsa ilki.
+  let variant = null;
   // Takımlı oyun: kişi → takım (0 Kırmızı, 1 Mavi). Seçilen kişi az kişili takıma eklenir.
   const teamOf = new Map([[myFp(), 0]]);
   const teamSizes = () => [0, 1].map((t) => [...teamOf.values()].filter((x) => x === t).length);
@@ -4755,6 +4890,7 @@ function showGameCreate({ game, fp } = {}) {
     <div class="field"><label>Oyun</label><div class="game-pick" id="gn-games"></div></div>
     <div class="field"><label id="gn-people-label">Rakip</label><div class="recips" id="gn-people"></div></div>
     <div class="field" id="gn-seat-field"><label>Taşlarınız</label><div class="seg" id="gn-seat"></div></div>
+    <div class="field" id="gn-variant-field" hidden><label>Harita</label><div class="seg" id="gn-variant"></div><div class="small muted" id="gn-variant-desc"></div></div>
     <div class="field" id="gn-teams-field" hidden><label>Takımlar <span class="muted" id="gn-mode"></span></label><div class="gn-teams" id="gn-teams"></div>
       <div class="small muted">Oyuncuya tıklayıp takımını değiştirin. Takımlar eşit olmalı: 1v1, 2v2 ya da 3v3.</div></div>
     <div class="err" id="gn-err"></div>
@@ -4784,7 +4920,17 @@ function showGameCreate({ game, fp } = {}) {
     }
     m.querySelector('#gn-seat').innerHTML = [['random', 'Rastgele'], ...seats.map((s, i) => [String(i), s])]
       .map(([v, l]) => `<button class="${seat === v ? 'on' : ''}" data-seat="${v}">${esc(l)}</button>`).join('');
+    const variants = chosen.variants || [];
+    if (!variants.some((v) => v.id === variant)) variant = variants[0]?.id || null;
+    m.querySelector('#gn-variant-field').hidden = !variants.length;
+    m.querySelector('#gn-variant').innerHTML = variants
+      .map((v) => `<button class="${variant === v.id ? 'on' : ''}" data-variant="${esc(v.id)}">${esc(v.name)}</button>`).join('');
+    m.querySelector('#gn-variant-desc').textContent = chosen.id === 'arena' ? (ARENA_MAP_DESC[variant] || '') : '';
   };
+  m.querySelector('#gn-variant').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-variant]');
+    if (b) { variant = b.dataset.variant; render(); }
+  });
   m.querySelector('#gn-games').addEventListener('click', (e) => {
     const b = e.target.closest('[data-g]');
     if (!b) return;
@@ -4831,7 +4977,7 @@ function showGameCreate({ game, fp } = {}) {
       players = order.filter((f) => f !== myFp());
     }
     try {
-      const g = await api.invoke('game_invite', { game: chosen.id, players, seat: mySeat });
+      const g = await api.invoke('game_invite', { game: chosen.id, players, seat: mySeat, variant });
       if (!gameById(g.id)) state.games = [g, ...state.games];
       closeModal();
       openRoom(g.id);
@@ -7326,6 +7472,8 @@ async function init() {
   api.listen('shares', (e) => onShares(e.payload));
   api.listen('polls', (e) => onPolls(e.payload));
   api.listen('games', (e) => onGames(e.payload));
+  api.listen('arena', (e) => arenaState.game?.handle(e.payload));
+  loadArenaInfo().catch(() => {});
   api.listen('game', (e) => onGame(e.payload));
   api.listen('game-error', (e) => toast(e.payload.message, { type: 'error', timeout: 6000 }));
   api.listen('share-files', (e) => { if (state.openShare === e.payload.id) loadShareFiles(); });
@@ -7726,7 +7874,66 @@ function createPreviewApi() {
   // Örnek basket (2v2): Kırmızı = Nur & Elif, Mavi = Ahmet & Render-Sunucu. 2. turda (savunmacı) Ahmet attı, sıra bizde.
   snap.gameCatalog.push({ id: 'basket', name: 'Basket', description: 'Takımlı atış yarışması: 1v1, 2v2 ya da 3v3. Her turda herkes aynı noktadan sırayla atar; rüzgâr, savunmacı, para topu, temiz sayı ve 🔥 seri bonusları var. Çok sayı atan takım kazanır.', minPlayers: 2, maxPlayers: 6, seats: [], teams: true });
   const fp3 = snap.peers[2]?.fingerprint || 'c'.repeat(64);
-  const bkPlayers = [{ fingerprint: me, name: 'Nur' }, { fingerprint: fp1, name: 'Ahmet' }, { fingerprint: fp2, name: 'Elif (Tasarım)' }, { fingerprint: fp3, name: snap.peers[2]?.name || 'Render-Sunucu' }];
+  // Örnek arena (FPS) odası ve önizleme için taklit maç sunucusu: iki bot dolaşır, vurulunca
+  // ölür ve yeniden doğar (gerçek doğrulama arka uçtadır). Harita verisi arena-preview.json'dan.
+  snap.gameCatalog.push({ id: 'arena', name: 'Arena', description: '2–8 kişilik birinci şahıs nişancı: herkes tek başına, ölüm maçı. Tüfek, keskin nişancı ve pompalı; iki harita.', minPlayers: 2, maxPlayers: 8, seats: [], variants: [{ id: 'depo', name: 'Depo' }, { id: 'avlu', name: 'Avlu' }], realtime: true });
+  const arPlayers = [{ fingerprint: me, name: 'Nur' }, { fingerprint: fp1, name: 'Ahmet' }, { fingerprint: fp2, name: 'Elif (Tasarım)' }];
+  snap.games.unshift(gameMock({ id: 'gm9', game: 'arena', title: 'Arena', host: me, hostName: 'Nur', isHost: true, players: arPlayers, variant: 'depo',
+    joined: arPlayers.map((p) => p.fingerprint), status: 'active', mySeat: 0, createdAt: now - 60e3, updatedAt: now - 30e3, info: { quit: [false, false, false] } }));
+  const arMock = { timer: 0, info: null, map: null, players: [], ev: [], t0: 0, kills: [0, 0, 0], deaths: [0, 0, 0] };
+  const arenaMockStart = async (roomId) => {
+    const g = snap.games.find((x) => x.id === roomId);
+    arMock.info ||= await fetch('arena-preview.json').then((r) => r.json());
+    arMock.map = arMock.info.maps.find((m) => m.id === g.variant) || arMock.info.maps[0];
+    const sp = arMock.map.spawns;
+    arMock.players = g.players.map((p, s) => ({ s, p: [...sp[s * 3 % sp.length]], yaw: 0, pitch: 0, c: false, w: 0, hp: 100, alive: true, sp: 1, on: true, respawnAt: 0, t: s * 2 }));
+    arMock.t0 = Date.now();
+    clearInterval(arMock.timer);
+    arMock.timer = setInterval(() => {
+      const nowMs = Date.now();
+      for (const b of arMock.players.slice(1)) {
+        if (!b.alive && nowMs >= b.respawnAt) {
+          Object.assign(b, { alive: true, hp: 100, sp: b.sp + 1, p: [...sp[(b.sp * 3 + b.s) % sp.length]] });
+          arMock.ev.push({ e: 'spawn', s: b.s });
+        }
+        if (!b.alive) continue;
+        b.t += 1 / 30;
+        b.p[0] += Math.cos(b.t * 0.7) * 0.08;
+        b.p[2] += Math.sin(b.t * 0.9) * 0.08;
+        b.p[0] = Math.max(-arMock.map.halfX + 1, Math.min(arMock.map.halfX - 1, b.p[0]));
+        b.p[2] = Math.max(-arMock.map.halfZ + 1, Math.min(arMock.map.halfZ - 1, b.p[2]));
+        b.yaw = Math.atan2(-Math.cos(b.t * 0.7), -Math.sin(b.t * 0.9));
+      }
+      const left = Math.max(0, arMock.info.rules.matchSecs * 1000 - (nowMs - arMock.t0));
+      emit('arena', {
+        t: 'snap', left, started: true, ev: arMock.ev.splice(0),
+        players: arMock.players.map((x) => ({ ...x, k: arMock.kills[x.s], d: arMock.deaths[x.s], respawn: Math.max(0, x.respawnAt - nowMs) })),
+      });
+    }, 33);
+    return { seat: 0, map: arMock.map.id };
+  };
+  const arenaMockSend = (pk) => {
+    const meP = arMock.players[0];
+    if (!meP) return;
+    if (pk.t === 'input') Object.assign(meP, { p: pk.p, yaw: pk.yaw, pitch: pk.pitch, w: pk.w, c: pk.c });
+    if (pk.t !== 'fire') return;
+    arMock.ev.push({ e: 'fire', s: 0, w: pk.w, o: pk.o, d: pk.d });
+    const W = arMock.info.weapons[pk.w];
+    for (const h of pk.hits || []) {
+      const b = arMock.players[h.s];
+      if (!b?.alive) continue;
+      const dmg = W.damage * h.n * (h.h ? W.headMult : 1);
+      b.hp -= dmg;
+      arMock.ev.push({ e: 'hit', by: 0, to: h.s, dmg, head: h.h });
+      if (b.hp <= 0) {
+        Object.assign(b, { hp: 0, alive: false, respawnAt: Date.now() + arMock.info.rules.respawnMs });
+        arMock.kills[0] += 1;
+        arMock.deaths[h.s] += 1;
+        arMock.ev.push({ e: 'kill', by: 0, to: h.s, w: pk.w, head: h.h });
+      }
+    }
+  };
+  const bkPlayers =[{ fingerprint: me, name: 'Nur' }, { fingerprint: fp1, name: 'Ahmet' }, { fingerprint: fp2, name: 'Elif (Tasarım)' }, { fingerprint: fp3, name: snap.peers[2]?.name || 'Render-Sunucu' }];
   const bkDemo = gameMock({ id: 'gm4', game: 'basket', title: 'Basket', host: me, hostName: 'Nur', isHost: true, players: bkPlayers,
     joined: bkPlayers.map((p) => p.fingerprint), status: 'active', mySeat: 0, createdAt: now - 5 * 60e3, updatedAt: now - 15e3,
     moves: ['s0a2994p40', 's1a2757p96', 's2a2739p97', 's3a2741p96', 's1a2790p100'] });
@@ -7869,6 +8076,7 @@ function createPreviewApi() {
     if (location.hash.includes('game-invite')) openRoom('gm2');
     if (location.hash.includes('game-over')) openRoom('gm0');
     if (location.hash.includes('game-golf')) openRoom('gm3');
+    if (location.hash.includes('game-arena')) openRoom('gm9');
     if (location.hash.includes('game-basket')) openRoom('gm4');
     if (location.hash.includes('game-new')) showGameCreate();
     if (location.hash.includes('palette')) openPalette();
@@ -7964,6 +8172,10 @@ function createPreviewApi() {
         setTimeout(() => emit('games', structuredClone(snap.games)), 40);
         return null;
       }
+      if (cmd === 'arena_info') return arMock.info ||= await fetch('arena-preview.json').then((r) => r.json());
+      if (cmd === 'arena_connect') return arenaMockStart(args.id);
+      if (cmd === 'arena_send') { arenaMockSend(args.packet); return null; }
+      if (cmd === 'arena_leave') { clearInterval(arMock.timer); return null; }
       if (cmd === 'game_invite') {
         const others = args.players.map((f) => ({ fingerprint: f, name: snap.peers.find((p) => p.fingerprint === f)?.name || 'Kişi' }));
         const seat = args.seat ?? Math.round(Math.random());
