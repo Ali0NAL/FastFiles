@@ -5,6 +5,8 @@ Aynı ağa (Wi-Fi veya ethernet) bağlı bilgisayarlar birbirini otomatik bulur.
 
 ## Özellikler
 
+> **İş modu / eğlence modu.** Uygulama her açılışta **iş modunda** başlar: yalnızca ofiste kullanılan özellikler (aktarım, mesajlaşma, ortak klasörler, oylama, ekran paylaşımı, telefon, hızlı gönderim…) görünür. **Oyunlar, Sanal ofis (3B), Birlikte izle, ekran animasyonları (hediye, kalp, kurşun) ve Dürt** yalnızca **eğlence modunda** kullanılabilir. Eğlence modu, sol üstteki logoya **3 saniye basılı tutup** açılan pencereye `mola` şifresi yazılınca açılır; üst çubuktaki **"Ofis moduna dön"** düğmesiyle kapanır. İş modunda bu özelliklerden gelen davet, animasyon ve dürtmeler gösterilmez, Windows bildirimi çıkmaz, pencere öne gelmez (sohbete kısa bir not düşer; oyun davetleri eğlence modu açılınca listede görünür).
+
 - **Otomatik keşif.** Uygulamayı açan herkes birkaç saniye içinde listede görünür. IP yazmaya gerek yoktur.
 - **Sürükle-bırak.** Dosya ve klasörleri bir cihazın kartına bırakmak yeterlidir. "Dosya" ve "Klasör" butonları da var.
 - **Klasör desteği.** Klasör yapısı karşı tarafta aynen korunur.

@@ -9,10 +9,11 @@
 <body>
   <header class="topbar">
     <div class="brand">
-      <div class="logo" aria-hidden="true">
+      <div class="logo" id="brand-logo" aria-hidden="true">
         <svg viewBox="0 0 24 24"><path d="M13.5 2 5 13.2h6L9.8 22 19 10h-6.2z"/></svg>
       </div>
       <span>FastFiles</span>
+      <span class="fun-chip fun-only" title="Eğlence modu açık: oyunlar, animasyonlar ve birlikte izleme kullanılabilir">☕ Mola</span>
     </div>
     <div class="me" id="me" title="Durumunuzu değiştirmek için tıklayın" role="button" tabindex="0">
       <span class="avatar xs" id="me-avatar" aria-hidden="true"></span>
@@ -22,10 +23,13 @@
       <span class="me-status" id="me-status"></span>
     </div>
     <div class="top-actions">
-      <button class="btn soft small office-btn" id="btn-office" title="Ofisin 3B görünümü: kim nerede oturuyor, kim kime ne gönderiyor">
+      <button class="btn small work-btn fun-only" id="btn-work-mode" title="Eğlence özelliklerini kapatıp iş moduna dönün">
+        <svg viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="13" rx="2"/><path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M3 13h18"/></svg>Ofis moduna dön
+      </button>
+      <button class="btn soft small office-btn fun-only" id="btn-office" title="Ofisin 3B görünümü: kim nerede oturuyor, kim kime ne gönderiyor">
         <svg viewBox="0 0 24 24"><path d="M3 10h18l-1.5 2.5h-15z"/><path d="M6 12.5V20M18 12.5V20"/><circle cx="8" cy="5.5" r="1.8"/><circle cx="16" cy="5.5" r="1.8"/></svg>Ofis
       </button>
-      <button class="btn soft small games-btn" id="btn-games" title="Arkadaşlarınızla oyun oynayın">
+      <button class="btn soft small games-btn fun-only" id="btn-games" title="Arkadaşlarınızla oyun oynayın">
         <svg viewBox="0 0 24 24"><path d="M6 11h4M8 9v4M15 12h.01M18 10h.01"/><path d="M17.3 5H6.7a4 4 0 0 0-4 3.6l-.6 6.1a2.6 2.6 0 0 0 2.6 2.8c.9 0 1.7-.5 2.1-1.2L8 14h8l1.2 2.3c.4.7 1.2 1.2 2.1 1.2a2.6 2.6 0 0 0 2.6-2.8l-.6-6.1A4 4 0 0 0 17.3 5z"/></svg>Oyunlar
         <span class="tab-badge" id="games-badge" hidden>0</span>
       </button>
@@ -51,7 +55,7 @@
     <button class="btn small" id="share-bar-stop">Paylaşımı durdur</button>
   </div>
 
-  <div class="watch-bar" id="watch-bar" hidden>
+  <div class="watch-bar fun-only" id="watch-bar" hidden>
     <span class="wb-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="2.5" y="5" width="19" height="13" rx="3"/><path d="M10 8.8v6.4l5.4-3.2z"/></svg></span>
     <span class="wb-text" id="watch-bar-text"></span>
     <span class="spacer"></span>
@@ -237,10 +241,10 @@
           <button class="icon-btn sm" id="chat-screen" title="Ekranımı paylaş">
             <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4M12 13V7M9.5 9.5 12 7l2.5 2.5"/></svg>
           </button>
-          <button class="icon-btn sm" id="chat-watch" title="Birlikte izle (YouTube)">
+          <button class="icon-btn sm fun-only" id="chat-watch" title="Birlikte izle (YouTube)">
             <svg viewBox="0 0 24 24"><rect x="2.5" y="5" width="19" height="13" rx="3"/><path d="M10 8.8v6.4l5.4-3.2z"/><path d="M8 21h8"/></svg>
           </button>
-          <div class="chat-fx" id="chat-fx-wrap" hidden>
+          <div class="chat-fx fun-only" id="chat-fx-wrap" hidden>
             <button class="icon-btn sm" id="chat-fx" title="Animasyon gönder (ekranında oynar)" aria-haspopup="menu" aria-expanded="false">
               <svg viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="1.5"/><path d="M3 7.5h18V10H3zM12 7.5V20"/><path d="M12 7.5C10.5 4 7 3.6 7 5.6 7 7 9.4 7.5 12 7.5zM12 7.5c1.5-3.5 5-3.9 5-1.9 0 1.4-2.4 1.9-5 1.9z"/></svg>
             </button>
@@ -263,7 +267,7 @@
               <div class="fx-menu-note" id="fx-menu-note">Art arda gönderilemez · 15 sn ara</div>
             </div>
           </div>
-          <button class="icon-btn sm" id="chat-nudge" title="Dürt (penceresi titrer)" hidden>
+          <button class="icon-btn sm fun-only" id="chat-nudge" title="Dürt (penceresi titrer)" hidden>
             <svg viewBox="0 0 24 24"><path d="M7 11.5V6.5a1.5 1.5 0 0 1 3 0V11M10 10V4.5a1.5 1.5 0 0 1 3 0V10M13 10V5.5a1.5 1.5 0 0 1 3 0V12M16 9.5a1.5 1.5 0 0 1 3 0V14a7 7 0 0 1-7 7h-.6a6 6 0 0 1-4.6-2.2L3.5 15a1.6 1.6 0 0 1 2.4-2.1L7 14"/><path d="M3 5.5 1.8 4.6M4.6 3.2 4 1.8M20.5 3.8l1.2-1"/></svg>
           </button>
           <div class="chat-more">
@@ -274,7 +278,7 @@
               <button class="icon-btn sm" id="chat-search" title="Sohbette ara (Ctrl+F)">
                 <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
               </button>
-              <button class="icon-btn sm" id="chat-game" title="Oyuna davet et" hidden>
+              <button class="icon-btn sm fun-only" id="chat-game" title="Oyuna davet et" hidden>
                 <svg viewBox="0 0 24 24"><path d="M6 11h4M8 9v4M15 12h.01M18 10h.01"/><path d="M17.3 5H6.7a4 4 0 0 0-4 3.6l-.6 6.1a2.6 2.6 0 0 0 2.6 2.8c.9 0 1.7-.5 2.1-1.2L8 14h8l1.2 2.3c.4.7 1.2 1.2 2.1 1.2a2.6 2.6 0 0 0 2.6-2.8l-.6-6.1A4 4 0 0 0 17.3 5z"/></svg>
               </button>
               <button class="icon-btn sm" id="chat-leave" title="Gruptan ayrıl" hidden>
@@ -323,8 +327,11 @@
     </aside>
   </main>
 
+  <!-- Oyunlar, Arena, Sanal ofis, Birlikte izle ve ekran animasyonları yalnızca eğlence modunda
+       (logoya 3 sn basılı tutup "mola" şifresi). İş modunda `.fun-only` öğeler gizlenir. -->
+
   <!-- Oyunlar: sol tarafta oyun listesi, sağda oyun seçimi ya da açık oyun odası -->
-  <section class="games-screen" id="games-screen" hidden>
+  <section class="games-screen fun-only" id="games-screen" hidden>
     <aside class="games-side">
       <div class="games-side-head">
         <button class="icon-btn sm" id="games-close" title="Oyunlardan çık (Esc)"><svg viewBox="0 0 24 24"><path d="M15 18 9 12l6-6"/></svg></button>
@@ -398,10 +405,10 @@
   </section>
 
   <!-- Arena maçı: tam ekran, fare kilitli (ui/arena.js çizer) -->
-  <div class="arena-screen" id="arena-screen" hidden></div>
+  <div class="arena-screen fun-only" id="arena-screen" hidden></div>
 
   <!-- Sanal ofis: masanın 3B dijital ikizi -->
-  <section class="office-screen" id="office-screen" hidden>
+  <section class="office-screen fun-only" id="office-screen" hidden>
     <div class="office-stage" id="office-stage"></div>
     <div class="office-hud office-tl">
       <button class="icon-btn sm" id="office-close" title="Ofisten çık (Esc)"><svg viewBox="0 0 24 24"><path d="M15 18 9 12l6-6"/></svg></button>
@@ -450,7 +457,7 @@
   </section>
 
   <!-- Birlikte izle (YouTube) -->
-  <section class="watch-party" id="watch-party" hidden aria-label="Birlikte izle">
+  <section class="watch-party fun-only" id="watch-party" hidden aria-label="Birlikte izle">
     <div class="wp-head">
       <span class="wp-live" aria-hidden="true"></span>
       <div class="wp-titles">

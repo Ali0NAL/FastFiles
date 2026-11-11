@@ -1939,7 +1939,7 @@ $('#messages').addEventListener('keydown', (e) => {
 });
 $('#messages').addEventListener('click', async (e) => {
   const ytw = e.target.closest('.yt-watch');
-  if (ytw) return showWatchStart(state.openChat, ytw.dataset.yt);
+  if (ytw) return funMode() ? showWatchStart(state.openChat, ytw.dataset.yt) : undefined;
   const link = e.target.closest('.msg-link');
   if (link) {
     e.preventDefault();
@@ -2343,6 +2343,8 @@ function onNotificationClick(target = {}) {
   if (lockVisible()) return;
   if (target.view === 'phone') return openPhone();
   if (target.view === 'screen' && target.session) return watchScreen(target.session);
+  // Oyun / birlikte izle bildirimleri iş modunda hiçbir ekran açmaz.
+  if ((target.view === 'games' || target.view === 'watch') && !funMode()) return;
   if (target.view === 'watch' && target.id) return wp.rooms.get(target.id)?.v.joined ? openWatchPlayer(target.id) : joinWatch(target.id);
   if (modalKind && modalKind !== 'incoming') closeModal();
   if (target.view === 'games') {
@@ -3305,29 +3307,31 @@ function onGames(list) {
   const hadOpt = gameState.optimistic;
   state.games = list;
   maybeClearOptimistic();
-  // Uygulama öndeyken de haber ver (arkadayken Windows bildirimi gelir).
+  // Uygulama öndeyken de haber ver (arkadayken Windows bildirimi gelir). İş modunda oyunlar
+  // görünmez: davet ve sıra bildirimleri gösterilmez (oda listesi yine güncellenir).
+  const note = funMode() ? toast : () => {};
   for (const g of list) {
     const old = before.get(g.id);
     if (!old) {
       if (!g.isHost && g.status === 'invited' && g.needsMe) {
-        toast(`${g.hostName} sizi ${g.title} oynamaya davet ediyor`, { action: 'Görüntüle', timeout: 12000, onAction: () => openRoom(g.id) });
+        note(`${g.hostName} sizi ${g.title} oynamaya davet ediyor`, { action: 'Görüntüle', timeout: 12000, onAction: () => openRoom(g.id) });
       }
       continue;
     }
     if (gamesOpen() && gameState.open === g.id) continue;
     if (old.status === 'invited' && g.status === 'active') {
-      toast(`${vsName(g)} ile ${g.title} başladı`, { type: 'success', action: 'Oyuna git', timeout: 10000, onAction: () => openRoom(g.id) });
+      note(`${vsName(g)} ile ${g.title} başladı`, { type: 'success', action: 'Oyuna git', timeout: 10000, onAction: () => openRoom(g.id) });
     } else if (old.status === 'invited' && g.status === 'declined' && g.isHost) {
-      toast(`${vsName(g)} ${g.title} davetinizi reddetti`, { type: 'error' });
+      note(`${vsName(g)} ${g.title} davetinizi reddetti`, { type: 'error' });
     } else if (old.status !== 'finished' && g.status === 'finished') {
-      toast(`${g.title} · ${gameResultText(g)}`, { action: 'Gör', timeout: 8000, onAction: () => openRoom(g.id) });
+      note(`${g.title} · ${gameResultText(g)}`, { action: 'Gör', timeout: 8000, onAction: () => openRoom(g.id) });
     } else if (g.game === 'golf' && g.myTurn && old.info?.hole !== g.info?.hole) {
       // Golfte herkes aynı anda oynar: yalnızca yeni delik başlayınca haber verilir.
-      toast(`${g.title} · ${g.info.hole + 1}. delik başladı (${vsName(g)})`, { action: 'Oyuna git', timeout: 8000, onAction: () => openRoom(g.id) });
+      note(`${g.title} · ${g.info.hole + 1}. delik başladı (${vsName(g)})`, { action: 'Oyuna git', timeout: 8000, onAction: () => openRoom(g.id) });
     } else if (g.game !== 'golf' && !old.myTurn && g.myTurn) {
-      toast(`${g.title} · sıra sizde (${vsName(g)})`, { action: 'Oyuna git', timeout: 8000, onAction: () => openRoom(g.id) });
+      note(`${g.title} · sıra sizde (${vsName(g)})`, { action: 'Oyuna git', timeout: 8000, onAction: () => openRoom(g.id) });
     } else if (g.drawOffer && g.drawOffer !== myFp() && old.drawOffer !== g.drawOffer) {
-      toast(`${vsName(g)} beraberlik teklif ediyor`, { action: 'Gör', timeout: 8000, onAction: () => openRoom(g.id) });
+      note(`${vsName(g)} beraberlik teklif ediyor`, { action: 'Gör', timeout: 8000, onAction: () => openRoom(g.id) });
     }
   }
   if (gameState.open && !gameById(gameState.open)) gameState.open = null;
@@ -5403,6 +5407,7 @@ $('#chat-nudge').onclick = async () => {
   } catch { /* toast gösterildi */ }
 };
 function onNudge({ fingerprint, name }) {
+  if (!funMode()) return; // iş modunda pencere titremez (sohbete not yine düşer)
   document.body.classList.remove('nudged');
   void document.body.offsetWidth;
   document.body.classList.add('nudged');
@@ -5474,7 +5479,7 @@ $('#fx-menu').addEventListener('click', async (e) => {
 
 function onEffect({ key, name, effect, group }) {
   const info = FX_INFO[effect];
-  if (!info) return;
+  if (!info || !funMode()) return; // iş modunda oynamaz (sohbete not yine düşer)
   const locked = lockVisible();
   const text = `${name} ${group ? 'gruba' : 'sana'} ${info.what} ${info.verb}${effect === 'bullet' ? '!' : ''}`;
   // Kilitliyken animasyon oynar ama kimden geldiği gösterilmez.
@@ -6141,8 +6146,8 @@ function paletteItems(q) {
   const actions = [
     { kind: 'action', id: 'shot', label: '📸 Ekran görüntüsü al, çiz, gönder', sub: 'Ctrl+Shift+PrtSc' },
     { kind: 'action', id: 'phone', label: '📱 Telefon bağla (QR)', sub: 'Telefondan bilgisayara, bilgisayardan telefona' },
-    { kind: 'action', id: 'office', label: '🏢 Ofisi aç', sub: '3B görünüm' },
-  ].filter((a) => match(a.label));
+    { kind: 'action', id: 'office', label: '🏢 Ofisi aç', sub: '3B görünüm', fun: true },
+  ].filter((a) => match(a.label) && (!a.fun || funMode()));
   return q ? [...items, ...actions] : [...actions, ...items];
 }
 
@@ -6465,7 +6470,7 @@ function onWatch({ view, event }) {
 }
 
 function onWatchInvite({ id, hostName, title }) {
-  if (wp.open) return renderWatchBar();
+  if (wp.open || !funMode()) return renderWatchBar();
   toast(`🎬 ${hostName} birlikte izlemeye çağırıyor${title ? ` · ${title}` : ''}`, { action: 'Katıl', timeout: 10000, onAction: () => joinWatch(id) });
   renderWatchBar();
 }
@@ -7075,6 +7080,90 @@ document.addEventListener('keydown', (e) => {
   else if (e.key.toLowerCase() === 'f' && !e.ctrlKey) $('#wp-full').click();
 });
 
+// ───────────────────────────── İş / eğlence modu ─────────────────────────────
+// Uygulama her açılışta iş modunda başlar: yalnızca ofiste kullanılan özellikler görünür.
+// Eğlence modu (oyunlar, sanal ofis, birlikte izle, ekran animasyonları, dürtme) sol üstteki
+// logoya 3 sn basılı tutup "mola" şifresi yazılınca açılır; üst çubuktaki "Ofis moduna dön"
+// düğmesiyle kapanır. İş modunda `.fun-only` öğeler CSS ile gizlenir, bu özelliklerden gelen
+// olaylar (davet, animasyon, dürtme) yok sayılır ve arka uç da bunların Windows bildirimlerini
+// göstermez (`set_fun_mode`).
+
+const FUN_PASSWORD = 'mola';
+const FUN_HOLD_MS = 3000;
+function funMode() { return document.body.classList.contains('fun-mode'); }
+
+function setFunMode(on, { quiet = false } = {}) {
+  on = !!on;
+  api.invoke('set_fun_mode', { on }).catch(() => {});
+  if (funMode() === on) return;
+  document.body.classList.toggle('fun-mode', on);
+  if (!on) {
+    // Açık eğlence ekranları kapanır (süren oyunlar kaybolmaz; Arena maçından ve izleme
+    // odasından çıkılır).
+    closeFxMenu();
+    if (arenaOpen()) closeArena();
+    if (gamesOpen()) closeGames();
+    if (officeOpen()) closeOffice();
+    if (wp.open) closeWatchPlayer(true);
+    $('#chat-more-menu').hidden = true;
+  }
+  renderGames();
+  renderWatchBar();
+  if (state.openChat) renderChatHead();
+  if (!quiet) toast(on ? '☕ Eğlence modu açık · iyi molalar!' : '💼 İş moduna dönüldü', { type: 'success' });
+}
+
+function showFunUnlock() {
+  const m = openModal('fun', `
+    <h3>☕ Mola zamanı</h3>
+    <p class="lead">Eğlence modunu açmak için şifreyi yazın.</p>
+    <div class="field">
+      <input class="input" id="fun-pass" type="password" placeholder="Şifre" autocomplete="off" spellcheck="false" autofocus />
+      <div class="err" id="fun-err"></div>
+    </div>
+    <div class="foot">
+      <button class="btn ghost" data-close>Vazgeç</button>
+      <button class="btn" id="fun-go">Aç</button>
+    </div>`);
+  const input = m.querySelector('#fun-pass');
+  m.querySelector('[data-close]').onclick = closeModal;
+  const go = () => {
+    if (input.value.trim().toLocaleLowerCase('tr') === FUN_PASSWORD) {
+      closeModal();
+      setFunMode(true);
+      return;
+    }
+    m.querySelector('#fun-err').textContent = input.value ? 'Şifre yanlış' : 'Şifreyi yazın';
+    input.classList.remove('shake');
+    void input.offsetWidth;
+    input.classList.add('shake');
+    input.select();
+  };
+  m.querySelector('#fun-go').onclick = go;
+  input.addEventListener('keydown', (e) => e.key === 'Enter' && go());
+}
+
+// Logoya 3 sn basılı tutmak (iş modundayken) şifre penceresini açar.
+{
+  const logo = $('#brand-logo');
+  let timer = 0;
+  const cancel = () => { clearTimeout(timer); timer = 0; logo.classList.remove('holding'); };
+  logo.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || funMode() || lockVisible()) return;
+    e.preventDefault();
+    cancel();
+    try { logo.setPointerCapture(e.pointerId); } catch { /* yalnızca bırakınca iptal */ }
+    logo.classList.add('holding');
+    timer = setTimeout(() => {
+      cancel();
+      if (funMode() || lockVisible() || modalKind === 'incoming' || modalKind === 'welcome') return;
+      showFunUnlock();
+    }, FUN_HOLD_MS);
+  });
+  for (const ev of ['pointerup', 'pointercancel', 'lostpointercapture']) logo.addEventListener(ev, cancel);
+}
+$('#btn-work-mode').onclick = () => setFunMode(false);
+
 // ───────────────────────────── Kısayollar ─────────────────────────────
 
 document.addEventListener('keydown', (e) => {
@@ -7509,6 +7598,8 @@ async function init() {
   // Gezgin'de sağ tık → "FastFiles ile gönder".
   api.listen('send-request', () => takePendingSend());
   takePendingSend();
+  // Her açılış iş modunda başlar (arayüz yeniden yüklendiyse arka uç da eşitlensin).
+  if (!funMode()) api.invoke('set_fun_mode', { on: false }).catch(() => {});
 
   // IP değişikliklerini (Wi-Fi ↔ ethernet) yakala.
   setInterval(async () => { await refreshSnapshot().catch(() => {}); renderMe(); }, 15000);
@@ -8071,6 +8162,7 @@ function createPreviewApi() {
     if (location.hash.includes('share')) { setTab('shares'); openShare('sh1'); }
     if (location.hash.includes('locked')) { setTab('shares'); openShare('sh2'); }
     if (location.hash.includes('poll')) openPoll(location.hash.includes('poll-closed') ? 'pl0' : 'pl2');
+    if (/game|office|watch|fun/.test(location.hash)) setFunMode(true, { quiet: true });
     if (location.hash.includes('games')) openGames();
     if (location.hash.includes('game-play')) openRoom('gm1');
     if (location.hash.includes('game-invite')) openRoom('gm2');
@@ -8278,7 +8370,7 @@ function createPreviewApi() {
         return structuredClone(m);
       }
       if (cmd === 'chat_nudge') return null;
-      if (cmd === 'chat_effect') return null;
+      if (cmd === 'chat_effect' || cmd === 'set_fun_mode') return null;
       if (cmd === 'chat_queue_files') {
         const name = args.paths[0].split(/[\\/]/).pop();
         const msg = { id: `q${Date.now()}`, outgoing: true, text: `📎 ${name}`, at: Date.now(), status: 'sending', pending: [args.fingerprint], recipients: 1,

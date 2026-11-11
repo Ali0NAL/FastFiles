@@ -206,6 +206,20 @@ async fn chat_nudge(node: NodeState<'_>, fingerprint: String) -> Result<(), Stri
     node.inner().chat_nudge(&fingerprint)
 }
 
+/// Eğlence modu (oyunlar, ekran animasyonları, dürtme, birlikte izle, 3B ofis) açık mı?
+/// Uygulama her açılışta iş modunda başlar; iş modunda bu özelliklerin Windows bildirimleri
+/// gösterilmez, pencere öne getirilmez ve titretilmez.
+static FUN_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn fun_mode() -> bool {
+    FUN_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[tauri::command]
+fn set_fun_mode(on: bool) {
+    FUN_MODE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Sohbete ekran animasyonu gönderir: "gift" | "heart" | "bullet".
 #[tauri::command]
 async fn chat_effect(node: NodeState<'_>, key: String, effect: String) -> Result<(), String> {
@@ -1128,7 +1142,7 @@ pub fn run() {
                         notify_background(&emit_handle, name, &body, serde_json::json!({ "view": "chat", "key": key }));
                     }
                     // Dürtme: pencere titrer (odaktayken yalnızca sohbete not düşer)
-                    "nudge" if !do_not_disturb(&emit_handle) => {
+                    "nudge" if fun_mode() && !do_not_disturb(&emit_handle) => {
                         let name = payload["name"].as_str().unwrap_or("Biri");
                         if let Some(w) = emit_handle.get_webview_window("main") {
                             let _ = w.show();
@@ -1144,7 +1158,7 @@ pub fn run() {
                         );
                     }
                     // Ekran animasyonu (hediye, kalp, kurşun): pencere öne gelir, animasyon tüm ekranda oynar.
-                    "effect" if !do_not_disturb(&emit_handle) => {
+                    "effect" if fun_mode() && !do_not_disturb(&emit_handle) => {
                         let name = payload["name"].as_str().unwrap_or("Biri");
                         let (title, body) = match payload["effect"].as_str() {
                             Some("gift") => (format!("🎁 {name} size hediye gönderdi"), "Açmak için tıklayın"),
@@ -1173,7 +1187,7 @@ pub fn run() {
                         );
                     }
                     // Birlikte izle daveti
-                    "watch-invite" if !do_not_disturb(&emit_handle) => {
+                    "watch-invite" if fun_mode() && !do_not_disturb(&emit_handle) => {
                         let name = payload["hostName"].as_str().unwrap_or("Biri");
                         let title = payload["title"].as_str().filter(|t| !t.is_empty()).unwrap_or("YouTube videosu");
                         notify_background(
@@ -1184,6 +1198,8 @@ pub fn run() {
                         );
                     }
                     // Dosya alımı başladı (güvenilir cihaz) / bitti / başarısız ("Odakta" iken sessiz)
+                    // Oyun bildirimleri (davet, sıra sizde…) yalnızca eğlence modunda.
+                    "notify" if payload["target"]["view"] == "games" && !fun_mode() => {}
                     "notify" if !do_not_disturb(&emit_handle) => {
                         notify_background(
                             &emit_handle,
@@ -1354,6 +1370,7 @@ pub fn run() {
             chat_delete,
             chat_nudge,
             chat_effect,
+            set_fun_mode,
             chat_queue_files,
             screen_clip,
             screen_clip_cancel,

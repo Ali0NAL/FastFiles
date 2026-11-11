@@ -1642,3 +1642,36 @@ body.fx-gift.fx-glow :is(.layout, .games-screen, .office-screen, .watch-party) {
 .ar-btn { border: 0; border-radius: 10px; padding: 9px 20px; font: inherit; font-weight: 700; color: #fff; background: #7c77ff; cursor: pointer; }
 .ar-btn.ghost { background: rgba(255, 255, 255, .1); }
 .ar-btn:hover { filter: brightness(1.1); }
+
+/* ─── İş / eğlence modu ───
+   İş modu varsayılandır: eğlence özellikleri (oyunlar, sanal ofis, birlikte izle, ekran
+   animasyonları, dürtme) gizlidir. Eğlence modu logoya 3 sn basılı tutup şifreyle açılır. */
+body:not(.fun-mode) .fun-only,
+body:not(.fun-mode) .yt-watch { display: none !important; }
+
+.logo { position: relative; user-select: none; -webkit-user-select: none; touch-action: none; }
+.logo.holding { animation: logo-hold 3s linear forwards; }
+.logo.holding::after {
+  content: ""; position: absolute; inset: -5px; border-radius: 13px;
+  border: 2px solid var(--accent); pointer-events: none;
+  animation: logo-ring 3s linear forwards;
+}
+@keyframes logo-hold { 0%, 15% { transform: none; } 100% { transform: scale(.86); } }
+@keyframes logo-ring { 0%, 15% { opacity: 0; transform: scale(1.35); } 100% { opacity: 1; transform: scale(1); } }
+
+.input.shake { animation: shake .4s; }
+
+body.fun-mode .topbar {
+  background-image: linear-gradient(90deg, #ff5f7e, #ff9a3d, #ffd23f, #34d17f, #22c5e0, #7c77ff, #c86bff);
+  background-size: 100% 3px; background-repeat: no-repeat; background-position: bottom;
+  border-bottom-color: transparent;
+}
+body.fun-mode .logo { background: linear-gradient(135deg, #ff5f7e, #ffb03f 50%, #22c5e0); }
+.fun-chip {
+  padding: 3px 10px; border-radius: 999px;
+  font-size: 12px; font-weight: 600; letter-spacing: 0;
+  color: #9a5b00; background: #fff1d6; border: 1px solid #ffd99a;
+}
+:root[data-mode="dark"] .fun-chip { color: #ffcf7a; background: #3a2a10; border-color: #6b4d1a; }
+@media (prefers-color-scheme: dark) { :root:not([data-mode="light"]) .fun-chip { color: #ffcf7a; background: #3a2a10; border-color: #6b4d1a; } }
+.work-btn svg { width: 15px; height: 15px; }
