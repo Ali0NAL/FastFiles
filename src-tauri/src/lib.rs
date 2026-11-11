@@ -82,6 +82,7 @@ fn update_settings(
     appearance: Option<String>,
     lock_minutes: Option<u32>,
     seat: Option<u8>,
+    work_avatar: Option<u8>,
     hotkeys: Option<bool>,
 ) -> Result<Settings, String> {
     if let Some(name) = &device_name {
@@ -122,6 +123,9 @@ fn update_settings(
         }
         if let Some(v) = seat {
             s.seat = if v > protocol::MAX_SEAT { 0 } else { v };
+        }
+        if let Some(v) = work_avatar {
+            s.work_avatar = if v > protocol::WORK_AVATARS { 0 } else { v };
         }
         if let Some(v) = hotkeys {
             s.hotkeys = v;

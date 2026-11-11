@@ -96,6 +96,9 @@ pub struct Settings {
     pub install_attempt_at: u64,
     /// Sanal ofiste oturulan koltuk (0 = seçilmedi). Keşif duyurusuyla diğer cihazlara gider.
     pub seat: u8,
+    /// İş modundaki hazır profil resmi (1..=WORK_AVATARS). 0 = seçilmedi: arayüz parmak izinden
+    /// birini seçer. Keşif duyurusuyla diğer cihazlara gider.
+    pub work_avatar: u8,
     /// Elle seçilen durum: "" (müsait) | "busy" | "focus" | "away". Boşken 10 dk işlem
     /// yapılmazsa kendiliğinden "away" olur.
     pub status: String,
@@ -123,6 +126,7 @@ impl Default for Settings {
             install_attempt: String::new(),
             install_attempt_at: 0,
             seat: 0,
+            work_avatar: 0,
             status: String::new(),
             hotkeys: true,
         }

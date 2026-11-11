@@ -87,6 +87,8 @@ pub struct Peer {
     pub avatar: String,
     /// Sanal ofiste seçtiği koltuk (0 = seçmedi).
     pub seat: u8,
+    /// İş modundaki hazır profil resmi (0 = seçmedi).
+    pub work_avatar: u8,
     /// Durum: "" | "busy" | "focus" | "away".
     pub status: String,
     #[serde(skip)]
@@ -441,9 +443,9 @@ impl Node {
     pub fn device_info(&self) -> DeviceInfo {
         // Ayarlar tek seferde okunur: yapı ifadesindeki kilit geçicileri ifade bitene kadar
         // yaşar, aynı kilidi ikinci kez almak kilitlenmeye yol açar.
-        let (name, seat) = {
+        let (name, seat, work_avatar) = {
             let s = self.settings.lock().unwrap();
-            (s.device_name.clone(), s.seat)
+            (s.device_name.clone(), s.seat, s.work_avatar)
         };
         DeviceInfo {
             id: self.identity.id.clone(),
@@ -455,6 +457,7 @@ impl Node {
             pkg: self.update_pkg.lock().unwrap().as_ref().map(|h| h.version.clone()).unwrap_or_default(),
             avatar: self.my_avatar_hash(),
             seat,
+            work_avatar,
             status: self.extras.status_now(),
         }
     }
@@ -784,6 +787,9 @@ impl Node {
         if d.seat > crate::protocol::MAX_SEAT {
             d.seat = 0;
         }
+        if d.work_avatar > crate::protocol::WORK_AVATARS {
+            d.work_avatar = 0;
+        }
         if !valid_status(&d.status) {
             d.status.clear();
         }
@@ -817,9 +823,11 @@ impl Node {
                         || p.pkg != d.pkg
                         || p.avatar != d.avatar
                         || p.seat != d.seat
+                        || p.work_avatar != d.work_avatar
                         || p.status != d.status;
                     p.avatar = d.avatar;
                     p.seat = d.seat;
+                    p.work_avatar = d.work_avatar;
                     p.status = d.status;
                     p.version = d.version;
                     p.pkg = d.pkg;
@@ -851,6 +859,7 @@ impl Node {
                             pkg: d.pkg,
                             avatar: d.avatar,
                             seat: d.seat,
+                            work_avatar: d.work_avatar,
                             status: d.status,
                             last_seen: Some(now),
                             addrs: vec![(ip, now)],

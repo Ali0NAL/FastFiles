@@ -2,6 +2,7 @@
 // Tauri içinde `window.__TAURI__` kullanılır; tarayıcıda açılırsa örnek verilerle önizleme modu çalışır.
 
 import { YTPlayer, YT, parseYouTube, ytThumb, ytWatchUrl, fmtClock } from './ytplayer.js';
+import { workAvatarSvg, WORK_AVATARS } from './workavatars.js';
 
 const T = window.__TAURI__;
 const api = T ? {
@@ -67,11 +68,36 @@ function hue(id) {
   return (h >>> 0) % 360;
 }
 const grad = (id) => { const h = hue(id); return `linear-gradient(135deg, hsl(${h} 72% 62%), hsl(${(h + 35) % 360} 70% 50%))`; };
-/** Profil resmi varsa resim, yoksa baş harfler (avatar kutusunun içi). */
+/** Avatar kutusunun içi. Fotoğraflar (hazır resimler ya da yüklenen resim) yalnızca eğlence
+ *  modunda görünür; iş modunda (ve fotoğrafı olmayanlarda) kişinin iş profil resmi çizilir. */
 const face = (fp, name) => {
-  const url = state.avatars.get(fp);
-  return url ? `<img src="${esc(url)}" alt="" draggable="false">` : esc(initials(name));
+  const url = funMode() && state.avatars.get(fp);
+  return url ? `<img src="${esc(url)}" alt="" draggable="false">` : workAvatarSvg(workAvatarOf(fp));
 };
+
+// İş profil resmi: kişinin seçtiği numara (keşif duyurusuyla gelir), seçmediyse parmak izinden
+// türetilen numara. Çevrimdışı kişiler için son bilinen seçim bu bilgisayarda saklanır.
+const WA_CACHE_KEY = 'ff.workAvatars';
+const waCache = (() => { try { return JSON.parse(localStorage.getItem(WA_CACHE_KEY)) || {}; } catch { return {}; } })();
+function rememberWorkAvatars(peers) {
+  let changed = false;
+  for (const p of peers || []) {
+    if (p.fingerprint && p.workAvatar && waCache[p.fingerprint] !== p.workAvatar) {
+      waCache[p.fingerprint] = p.workAvatar;
+      changed = true;
+    }
+  }
+  if (changed) try { localStorage.setItem(WA_CACHE_KEY, JSON.stringify(waCache)); } catch { /* yalnızca önbellek */ }
+}
+function autoWorkAvatar(fp) {
+  let h = 2166136261;
+  for (const c of String(fp || '')) h = Math.imul(h ^ c.charCodeAt(0), 16777619);
+  return ((h >>> 0) % WORK_AVATARS) + 1;
+}
+function workAvatarOf(fp) {
+  if (fp && fp === state.device?.fingerprint) return state.settings?.workAvatar || autoWorkAvatar(fp);
+  return state.peers.find((p) => p.fingerprint === fp)?.workAvatar || waCache[fp] || autoWorkAvatar(fp);
+}
 const fpShort = (fp) => (fp || '').slice(0, 16).toUpperCase().match(/.{4}/g)?.join(' ') ?? '';
 
 const ic = {
@@ -198,6 +224,7 @@ function renderMe() {
 
 function renderPeers() {
   const list = state.peers;
+  rememberWorkAvatars(list);
   $('#peer-count').textContent = list.length;
   $('#peers').hidden = list.length === 0;
   $('#peers-empty').hidden = list.length > 0;
@@ -217,7 +244,7 @@ function renderPeers() {
       el.dataset.id = p.id;
       setTimeout(() => el.classList.remove('enter'), 400);
     }
-    const sig = JSON.stringify([p.name, p.ip, p.os, p.version, p.trusted, p.blocked, p.manualAddr, p.status, unreadOf(p.fingerprint), state.avatars.get(p.fingerprint)?.length || 0]);
+    const sig = JSON.stringify([p.name, p.ip, p.os, p.version, p.trusted, p.blocked, p.manualAddr, p.status, unreadOf(p.fingerprint), state.avatars.get(p.fingerprint)?.length || 0, funMode(), workAvatarOf(p.fingerprint)]);
     if (el.dataset.sig !== sig) {
       el.dataset.sig = sig;
       el.innerHTML = peerInner(p);
@@ -756,6 +783,7 @@ function showSettings() {
     <p class="lead">Bu bilgisayarın ağda nasıl görüneceği ve gelen dosyaların nereye kaydedileceği.</p>
     <div class="field">
       <label>Profil resmi</label>
+      ${funMode() ? `
       <div class="avatar-edit">
         <div class="avatar" id="s-avatar" style="background:${grad(state.device?.fingerprint)}">${face(state.device?.fingerprint, s.deviceName)}</div>
         <div class="row">
@@ -769,7 +797,15 @@ function showSettings() {
         ${window.FF_PRESET_AVATARS.map((p) => `
           <button class="preset" data-file="${esc(p.file)}" title="${esc(p.title)}"><img src="avatars/${esc(p.file)}" alt="${esc(p.title)}" loading="lazy" draggable="false"></button>`).join('')}
       </div>` : ''}
-      <span class="help">Hazır avatarlardan birine tıklayın ya da kendi resminizi seçin. Diğerleri sizi bu resimle görür.</span>
+      <span class="help">Eğlence modu profil resmi: hazır resimlerden birine tıklayın ya da kendi resminizi seçin. Eğlence modundakiler sizi bu resimle görür; iş modunda iş profil resminiz görünür.</span>` : `
+      <div class="avatar-edit">
+        <div class="avatar" id="s-avatar">${face(state.device?.fingerprint, s.deviceName)}</div>
+        <span class="help">İş modunda herkes sizi bu resimle görür. Aşağıdan birini seçin.</span>
+      </div>
+      <div class="preset-grid" id="s-work-avatars">
+        ${Array.from({ length: WORK_AVATARS }, (_, i) => i + 1).map((n) => `
+          <button class="preset wa-pick ${workAvatarOf(state.device?.fingerprint) === n ? 'on' : ''}" data-wa="${n}" title="Profil resmi ${n}">${workAvatarSvg(n)}</button>`).join('')}
+      </div>`}
     </div>
     <div class="field">
       <label for="s-name">Cihaz adı</label>
@@ -896,6 +932,17 @@ function showSettings() {
       toast(String(e?.message || e), { type: 'error' });
     }
   };
+  m.querySelector('#s-work-avatars')?.addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-wa]');
+    if (!b) return;
+    try {
+      state.settings = await call('update_settings', { workAvatar: Number(b.dataset.wa) });
+    } catch { return; /* toast gösterildi */ }
+    m.querySelectorAll('#s-work-avatars [data-wa]').forEach((x) => x.classList.toggle('on', x === b));
+    m.querySelector('#s-avatar').innerHTML = face(state.device.fingerprint, state.settings.deviceName);
+    renderMe();
+  });
+  if (fileInput) {
   m.querySelector('#s-avatar-pick').onclick = () => fileInput.click();
   fileInput.onchange = () => {
     const file = fileInput.files?.[0];
@@ -913,6 +960,7 @@ function showSettings() {
     m.querySelector('#s-avatar-remove').hidden = true;
     renderMe();
   };
+  }
   m.querySelector('#s-import').onclick = async () => {
     const file = await api.pick({ multiple: false, directory: false, title: 'FastFiles güncelleme paketi', filters: [{ name: 'FastFiles güncellemesi', extensions: ['ffupdate'] }] });
     if (!file) return;
@@ -7109,6 +7157,10 @@ function setFunMode(on, { quiet = false } = {}) {
   }
   renderGames();
   renderWatchBar();
+  renderMe();
+  renderPeers();
+  renderConvs();
+  if (pollOpen()) renderPoll();
   if (state.openChat) renderChatHead();
   if (!quiet) toast(on ? '☕ Eğlence modu açık · iyi molalar!' : '💼 İş moduna dönüldü', { type: 'success' });
 }
@@ -8439,6 +8491,7 @@ function createPreviewApi() {
       if (['screen_clip_cancel', 'screen_watch_stop', 'screen_dismiss', 'phone_stop', 'show_window'].includes(cmd)) return null;
       if (cmd === 'update_settings') {
         if ('seat' in args) snap.settings.seat = args.seat;
+        if ('workAvatar' in args) snap.settings.workAvatar = args.workAvatar;
         return structuredClone(snap.settings);
       }
       return snap.settings;

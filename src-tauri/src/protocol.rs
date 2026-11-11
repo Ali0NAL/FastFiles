@@ -47,11 +47,16 @@ pub struct DeviceInfo {
     /// Sanal ofiste seçilen koltuk (1..=MAX_SEAT). 0 = seçilmedi (eski sürümler göndermez).
     #[serde(default)]
     pub seat: u8,
+    /// İş modundaki hazır profil resmi (1..=WORK_AVATARS). 0 = seçilmedi (eski sürümler göndermez).
+    #[serde(default)]
+    pub work_avatar: u8,
     /// Durum: "" (müsait) | "busy" (toplantıda) | "focus" (odakta) | "away" (dışarıda).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub status: String,
 }
 
+/// İş modundaki hazır profil resmi sayısı (arayüzdeki `WORK_AVATARS` ile aynı).
+pub const WORK_AVATARS: u8 = 20;
 /// Sanal ofisteki en yüksek koltuk numarası (masa düzeni büyürse artırılabilir).
 pub const MAX_SEAT: u8 = 32;
 /// Geçerli durum değerleri ("" = müsait).
