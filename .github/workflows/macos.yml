@@ -33,13 +33,28 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          cache-on-failure: true
 
       - name: Tauri CLI kur
         run: cargo install tauri-cli --version "^2" --locked
 
       - name: Derle (universal .dmg)
         working-directory: src-tauri
-        run: cargo tauri build --target universal-apple-darwin --bundles app,dmg
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo tauri build --target universal-apple-darwin --bundles app,dmg 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      # Loglar yalnızca giriş yapınca görünür; hata özeti çalıştırma sayfasında herkese görünsün.
+      - name: Hata özetini göster
+        if: failure()
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/build.log"
+          [ -f "$log" ] || exit 0
+          msg="$(grep -nE 'error(\[E[0-9]+\])?:|^error|Error:|failed to' "$log" | head -30; echo '-----'; tail -50 "$log")"
+          msg="${msg//'%'/'%25'}"; msg="${msg//$'\r'/'%0D'}"; msg="${msg//$'\n'/'%0A'}"
+          echo "::error title=Derleme hatası::$msg"
 
       - name: Sürümü oku
         id: ver
