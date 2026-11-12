@@ -129,6 +129,7 @@ fn clipboard_seq() -> u32 {
 }
 
 /// RGBA görüntüyü bellekte PNG'ye çevirir.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     {
