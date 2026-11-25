@@ -131,6 +131,22 @@ impl Node {
             None if valid_fingerprint(key) => vec![key.to_string()],
             None => return Err("Geçersiz kişi".into()),
         };
+        self.screen_share_with(&targets)
+    }
+
+    /// Ekranı seçilen kişilerle paylaşır. Zaten paylaşılıyorsa yeni kişiler aynı oturuma eklenir;
+    /// tek yakalama tüm izleyicilere gider (birden fazla kişi aynı anda izleyebilir).
+    pub fn screen_share_with(self: &Arc<Self>, fingerprints: &[String]) -> Result<String, String> {
+        let me = self.identity.fingerprint.clone();
+        let mut targets: Vec<String> = Vec::new();
+        for f in fingerprints.iter().take(64) {
+            if valid_fingerprint(f) && *f != me && !targets.contains(f) {
+                targets.push(f.clone());
+            }
+        }
+        if targets.is_empty() {
+            return Err("Paylaşılacak kişi seçilmedi".into());
+        }
         let online: Vec<Peer> = self.peers().into_iter().filter(|p| !p.blocked && targets.contains(&p.fingerprint)).collect();
         if online.is_empty() {
             return Err("Paylaşılacak kişi çevrimiçi değil".into());

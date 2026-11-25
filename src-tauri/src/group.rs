@@ -89,7 +89,7 @@ impl Node {
         }
     }
 
-    fn emit_chat_message(&self, key: &str, msg: &ChatMessage, incoming: bool) {
+    pub(super) fn emit_chat_message(&self, key: &str, msg: &ChatMessage, incoming: bool) {
         let meta = self.chats.lock().unwrap().conversation_meta(key);
         if let Some((name, unread)) = meta {
             self.emit("chat", json!({ "fingerprint": key, "name": name, "unread": unread, "incoming": incoming, "message": msg }));
@@ -355,7 +355,7 @@ impl Node {
             .collect();
         let mut queued_pairs: HashSet<(String, String)> = HashSet::new();
         for item in items {
-            if let OutboxItem::Message { key, to, .. } = &item {
+            if let OutboxItem::Message { key, to, .. } | OutboxItem::DirectMessage { key, to, .. } = &item {
                 let pair = (key.clone(), to.clone());
                 if busy_pairs.contains(&pair) || !queued_pairs.insert(pair) {
                     continue;
@@ -377,6 +377,7 @@ impl Node {
                 }
                 OutboxItem::Leave { key, to, .. } => (to.clone(), format!("leave:{key}:{to}")),
                 OutboxItem::DirectFile { key, to, msg } => (to.clone(), format!("file:{key}:{to}:{}", msg.id)),
+                OutboxItem::DirectMessage { key, to, msg } => (to.clone(), format!("msg:{key}:{to}:{}", msg.id)),
             };
             let Some(peer) = online.get(&to).cloned() else { continue };
             if self.outbox_backoff.lock().unwrap().get(&flight).map_or(false, |until| Instant::now() < *until) {
@@ -516,6 +517,25 @@ impl Node {
                     self.emit_chat_message(&key, &m, false);
                 }
                 Delivery::Done
+            }
+            OutboxItem::DirectMessage { key, msg, .. } => {
+                // Kişi çevrimiçi oldu: bekleyen mesaj iletilir. Karşı taraf reddederse (engel,
+                // çok uzun) bir daha denenmez; bağlantı sorunu ya da hız sınırında yeniden denenir.
+                let (status, error, result) = match self.deliver_chat(peer, &msg).await {
+                    Ok(()) => (MsgStatus::Sent, None, Delivery::Done),
+                    Err(ChatFail::Unreachable(_)) => return Delivery::RetryLater,
+                    Err(ChatFail::Rate(_)) => return Delivery::RetrySoon,
+                    Err(ChatFail::Fatal(e)) => (MsgStatus::Failed, Some(e), Delivery::Done),
+                };
+                let updated = self.chats.lock().unwrap().update_message(&key, &msg.id, |m| {
+                    m.pending.clear();
+                    m.status = status;
+                    m.error = error;
+                });
+                if let Some(m) = updated {
+                    self.emit_chat_message(&key, &m, false);
+                }
+                result
             }
             OutboxItem::DirectFile { key, to, msg } => {
                 // Kişi çevrimiçi oldu: bekleyen dosya normal bir gönderim olarak başlar.
@@ -670,7 +690,7 @@ impl Node {
         if self.chats.lock().unwrap().contains(&key, id) {
             return Ok(());
         }
-        if !self.chat_rate_ok(&sender) {
+        if !self.chat_rate_ok(&sender, ip) {
             return Err("rate");
         }
         let text = sanitize_text(text, MAX_CHAT_CHARS);

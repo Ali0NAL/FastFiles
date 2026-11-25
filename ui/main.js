@@ -144,6 +144,8 @@ const ic = {
   clip: '<svg viewBox="0 0 24 24"><rect x="6" y="4" width="12" height="17" rx="2"/><path d="M9 4.5V3h6v1.5M9 10h6M9 14h4"/></svg>',
   copy: '<svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>',
   users: '<svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3 19c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5"/><path d="M16 4.8a3.2 3.2 0 0 1 0 6.4M18 13.8c2 .7 3 2.5 3 5.2"/></svg>',
+  star: '<svg viewBox="0 0 24 24"><path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9z"/></svg>',
+  screen: '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4M12 13V7M9.5 9.5 12 7l2.5 2.5"/></svg>',
 };
 const osIcon = (os) => ic[os === 'macos' ? 'macos' : os === 'linux' ? 'linux' : 'windows'];
 
@@ -152,7 +154,7 @@ const osIcon = (os) => ic[os === 'macos' ? 'macos' : os === 'linux' ? 'linux' : 
 function toast(msg, { type = 'info', action, onAction, timeout = 4500 } = {}) {
   const el = document.createElement('div');
   el.className = `toast ${type}`;
-  el.innerHTML = `${type === 'error' ? ic.alert : type === 'success' ? ic.check : ''}<span>${esc(msg)}</span>${action ? `<button>${esc(action)}</button>` : ''}`;
+  el.innerHTML = `${type === 'error' || type === 'warn' ? ic.alert : type === 'success' ? ic.check : type === 'offline' ? ic.clock : ''}<span>${esc(msg)}</span>${action ? `<button>${esc(action)}</button>` : ''}`;
   if (action) el.querySelector('button').onclick = () => { onAction?.(); dismiss(); };
   $('#toasts').appendChild(el);
   const dismiss = () => { el.classList.add('out'); setTimeout(() => el.remove(), 200); };
@@ -241,86 +243,309 @@ function renderMe() {
 
 // ───────────────────────────── Cihazlar ─────────────────────────────
 
-function renderPeers() {
-  const list = state.peers;
-  rememberWorkAvatars(list);
-  $('#peer-count').textContent = list.length;
-  $('#peers').hidden = list.length === 0;
-  $('#peers-empty').hidden = list.length > 0;
-  $('#drop-hint').hidden = list.length === 0;
-  $('#btn-batch').hidden = list.length < 2;
+// Ana ekran: çevrimiçi kişiler ve daha önce görülen (şu an kapalı) kişiler aynı listededir.
+// Kapanan kişinin kartı kaybolmaz, "çevrimdışı" görünüme geçer; ona yine mesaj ve dosya
+// bırakılabilir (kişi açılınca kendiliğinden gider). En çok çalışılan kişiler "Favoriler"de.
 
-  // Kartları yerinde güncelle: yalnızca değişen kartın içeriği yenilenir,
-  // yalnızca yeni gelen cihaz animasyonla girer. Böylece liste hiç yanıp sönmez.
-  const container = $('#peers');
-  const existing = new Map([...container.children].map((el) => [el.dataset.id, el]));
-  list.forEach((p, i) => {
-    let el = existing.get(p.id);
-    existing.delete(p.id);
-    if (!el) {
-      el = document.createElement('div');
-      el.className = 'peer enter';
-      el.dataset.id = p.id;
-      setTimeout(() => el.classList.remove('enter'), 400);
-    }
-    const sig = JSON.stringify([p.name, p.ip, p.os, p.version, p.trusted, p.blocked, p.manualAddr, p.status, unreadOf(p.fingerprint), state.avatars.get(p.fingerprint)?.length || 0, funMode(), workAvatarOf(p.fingerprint)]);
-    if (el.dataset.sig !== sig) {
-      el.dataset.sig = sig;
-      el.innerHTML = peerInner(p);
-    }
-    if (container.children[i] !== el) container.insertBefore(el, container.children[i] || null);
-  });
-  existing.forEach((el) => el.remove());
+const KNOWN_KEY = 'ff-known-peers';
+const INTERACT_KEY = 'ff-interact';
+const FAV_KEY = 'ff-favorites';
+const loadJson = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
+const saveJson = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* önemli değil */ } };
+const people = {
+  known: loadJson(KNOWN_KEY, {}),          // parmak izi → { name, os, version, ip, lastSeen }
+  interact: loadJson(INTERACT_KEY, {}),    // parmak izi → { n, at } (zamanla azalan etkileşim puanı)
+  pinned: new Set(loadJson(FAV_KEY, [])),  // elle favorilere eklenenler
+  savedAt: 0,
+  online: new Map(),                       // kartın son çizildiği çevrimiçi durumu (geçiş animasyonu için)
+};
+const FP_RE = /^[0-9a-f]{64}$/;
+const HALF_LIFE = 14 * 86400e3; // etkileşim puanı iki haftada yarıya iner
+const FAV_MAX = 6;
+
+function interactScore(fp, now = Date.now()) {
+  const x = people.interact[fp];
+  return x ? x.n * 0.5 ** ((now - x.at) / HALF_LIFE) : 0;
+}
+
+/** Bir kişiyle yapılan iş (mesaj, dosya) puanını artırır; en çok çalışılanlar favorilere çıkar. */
+function bumpInteract(fp, w = 1) {
+  if (!fp || !FP_RE.test(fp) || fp === myFp()) return;
+  const now = Date.now();
+  people.interact[fp] = { n: interactScore(fp, now) + w, at: now };
+  saveJson(INTERACT_KEY, people.interact);
+  schedulePeers();
+}
+
+let peersQueued = false;
+function schedulePeers() {
+  if (peersQueued) return;
+  peersQueued = true;
+  requestAnimationFrame(() => { peersQueued = false; renderPeers(); });
+}
+
+const DISMISS_KEY = 'ff-dismissed';
+const KNOWN_MAX = 200;      // kalıcı listede en fazla bu kadar kişi (en eski görülenler düşer)
+const STABLE_MS = 120e3;    // sohbet geçmişi olmayan cihaz en az bu kadar görünmüş olmalı
+people.dismissed = new Set(loadJson(DISMISS_KEY, [])); // "Listeden kaldır" denen kapalı kişiler
+people.firstSeen = new Map(); // parmak izi → bu oturumda kesintisiz görülmeye başladığı an
+for (const fp of Object.keys(people.known)) if (!FP_RE.test(fp)) delete people.known[fp];
+
+// Keşif (UDP) duyuruları imzasızdır: ağdaki biri uydurma parmak izleriyle sahte cihazlar
+// duyurabilir. Kalıcı listeye yalnızca TLS ile doğrulanmış biriyle (birebir sohbet ya da dosya
+// geçmişi var, ya da güvenilir) ya da bir süre kesintisiz görünen cihazlar girer.
+function verifiedPeer(p, now) {
+  const c = state.chats.get(p.fingerprint);
+  return (c && !c.group) || p.trusted || now - (people.firstSeen.get(p.fingerprint) ?? now) >= STABLE_MS;
+}
+
+/** Doğrulanmış çevrimiçi cihazları ve birebir sohbeti olan kişileri "bilinen kişiler"e kaydeder. */
+function rememberPeers() {
+  const now = Date.now();
+  let dirty = false;
+  const here = new Set();
+  for (const p of state.peers) {
+    const fp = p.fingerprint;
+    if (!fp || !FP_RE.test(fp) || fp === myFp()) continue;
+    here.add(fp);
+    if (!people.firstSeen.has(fp)) people.firstSeen.set(fp, now);
+    if (!verifiedPeer(p, now)) continue;
+    if (people.dismissed.delete(fp)) saveJson(DISMISS_KEY, [...people.dismissed]); // yeniden açıldı
+    const k = people.known[fp];
+    if (!k || k.name !== p.name || k.os !== p.os || k.ip !== p.ip || k.version !== p.version) dirty = true;
+    people.known[fp] = { name: p.name, os: p.os, version: p.version || '', ip: p.ip, lastSeen: now };
+  }
+  for (const fp of people.firstSeen.keys()) if (!here.has(fp)) people.firstSeen.delete(fp);
+  for (const c of state.chats.values()) {
+    const fp = c.fingerprint;
+    if (c.group || !FP_RE.test(fp) || people.known[fp] || people.dismissed.has(fp) || fp === myFp()) continue;
+    people.known[fp] = { name: c.name, os: '', version: '', ip: '', lastSeen: c.last?.at || 0 };
+    dirty = true;
+  }
+  const keys = Object.keys(people.known);
+  if (keys.length > KNOWN_MAX) {
+    keys.filter((fp) => !people.pinned.has(fp) && !here.has(fp))
+      .sort((a, b) => (people.known[a].lastSeen || 0) - (people.known[b].lastSeen || 0))
+      .slice(0, keys.length - KNOWN_MAX)
+      .forEach((fp) => delete people.known[fp]);
+    dirty = true;
+  }
+  if (dirty || now - people.savedAt > 60e3) {
+    people.savedAt = now;
+    saveJson(KNOWN_KEY, people.known);
+  }
+}
+
+function seenAgo(ms) {
+  if (!ms) return 'uzun süredir görülmedi';
+  const d = Date.now() - ms;
+  if (d < 90e3) return 'az önce çıktı';
+  if (d < 3600e3) return `${Math.round(d / 60e3)} dk önce görüldü`;
+  if (d < 86400e3) return `${Math.round(d / 3600e3)} sa önce görüldü`;
+  if (d < 7 * 86400e3) return `${Math.round(d / 86400e3)} gün önce görüldü`;
+  return `${new Date(ms).toLocaleDateString('tr-TR', { day: 'numeric', month: 'short' })} tarihinde görüldü`;
+}
+
+/** Ekrandaki tüm kişiler: { fp, peer (çevrimiçiyse), name, ... }. */
+function allPeople() {
+  const list = [];
+  const seen = new Set();
+  for (const p of state.peers) {
+    if (!p.fingerprint || seen.has(p.fingerprint)) continue;
+    seen.add(p.fingerprint);
+    list.push({ fp: p.fingerprint, peer: p, name: p.name, os: p.os, online: true, lastSeen: Date.now() });
+  }
+  for (const [fp, k] of Object.entries(people.known)) {
+    if (seen.has(fp) || fp === myFp()) continue;
+    seen.add(fp);
+    list.push({ fp, peer: null, name: k.name, os: k.os, version: k.version, ip: k.ip, online: false, lastSeen: k.lastSeen || 0 });
+  }
+  return list;
+}
+
+const personName = (fp) => peerByFp(fp)?.name || people.known[fp]?.name || state.chats.get(fp)?.name || 'Kişi';
+
+function renderPeers() {
+  rememberPeers();
+  rememberWorkAvatars(state.peers);
+  const now = Date.now();
+  const list = allPeople();
+  const online = list.filter((x) => x.online).length;
+  $('#peer-count').textContent = online;
+  $('#peer-count').title = `${online} kişi çevrimiçi`;
+  const off = list.length - online;
+  $('#peer-count-off').hidden = off === 0;
+  $('#peer-count-off').textContent = `${off} kapalı`;
+  $('#peers-scroll').hidden = list.length === 0;
+  $('#peers-empty').hidden = list.length > 0;
+  $('#drop-hint').hidden = online === 0;
+  $('#btn-batch').hidden = online < 2;
+
+  // Favoriler: elle eklenenler + en çok çalışılanlar (yeterince etkileşim varsa).
+  const byScore = (a, b) => interactScore(b.fp, now) - interactScore(a.fp, now);
+  const pinned = list.filter((x) => people.pinned.has(x.fp) && !isBlocked(x.fp));
+  const auto = list
+    .filter((x) => !people.pinned.has(x.fp) && !isBlocked(x.fp) && interactScore(x.fp, now) >= 3)
+    .sort(byScore)
+    .slice(0, Math.max(0, FAV_MAX - pinned.length));
+  const favs = [...pinned, ...auto];
+  const favSet = new Set(favs.map((x) => x.fp));
+  // Önce çevrimiçiler (ada göre), sonra kapalılar (en son görülen önce).
+  const order = (a, b) => (b.online - a.online)
+    || (a.online ? a.name.localeCompare(b.name, 'tr') : b.lastSeen - a.lastSeen);
+  favs.sort(order);
+  const rest = list.filter((x) => !favSet.has(x.fp)).sort(order);
+  $('#fav-section').hidden = favs.length === 0;
+  $('#all-label').hidden = favs.length === 0 || rest.length === 0;
+  $('#peers').closest('.peer-section').hidden = rest.length === 0;
+
+  const existing = new Map([...document.querySelectorAll('#peers-scroll .peer')].map((el) => [el.dataset.fp, el]));
+  const place = (container, items) => {
+    items.forEach((x, i) => {
+      let el = existing.get(x.fp);
+      existing.delete(x.fp);
+      if (!el) {
+        el = document.createElement('div');
+        el.className = 'peer enter';
+        el.dataset.fp = x.fp;
+        el.style.setProperty('--i', Math.min(i, 12));
+        setTimeout(() => el.classList.remove('enter'), 700);
+      }
+      // Çevrimiçi ↔ kapalı geçişi: kart yerinde kalır, görünümü yumuşakça değişir.
+      const was = people.online.get(x.fp);
+      if (was !== undefined && was !== x.online) {
+        el.classList.remove('wake', 'sleep');
+        void el.offsetWidth;
+        el.classList.add(x.online ? 'wake' : 'sleep');
+        setTimeout(() => el.classList.remove('wake', 'sleep'), 1400);
+      }
+      people.online.set(x.fp, x.online);
+      el.classList.toggle('offline', !x.online);
+      el.classList.toggle('fav', favSet.has(x.fp));
+      if (x.peer) el.dataset.id = x.peer.id;
+      else delete el.dataset.id;
+      const p = x.peer;
+      const sig = JSON.stringify([x.name, x.online, p?.ip, x.os, p?.version, p?.trusted, isBlocked(x.fp), p?.manualAddr, p?.status,
+        unreadOf(x.fp), state.avatars.get(x.fp)?.length || 0, funMode(), workAvatarOf(x.fp), people.pinned.has(x.fp), favSet.has(x.fp),
+        x.online ? 0 : Math.floor((now - x.lastSeen) / 60e3)]);
+      if (el.dataset.sig !== sig) {
+        el.dataset.sig = sig;
+        el.innerHTML = peerInner(x);
+      }
+      if (container.children[i] !== el) container.insertBefore(el, container.children[i] || null);
+    });
+  };
+  place($('#favs'), favs);
+  place($('#peers'), rest);
+  existing.forEach((el) => { people.online.delete(el.dataset.fp); el.remove(); });
   officeSyncPeople();
 }
+// "x dk önce görüldü" yazıları güncel kalsın.
+setInterval(schedulePeers, 60e3);
 
-function peerInner(p) {
+function peerInner(x) {
+  const p = x.peer;
+  const blocked = isBlocked(x.fp);
+  const pinned = people.pinned.has(x.fp);
+  const unread = unreadOf(x.fp);
+  const sub = x.online
+    ? `${esc(p.ip)}${p.version ? ` · v${esc(p.version)}` : ''}`
+    : esc(seenAgo(x.lastSeen));
+  const later = x.online ? '' : ' (kişi açılınca gönderilir)';
   return `
       <div class="corner">
-        <button class="icon-btn sm ${p.trusted ? 'on' : ''}" data-act="trust"
-          title="${p.trusted ? 'Güveni kaldır (her gönderimde sorulsun)' : 'Güvenilir yap (gönderdikleri sormadan kabul edilsin)'}">${ic.shield}</button>
-        ${p.manualAddr ? `<button class="icon-btn sm" data-act="forget" title="Listeden kaldır">${ic.trash}</button>` : ''}
+        <button class="icon-btn sm star ${pinned ? 'on' : ''}" data-act="fav" title="${pinned ? 'Favorilerden çıkar' : 'Favorilere ekle'}">${ic.star}</button>
+        ${p ? `<button class="icon-btn sm ${p.trusted ? 'on' : ''}" data-act="trust"
+          title="${p.trusted ? 'Güveni kaldır (her gönderimde sorulsun)' : 'Güvenilir yap (gönderdikleri sormadan kabul edilsin)'}">${ic.shield}</button>` : ''}
+        ${p?.manualAddr || !x.online ? `<button class="icon-btn sm" data-act="forget" title="Listeden kaldır">${ic.trash}</button>` : ''}
       </div>
-      <div class="avatar" style="background:${grad(p.fingerprint)}">${face(p.fingerprint, p.name)}<span class="os">${osIcon(p.os)}</span></div>
-      <div class="name" title="${esc(p.name)}">${esc(p.name)}</div>
-      ${p.status ? `<div class="peer-status">${statusChip(p.status)}</div>` : ''}
-      <div class="addr">${esc(p.ip)}${p.version ? ` · v${esc(p.version)}` : ''}</div>
+      <div class="avatar-wrap">
+        <div class="avatar" style="background:${grad(x.fp)}">${face(x.fp, x.name)}</div>
+        <span class="presence ${x.online ? `on st-${esc(p.status || 'ok')}` : 'off'}" title="${x.online ? 'Çevrimiçi' : 'Çevrimdışı'}"></span>
+        ${x.os ? `<span class="os">${osIcon(x.os)}</span>` : ''}
+      </div>
+      <div class="name" title="${esc(x.name)}">${esc(x.name)}</div>
+      <div class="peer-status">${x.online
+        ? (p.status ? statusChip(p.status) : '<span class="state-chip on">Çevrimiçi</span>')
+        : '<span class="state-chip off">Çevrimdışı</span>'}</div>
+      <div class="addr" title="${x.online ? '' : 'Mesaj ve dosyalarınız kişi FastFiles\'ı açınca kendiliğinden iletilir'}">${sub}</div>
       <div class="badges">
-        ${p.blocked ? `<span class="badge blocked">${ic.ban}Engellendi</span>` : ''}
-        ${p.trusted ? `<span class="badge trusted">${ic.shield}Güvenilir</span>` : ''}
-        ${p.manualAddr ? '<span class="badge manual">Elle eklendi</span>' : ''}
+        ${blocked ? `<span class="badge blocked">${ic.ban}Engellendi</span>` : ''}
+        ${p?.trusted ? `<span class="badge trusted">${ic.shield}Güvenilir</span>` : ''}
+        ${p?.manualAddr ? '<span class="badge manual">Elle eklendi</span>' : ''}
       </div>
       <div class="actions">
-        <button class="btn soft small" data-act="files">${ic.file}Dosya</button>
-        <button class="btn soft small" data-act="folder">${ic.folder}Klasör</button>
-        <button class="btn soft small sq-btn" data-act="clip" title="Panodakini gönder (${K('Ctrl+V')}): metin, ekran görüntüsü veya kopyalanan dosyalar">${ic.clip}</button>
-        <button class="btn soft small chat-btn" data-act="chat" title="Mesaj gönder">${ic.chat}${unreadOf(p.fingerprint) ? `<span class="dot-badge">${unreadOf(p.fingerprint)}</span>` : ''}</button>
+        <button class="btn soft small" data-act="files" title="Dosya gönder${later}">${ic.file}<span>Dosya</span></button>
+        <button class="btn soft small" data-act="folder" title="Klasör gönder${later}">${ic.folder}<span>Klasör</span></button>
+        ${x.online ? `<button class="btn soft small sq-btn" data-act="clip" title="Panodakini gönder (${K('Ctrl+V')}): metin, ekran görüntüsü veya kopyalanan dosyalar">${ic.clip}</button>` : ''}
+        <button class="btn soft small sq-btn chat-btn" data-act="chat" title="${x.online ? 'Mesaj gönder' : 'Mesaj bırak: kişi açılınca iletilir'}">${ic.chat}${unread ? `<span class="dot-badge">${unread}</span>` : ''}</button>
       </div>
-      <div class="drop-label">Bırak → ${esc(p.name)}</div>`;
+      <div class="drop-label">${x.online ? `Bırak → ${esc(x.name)}` : `Bırak → ${esc(x.name)}<small>açılınca gönderilecek</small>`}</div>`;
 }
 
-$('#peers').addEventListener('click', async (e) => {
+$('#peers-scroll').addEventListener('click', async (e) => {
   const btn = e.target.closest('[data-act]');
   const card = e.target.closest('.peer');
   if (!btn || !card) return;
-  const peer = state.peers.find((p) => p.id === card.dataset.id);
-  if (!peer) return;
+  const fp = card.dataset.fp;
+  const peer = peerByFp(fp);
+  const name = personName(fp);
   switch (btn.dataset.act) {
-    case 'files': return pickAndSend(peer, false);
-    case 'folder': return pickAndSend(peer, true);
-    case 'chat': return openChat(peer.fingerprint, peer.name);
-    case 'clip': return sendClipboard([peer.id]);
+    case 'files': return peer ? pickAndSend(peer, false) : pickAndQueue(fp, false);
+    case 'folder': return peer ? pickAndSend(peer, true) : pickAndQueue(fp, true);
+    case 'chat': return openChat(fp, name);
+    case 'clip': return peer && sendClipboard([peer.id]);
+    case 'fav': {
+      if (people.pinned.has(fp)) people.pinned.delete(fp);
+      else people.pinned.add(fp);
+      saveJson(FAV_KEY, [...people.pinned]);
+      toast(people.pinned.has(fp) ? `${name} favorilere eklendi` : `${name} favorilerden çıkarıldı`, { type: 'success', timeout: 2500 });
+      return renderPeers();
+    }
     case 'trust': {
+      if (!peer) return;
       const trusted = !peer.trusted;
       state.settings = await call('set_trusted', { fingerprint: peer.fingerprint, name: peer.name, trusted });
       toast(trusted ? `${peer.name} artık güvenilir: gönderdikleri sormadan kabul edilecek` : `${peer.name} için artık onay istenecek`, { type: 'success' });
       return;
     }
     case 'forget':
-      await call('forget_manual_peer', { address: peer.manualAddr });
-      return;
+      if (peer?.manualAddr) return call('forget_manual_peer', { address: peer.manualAddr });
+      if (!peer) {
+        delete people.known[fp];
+        people.pinned.delete(fp);
+        delete people.interact[fp];
+        people.dismissed.add(fp); // sohbet geçmişinden geri eklenmesin
+        saveJson(DISMISS_KEY, [...people.dismissed]);
+        saveJson(KNOWN_KEY, people.known);
+        saveJson(FAV_KEY, [...people.pinned]);
+        saveJson(INTERACT_KEY, people.interact);
+        toast(`${name} listeden kaldırıldı; yeniden açılınca tekrar görünür`, { timeout: 3500 });
+        return renderPeers();
+      }
   }
 });
+
+// Kartın üzerinde fareyi izleyen yumuşak ışık (styles.css: .peer::before).
+$('#peers-scroll').addEventListener('pointermove', (e) => {
+  const card = e.target.closest('.peer');
+  if (!card) return;
+  const r = card.getBoundingClientRect();
+  card.style.setProperty('--mx', `${e.clientX - r.left}px`);
+  card.style.setProperty('--my', `${e.clientY - r.top}px`);
+});
+
+/** Kapalı kişiye dosya/klasör bırakır: kişi FastFiles'ı açınca kendiliğinden gönderilir. */
+async function pickAndQueue(fp, directory) {
+  const name = personName(fp);
+  const sel = await api.pick({
+    multiple: true,
+    directory,
+    title: directory ? `${name} için klasörler (açılınca gönderilecek)` : `${name} için dosyalar (açılınca gönderilecek)`,
+  });
+  if (!sel) return;
+  queueFiles(fp, Array.isArray(sel) ? sel : [sel]);
+}
 
 async function pickAndSend(peer, directory) {
   const sel = await api.pick({
@@ -840,6 +1065,8 @@ function showSettings() {
     </div>
     <label class="check"><input type="checkbox" id="s-tray" ${s.closeToTray ? 'checked' : ''} />
       <span>Pencere kapatılınca sistem tepsisinde çalışmaya devam et<br><span class="muted small">Kapalıyken de dosya alabilmek için önerilir.</span></span></label>
+    ${IS_MAC ? '' : `<label class="check"><input type="checkbox" id="s-autostart" ${s.autostart !== false ? 'checked' : ''} />
+      <span>Windows açılınca FastFiles'ı başlat<br><span class="muted small">Tepside sessizce açılır; size bırakılan mesaj ve dosyalar bilgisayar açılır açılmaz gelir.</span></span></label>`}
     <hr class="sep" />
     <div class="field">
       <label>Renk teması</label>
@@ -914,6 +1141,7 @@ function showSettings() {
         <span>Kullandığınız sürüm: <span class="v">v${esc(state.update?.current || '')}</span></span>
         ${state.update?.ready ? `<span class="badge trusted">v${esc(state.update.ready)} kurulmaya hazır</span>` : ''}
         <span class="spacer" style="flex:1"></span>
+        <button class="btn ghost small" id="s-notes">Yenilikler</button>
         <button class="btn ghost small" id="s-import">Güncelleme paketi yükle</button>
       </div>
       <span class="help">Güncellemeler ağdaki diğer FastFiles'lardan otomatik gelir ve yalnızca yayıncının dijital imzası doğrulanırsa kurulur.
@@ -980,6 +1208,7 @@ function showSettings() {
     renderMe();
   };
   }
+  m.querySelector('#s-notes').onclick = () => { closeModal(); showReleaseNotes(); };
   m.querySelector('#s-import').onclick = async () => {
     const file = await api.pick({ multiple: false, directory: false, title: 'FastFiles güncelleme paketi', filters: [{ name: 'FastFiles güncellemesi', extensions: ['ffupdate'] }] });
     if (!file) return;
@@ -1000,6 +1229,7 @@ function showSettings() {
         compress: m.querySelector('#s-compress').checked,
         shellMenu: m.querySelector('#s-shell').checked,
         hotkeys: m.querySelector('#s-hotkeys').checked,
+        autostart: m.querySelector('#s-autostart')?.checked,
         speedLimitMb: Number(m.querySelector('#s-limit').value),
         theme: m.querySelector('.swatch.on')?.dataset.theme || 'mor',
         appearance: m.querySelector('#s-appearance').value,
@@ -1031,12 +1261,12 @@ function showSettings() {
 // ───────────────────────────── Renk temaları ─────────────────────────────
 
 const THEMES = [
-  { id: 'mor', name: 'Mor', a: '#5b55f6', b: '#22c5e0' },
-  { id: 'okyanus', name: 'Okyanus', a: '#0a7cff', b: '#2ec4b6' },
-  { id: 'orman', name: 'Orman', a: '#1f9d6b', b: '#9ccc3d' },
-  { id: 'gunbatimi', name: 'Gün batımı', a: '#ef6a2e', b: '#f5b52a' },
-  { id: 'gul', name: 'Gül', a: '#e0457b', b: '#a26bff' },
-  { id: 'grafit', name: 'Grafit', a: '#4b5567', b: '#7f8ba0' },
+  { id: 'mor', name: 'Mor', a: '#5b4fd1', b: '#7a6fe0' },
+  { id: 'okyanus', name: 'Okyanus', a: '#2160d8', b: '#3b7bea' },
+  { id: 'orman', name: 'Orman', a: '#17804c', b: '#22a062' },
+  { id: 'gunbatimi', name: 'Gün batımı', a: '#cf5419', b: '#e8732f' },
+  { id: 'gul', name: 'Gül', a: '#c62f66', b: '#de4f82' },
+  { id: 'grafit', name: 'Grafit', a: '#3c4352', b: '#586172' },
 ];
 
 function applyTheme(s) {
@@ -1238,8 +1468,8 @@ $('#btn-downloads').onclick = () => call('open_path', { path: state.settings.dow
 function showWelcome() {
   const m = openModal('welcome', `
     <div class="incoming-head">
-      <div class="avatar" style="background:linear-gradient(135deg,var(--accent),var(--accent-2))">
-        <svg viewBox="0 0 24 24" style="width:24px;height:24px;fill:#fff;stroke:none"><path d="M13.5 2 5 13.2h6L9.8 22 19 10h-6.2z"/></svg>
+      <div class="logo big" aria-hidden="true">
+        <svg viewBox="7 7.5 46 46"><rect x="21" y="14" width="8" height="36" rx="2" fill="#5b4fd1"/><rect x="21" y="14" width="21" height="8" rx="2" fill="#5b4fd1"/><polygon points="41,11 51,18 41,25" fill="#5b4fd1"/><rect x="21" y="29" width="16" height="7" rx="2" fill="#5b4fd1"/><rect x="9" y="16.5" width="8" height="3" rx="1.5" fill="#a49bf5"/><rect x="12" y="31" width="5" height="3" rx="1.5" fill="#a49bf5"/></svg>
       </div>
       <div><h3>FastFiles'a hoş geldiniz</h3><div class="muted small">Ofis içi hızlı dosya paylaşımı</div></div>
     </div>
@@ -1438,7 +1668,6 @@ function renderChatHeadBase() {
     $('#chat-nudge').hidden = true;
     $('#chat-fx-wrap').hidden = !canSend;
     if (!canSend) closeFxMenu();
-    $('#chat-screen').hidden = !canSend;
     $('#chat-watch').hidden = !canSend;
     $('#chat-shot').disabled = !canSend;
     $('#chat-attach').title = 'Dosya gönder (ya da dosyaları sohbete sürükleyin)';
@@ -1458,26 +1687,26 @@ function renderChatHeadBase() {
   st.className = `chat-status${peer && !blocked ? ' on' : ''}`;
   st.innerHTML = blocked ? 'Engellendi' : peer
     ? `<span class="online-dot st-${esc(peer.status || 'ok')}"></span>${peer.status ? `${statusOf(peer.status).icon} ${esc(statusOf(peer.status).label)}` : 'Çevrimiçi'} · ${esc(peer.ip)}`
-    : 'Çevrimdışı';
+    : `<span class="online-dot off"></span>Çevrimdışı · ${esc(seenAgo(people.known[fp]?.lastSeen))}`;
   const bb = $('#chat-block');
   bb.innerHTML = ic.ban;
   bb.classList.toggle('on', blocked);
   bb.title = blocked ? 'Engeli kaldır' : 'Engelle (bu cihazdan mesaj ve dosya alma)';
-  const canSend = !!peer && !blocked;
+  // Çevrimdışı kişiye de mesaj yazılır ve dosya bırakılır: kişi açılınca kendiliğinden gider.
+  const canSend = !blocked;
+  const live = !!peer && !blocked;
   const ta = $('#composer');
   ta.disabled = !canSend;
-  // Çevrimdışı kişiye de dosya bırakılabilir: çevrimiçi olunca kendiliğinden gider.
   $('#chat-attach').disabled = blocked;
-  $('#chat-attach').title = peer ? 'Dosya gönder (ya da dosyaları sohbete sürükleyin)' : 'Dosya bırak: kişi çevrimiçi olunca kendiliğinden gönderilir';
+  $('#chat-attach').title = peer ? 'Dosya gönder (ya da dosyaları sohbete sürükleyin)' : 'Dosya bırak: kişi açılınca kendiliğinden gönderilir';
   $('#chat-emoji').disabled = !canSend;
   if (!canSend) closeEmoji();
-  ta.placeholder = canSend ? 'Mesaj yazın…' : blocked ? 'Bu cihazı engellediniz' : 'Çevrimdışı · mesaj gönderilemez, ama dosya bırakabilirsiniz';
+  ta.placeholder = blocked ? 'Bu cihazı engellediniz' : peer ? 'Mesaj yazın…' : 'Mesaj bırakın · açılınca iletilir';
   $('#chat-send').disabled = !canSend || !ta.value.trim();
-  $('#chat-nudge').hidden = !canSend;
-  $('#chat-fx-wrap').hidden = !canSend;
-  if (!canSend) closeFxMenu();
-  $('#chat-screen').hidden = !canSend;
-  $('#chat-watch').hidden = !canSend;
+  $('#chat-nudge').hidden = !live;
+  $('#chat-fx-wrap').hidden = !live;
+  if (!live) closeFxMenu();
+  $('#chat-watch').hidden = !live;
   $('#chat-shot').disabled = blocked;
   updateComposerNote();
 }
@@ -1489,6 +1718,8 @@ function statusMeta(m) {
     if (!waiting) return `<span title="Herkese iletildi">${ic.checks}</span>`;
     return `<span title="Çevrimdışı üyelere geri geldiklerinde otomatik iletilecek">${ic.clock}</span> ${m.recipients - waiting}/${m.recipients}`;
   }
+  // Kapalı kişiye yazılan mesaj: kişi FastFiles'ı açınca iletilir.
+  if (m.pending?.length && m.status === 'sending') return `<span class="queued" title="Kişi çevrimdışı; FastFiles'ı açınca kendiliğinden iletilecek">${ic.clock} açılınca iletilecek</span>`;
   if (m.status === 'sending') return `<span title="Gönderiliyor">${ic.clock}</span>`;
   if (m.status === 'sent') return `<span title="İletildi">${ic.checks}</span>`;
   if (m.status === 'failed') {
@@ -2058,7 +2289,7 @@ async function sendChat() {
   const key = state.openChat;
   if (!text || (ta.disabled && !chatx.edit) || !key) return;
   const peer = peerByFp(key);
-  if (!groupOf(key) && !peer && !chatx.edit) return;
+  if (!groupOf(key) && !FP_RE.test(key) && !chatx.edit) return;
   try {
     if (chatx.edit) {
       await call('chat_edit', { key, id: chatx.edit.id, text });
@@ -2072,7 +2303,11 @@ async function sendChat() {
     }
     const replyTo = chatx.reply?.id || null;
     if (groupOf(key)) await call('group_send', { key, text, replyTo });
-    else await call('chat_send', { peerId: peer.id, text, replyTo });
+    else if (peer) await call('chat_send', { peerId: peer.id, text, replyTo });
+    else {
+      await call('chat_send_to', { fingerprint: key, name: personName(key), text, replyTo });
+      offlineNotice(key, 'Mesajınız');
+    }
     chatx.reply = null;
     renderReplyBar();
     $('#mention-pop').hidden = true;
@@ -2240,6 +2475,9 @@ function candidatePeople(exclude = new Set()) {
     if (!c.group && !map.has(c.fingerprint) && !isBlocked(c.fingerprint)) {
       map.set(c.fingerprint, { fingerprint: c.fingerprint, name: c.name, online: false });
     }
+  });
+  Object.entries(people.known).forEach(([fp, k]) => {
+    if (!map.has(fp) && !isBlocked(fp) && fp !== myFp()) map.set(fp, { fingerprint: fp, name: k.name, online: false });
   });
   return [...map.values()]
     .filter((p) => !exclude.has(p.fingerprint))
@@ -2441,6 +2679,7 @@ function onNotificationClick(target = {}) {
   }
 }
 
+const seenMsgs = new Set();
 function onChat({ fingerprint: fp, name, unread, incoming, message }) {
   // Mesaj geldi: o kişinin "yazıyor…" göstergesi kalkar.
   if (incoming && state.typing?.get(fp) && (!message.sender || state.typing.get(fp).fp === message.sender)) state.typing.delete(fp);
@@ -2456,6 +2695,12 @@ function onChat({ fingerprint: fp, name, unread, incoming, message }) {
     isNew = i < 0;
     if (i >= 0) hist[i] = message; else hist.push(message);
   }
+  // Favoriler için etkileşim puanı: her yeni mesaj/dosya bir kez sayılır (durum güncellemeleri değil).
+  if (!message.system && !seenMsgs.has(message.id)) {
+    seenMsgs.add(message.id);
+    const who = groupOf(fp) ? (incoming ? message.sender : null) : fp;
+    if (who) bumpInteract(who, message.file ? 2 : 1);
+  }
   const viewing = state.openChat === fp && chatOpen();
   if (viewing) {
     renderMessages(!incoming && isNew);
@@ -2468,7 +2713,7 @@ function onChat({ fingerprint: fp, name, unread, incoming, message }) {
     });
   }
   renderConvs();
-  renderPeers();
+  schedulePeers();
   officeOnChat(fp, incoming, message);
 }
 
@@ -6178,11 +6423,21 @@ function fxGift() {
 
 // ── Çevrimdışı kişiye dosya ──
 async function queueFiles(fp, paths) {
-  const name = state.chats.get(fp)?.name || '';
+  const name = personName(fp);
   try {
     await call('chat_queue_files', { fingerprint: fp, name, paths });
-    toast(`${name || 'Kişi'} çevrimiçi olunca dosya kendiliğinden gönderilecek`, { type: 'success' });
+    offlineNotice(fp, paths.length > 1 ? 'Dosyalarınız' : 'Dosyanız', true);
   } catch { /* toast gösterildi */ }
+}
+
+// Kapalı kişiye bir şey gönderilince uyarı: ne zaman gideceği açıkça söylenir. Aynı kişi için
+// mesajlarda 10 dakikada bir gösterilir (her mesajda tekrar etmesin), dosyalarda her seferinde.
+const offlineWarned = new Map();
+function offlineNotice(fp, what, always = false) {
+  const now = Date.now();
+  if (!always && now - (offlineWarned.get(fp) || 0) < 600e3) return;
+  offlineWarned.set(fp, now);
+  toast(`${personName(fp)} şu an çevrimdışı. ${what} kişi FastFiles'ı açınca kendiliğinden iletilecek (3 gün içinde).`, { type: 'offline', timeout: 6500 });
 }
 
 function onChatRemove({ fingerprint, id }) {
@@ -6597,14 +6852,59 @@ $('#btn-phone').onclick = openPhone;
 
 const screenState = { offers: new Map(), watching: null, url: null, actual: false };
 
-$('#chat-screen').onclick = async () => {
-  const key = state.openChat;
-  if (!key) return;
-  try {
-    await call('screen_share_start', { key });
-    toast('Ekran paylaşımı başladı; davet edilenler "İzle" deyince ekranınızı görür', { type: 'success', timeout: 6000 });
-  } catch { /* toast gösterildi */ }
-};
+// Üst çubuktaki "Ekranı paylaş": kişiler seçilir, hepsi aynı anda izleyebilir. Paylaşım
+// sürerken yeniden açılırsa yeni kişiler aynı paylaşıma eklenir.
+function showScreenShare() {
+  const sharing = document.body.classList.contains('sharing');
+  const list = state.peers.filter((p) => !p.blocked && p.fingerprint)
+    .sort((a, b) => (interactScore(b.fingerprint) - interactScore(a.fingerprint)) || a.name.localeCompare(b.name, 'tr'));
+  const selected = new Set();
+  const m = openModal('screen-share', `
+    <div class="modal-icon">${ic.screen}</div>
+    <h3>${sharing ? 'Paylaşıma kişi ekle' : 'Ekranınızı paylaşın'}</h3>
+    <p class="lead">Seçtiğiniz kişilere "İzle" daveti gider. Birden fazla kişi aynı anda izleyebilir; ekran yalnızca izleyen varken yakalanır ve şifreli gider.</p>
+    <div class="label-row"><label class="small muted">Çevrimiçi kişiler</label>${list.length > 1 ? '<button class="link-btn" id="ss-all">Tümünü seç</button>' : ''}</div>
+    <div class="recips" id="ss-people"></div>
+    <div class="foot">
+      ${sharing ? '<button class="btn ghost danger-text" id="ss-stop">Paylaşımı durdur</button><span class="spacer"></span>' : ''}
+      <button class="btn ghost" data-close>Vazgeç</button>
+      <button class="btn" id="ss-go" disabled>${sharing ? 'Davet et' : 'Paylaşımı başlat'}</button>
+    </div>`);
+  const render = () => {
+    m.querySelector('#ss-people').innerHTML = list.length
+      ? list.map((p) => personRow({ fingerprint: p.fingerprint, name: p.name, online: true }, selected.has(p.fingerprint))).join('')
+      : '<div class="muted small pad">Şu an çevrimiçi kimse yok. Ekran paylaşımı için izleyecek kişinin FastFiles\'ı açık olmalı.</div>';
+    const go = m.querySelector('#ss-go');
+    go.disabled = !selected.size;
+    go.textContent = `${sharing ? 'Davet et' : 'Paylaşımı başlat'}${selected.size ? ` (${selected.size} kişi)` : ''}`;
+    const all = m.querySelector('#ss-all');
+    if (all) all.textContent = selected.size === list.length ? 'Seçimi kaldır' : 'Tümünü seç';
+  };
+  render();
+  m.querySelector('#ss-people').addEventListener('change', (e) => {
+    const fp = e.target.closest('.recip')?.dataset.fp;
+    if (!fp) return;
+    e.target.checked ? selected.add(fp) : selected.delete(fp);
+    render();
+  });
+  m.querySelector('#ss-all')?.addEventListener('click', () => {
+    if (selected.size === list.length) selected.clear();
+    else list.forEach((p) => selected.add(p.fingerprint));
+    render();
+  });
+  m.querySelector('[data-close]').onclick = closeModal;
+  m.querySelector('#ss-stop')?.addEventListener('click', () => { closeModal(); api.invoke('screen_share_stop').catch(() => {}); });
+  m.querySelector('#ss-go').onclick = async () => {
+    const fps = [...selected];
+    try {
+      await call('screen_share_with', { fingerprints: fps });
+      closeModal();
+      toast(`${fps.length} kişiye davet gitti; "İzle" deyince ekranınızı görürler`, { type: 'success', timeout: 6000 });
+    } catch { /* toast gösterildi */ }
+  };
+}
+$('#btn-screen').onclick = showScreenShare;
+$('#share-bar-add')?.addEventListener('click', showScreenShare);
 $('#share-bar-stop').onclick = () => api.invoke('screen_share_stop').catch(() => {});
 
 function onScreenSharing(p) {
@@ -7409,7 +7709,38 @@ function setFunMode(on, { quiet = false } = {}) {
   renderConvs();
   if (pollOpen()) renderPoll();
   if (state.openChat) renderChatHead();
-  if (!quiet) toast(on ? '☕ Eğlence modu açık · iyi molalar!' : '💼 İş moduna dönüldü', { type: 'success' });
+  if (!quiet) {
+    if (on) playFunIntro();
+    else toast('💼 İş moduna dönüldü', { type: 'success' });
+  }
+}
+
+// Mola moduna girişte logonun kısa animasyonu tam ekran oynar (ui/fun-intro.gif). Tıklayınca
+// ya da ~2,7 sn sonra kapanır; arkasında eğlence modu zaten açıktır.
+let funIntroOpen = false;
+function playFunIntro() {
+  if (funIntroOpen) return;
+  funIntroOpen = true;
+  const o = document.createElement('div');
+  o.className = 'fun-intro';
+  o.innerHTML = `<div class="fi-stage"><img class="fi-gif" alt="" draggable="false"><div class="fi-label">Mola zamanı · iyi molalar ☕</div></div>`;
+  document.body.appendChild(o);
+  // Sorgu eki her seferinde sıfırdan oynaması içindir (GIF kaldığı kareden değil, baştan).
+  o.querySelector('.fi-gif').src = `fun-intro.gif?t=${Date.now()}`;
+  requestAnimationFrame(() => o.classList.add('show'));
+  let closed = false;
+  const onKey = (e) => { if (e.key === 'Escape') { e.stopImmediatePropagation(); close(); } };
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    clearTimeout(timer);
+    document.removeEventListener('keydown', onKey, true);
+    o.classList.add('out');
+    setTimeout(() => { o.remove(); funIntroOpen = false; }, 450);
+  };
+  const timer = setTimeout(close, 2700);
+  o.addEventListener('click', close); // atlamak için tıkla
+  document.addEventListener('keydown', onKey, true); // Esc ile atla
 }
 
 function showFunUnlock() {
@@ -7553,9 +7884,9 @@ function officeSyncPeople() {
   if (!officeState.mod) return;
   const { overflow } = officeState.mod.setPeople(list);
   const online = list.filter((p) => p.online).length;
-  $('#office-sub').textContent = `${online} kişi çevrimiçi${overflow.length ? ` · masada yer yok: ${overflow.map((p) => p.name).join(', ')}` : ''}`;
+  $('#office-sub').textContent = `${online} kişi çevrimiçi${overflow.length ? ` · ofiste yer yok: ${overflow.map((p) => p.name).join(', ')}` : ''}`;
   const seat = state.settings?.seat;
-  $('#office-seat').lastChild.textContent = seat ? `Koltuk ${seat}` : 'Koltuğumu seç';
+  $('#office-seat').lastChild.textContent = seat ? (officeState.mod?.seatName?.(seat) || `Koltuk ${seat}`) : 'Koltuğumu seç';
 }
 
 function officeTransfers() {
@@ -7642,7 +7973,8 @@ async function officePickSeat(n) {
   state.settings = s;
   setOfficePick(false);
   officeSyncPeople();
-  toast(n ? `Koltuk ${n} artık sizin. Diğer bilgisayarlarda da burada görüneceksiniz.` : 'Koltuktan kalktınız', { type: 'success' });
+  const where = n ? (officeState.mod?.seatName?.(n) || `Koltuk ${n}`) : '';
+  toast(n ? `${where} artık sizin yeriniz. Diğer bilgisayarlarda da burada görüneceksiniz.` : 'Koltuktan kalktınız', { type: 'success' });
 }
 
 async function openOffice() {
@@ -7674,7 +8006,7 @@ async function openOffice() {
   officeState.mod.start();
   if (!state.settings?.seat && !officeState.askedSeat) {
     officeState.askedSeat = true;
-    toast('Masada nerede oturduğunuzu seçin, herkes sizi orada görsün', { action: 'Koltuk seç', timeout: 9000, onAction: () => setOfficePick(true) });
+    toast('Ofiste nerede oturduğunuzu seçin, herkes sizi orada görsün', { action: 'Koltuk seç', timeout: 9000, onAction: () => setOfficePick(true) });
   }
 }
 
@@ -7706,12 +8038,23 @@ function peerIdAt(pos) {
   return el?.closest('.peer')?.dataset.id || null;
 }
 
+// Bırakma noktasındaki kapalı kişinin kartı (dosyalar kişi açılınca gönderilir).
+function offlineFpAt(pos) {
+  if (!pos || officeOpen()) return null;
+  const r = window.devicePixelRatio || 1;
+  return document.elementFromPoint(pos.x / r, pos.y / r)?.closest('.peer.offline')?.dataset.fp || null;
+}
+
 function updateDragTarget(pos) {
   const id = peerIdAt(pos);
+  const offFp = id ? null : offlineFpAt(pos);
   officeState.mod?.setDropTarget(state.peers.find((p) => p.id === id)?.fingerprint);
-  document.querySelectorAll('.peer.drop-target').forEach((el) => el.dataset.id !== id && el.classList.remove('drop-target'));
+  document.querySelectorAll('.peer.drop-target').forEach((el) => (el.dataset.id !== id || !id) && el.dataset.fp !== offFp && el.classList.remove('drop-target'));
   const msg = $('#drop-msg');
-  if (id) {
+  if (offFp) {
+    document.querySelector(`.peer[data-fp="${CSS.escape(offFp)}"]`)?.classList.add('drop-target');
+    msg.textContent = `Bırak → ${personName(offFp)} · çevrimdışı, açılınca gönderilecek`;
+  } else if (id) {
     document.querySelector(`.peer[data-id="${CSS.escape(id)}"]`)?.classList.add('drop-target');
     msg.textContent = `Bırak → ${state.peers.find((p) => p.id === id)?.name ?? ''}`;
   } else if (state.peers.length === 0) {
@@ -7784,6 +8127,7 @@ api.onDragDrop((event) => {
     endDrag();
   } else if (p.type === 'drop') {
     const id = batch ? null : peerIdAt(p.position);
+    const offFp = batch || id ? null : offlineFpAt(p.position);
     const paths = p.paths?.length ? p.paths : state.dragPaths;
     endDrag();
     state.dragPaths = null;
@@ -7798,6 +8142,8 @@ api.onDragDrop((event) => {
     if (!modalKind && shareDropTarget() && shareDropAt(p.position)) return addToShare(shareDropTarget().id, paths, shareDropFolder(p.position));
     // Kullanılamayan bir sohbet/klasör panelinin üzerine bırakıldı (çevrimdışı kişi, ayrılınan
     // grup, kilitli klasör): başka birine gitmesin.
+    // Kapalı kişinin kartına bırakıldı: kişi açılınca gönderilir.
+    if (!modalKind && offFp) return queueFiles(offFp, paths);
     if (!modalKind && !id && sidePanelAt(p.position)) {
       return toast('Buraya dosya gönderilemiyor (kişi çevrimdışı ya da klasör kullanılamıyor)', { type: 'error' });
     }
@@ -7838,6 +8184,70 @@ async function refreshSnapshot() {
   return snap;
 }
 
+// ───────────────────────────── Sürüm notları ─────────────────────────────
+// Güncellemeden sonraki ilk açılışta bir kez gösterilir; Ayarlar → "Yenilikler" ile yeniden açılır.
+
+const RELEASE_NOTES = [
+  {
+    version: '1.13.0',
+    date: '24 Kasım 2026',
+    sections: [
+      ['Yeni özellikler', [
+        ['Ofis planı', 'Sanal ofis, ofisimizin gerçek kat planına göre yeniden oluşturulmuştur. Patron ve yönetici odaları, duvar masası, üç çalışma masası, yemek masası, giriş ve mutfak kapıları ile balkon gerçek konumlarında gösterilmektedir. Koltuk sayısı 7\'den 20\'ye çıkarılmış, daha önce seçilmiş koltuklar korunmuştur.'],
+        ['Çevrimdışı kişilere mesaj ve dosya', 'FastFiles\'ı kapalı olan kişilere mesaj yazılabilir ve dosya bırakılabilir. Gönderiler, alıcı uygulamayı açtığında (3 gün içinde) otomatik olarak iletilir. Gönderim sırasında kişinin çevrimdışı olduğu ayrıca bildirilir.'],
+        ['Kalıcı kişi listesi', 'Uygulamayı kapatan kişiler ana ekrandan kaldırılmaz; "Çevrimdışı" durumu ve son görülme zamanıyla listelenmeye devam eder.'],
+        ['Favoriler', 'En sık mesajlaşılan ve dosya paylaşılan kişiler ana ekranın üst bölümünde gösterilir. Kişiler, kartlarındaki yıldız simgesiyle favorilere elle de eklenebilir.'],
+        ['Ekran paylaşımı', 'Ekran paylaşımı üst çubuğa taşınmıştır. Paylaşım için birden fazla kişi seçilebilir; seçilen kişilerin tamamı ekranı eşzamanlı olarak izleyebilir.'],
+        ['Otomatik başlatma', 'Windows oturumu açıldığında FastFiles sistem tepsisinde otomatik olarak başlatılır. Bu ayar Ayarlar bölümünden kapatılabilir.'],
+      ]],
+      ['İyileştirmeler', [
+        ['Arayüz', 'Uygulamanın görsel tasarımı yenilenmiş; renkler, yazı düzeni ve animasyonlar güncellenmiştir.'],
+        ['Düzenli indirme klasörü', 'Sohbet üzerinden gelen resimler, "İndirilenler\\FastFiles\\Resimler" altında gönderen kişinin adını taşıyan klasörde saklanır.'],
+        ['Pencere boyutları', 'Küçük pencere ve tam ekran kullanımında görülen taşma ve hizalama sorunları giderilmiştir.'],
+      ]],
+      ['Hata düzeltmeleri ve güvenlik', [
+        ['Mesaj iletimi', 'Bağlantının koptuğu anda gönderilen mesajların kaybolması önlenmiştir; bu mesajlar sıraya alınarak yeniden iletilir. Bekleyen mesajların alıcıya karışık sırayla ulaşması sorunu giderilmiştir.'],
+        ['Kişi doğrulama', 'Ağ üzerinden gelen doğrulanmamış cihaz kayıtlarının kalıcı kişi listesine eklenmesi engellenmiştir.'],
+      ]],
+    ],
+  },
+];
+const NOTES_SEEN_KEY = 'ff-notes-seen';
+
+function showReleaseNotes(version = RELEASE_NOTES[0].version) {
+  const n = RELEASE_NOTES.find((x) => x.version === version) || RELEASE_NOTES[0];
+  const m = openModal('notes', `
+    <div class="modal-icon">${ic.check}</div>
+    <h3>FastFiles ${esc(n.version)} sürüm notları</h3>
+    <p class="lead">${esc(n.date)} · Bu sürümde yapılan değişiklikler aşağıda özetlenmiştir.</p>
+    <div class="notes">${n.sections.map(([title, items]) => `
+      <section class="notes-sec">
+        <h4>${esc(title)}</h4>
+        <ul>${items.map(([head, text]) => `<li><b>${esc(head)}.</b> ${esc(text)}</li>`).join('')}</ul>
+      </section>`).join('')}
+    </div>
+    <div class="foot"><button class="btn" data-close>Anladım</button></div>`);
+  m.querySelector('[data-close]').onclick = closeModal;
+  try { localStorage.setItem(NOTES_SEEN_KEY, n.version); } catch { /* önemli değil */ }
+}
+
+/** Güncellemeden sonraki ilk açılışta notları bir kez gösterir (yeni kurulumda göstermez). */
+function maybeShowReleaseNotes() {
+  const current = state.update?.current;
+  const latest = RELEASE_NOTES[0].version;
+  if (!current || current !== latest) return;
+  let seen = null;
+  try { seen = localStorage.getItem(NOTES_SEEN_KEY); } catch { /* yok say */ }
+  if (seen === latest) return;
+  if (!state.settings?.onboarded) {
+    try { localStorage.setItem(NOTES_SEEN_KEY, latest); } catch { /* yok say */ }
+    return;
+  }
+  // Başka bir pencere (gelen dosya, kilit) açıksa sonra dene.
+  if (modalKind || lockVisible()) return setTimeout(maybeShowReleaseNotes, 4000);
+  showReleaseNotes(latest);
+}
+
 async function init() {
   state.booted = true;
   const snap = await refreshSnapshot();
@@ -7858,6 +8268,7 @@ async function init() {
   renderPeers();
   renderConvs();
   setTransfers(snap.transfers);
+  setTimeout(maybeShowReleaseNotes, 1200);
 
   api.listen('peers', (e) => {
     state.peers = e.payload;
@@ -7889,7 +8300,7 @@ async function init() {
     state.update = await api.invoke('update_state').catch(() => state.update);
     renderUpdateBar();
   });
-  api.listen('updated', (e) => toast(`FastFiles güncellendi: v${e.payload.from} → v${e.payload.to}`, { type: 'success', timeout: 7000 }));
+  api.listen('updated', (e) => toast(`FastFiles güncellendi: v${e.payload.from} → v${e.payload.to}`, { type: 'success', timeout: 9000, action: 'Yenilikler', onAction: () => showReleaseNotes() }));
   api.listen('transfer', (e) => onTransfer(e.payload));
   api.listen('transfers', (e) => setTransfers(e.payload));
   api.listen('typing', (e) => onTyping(e.payload));
@@ -7969,6 +8380,15 @@ function createPreviewApi() {
       { id: 't7', direction: 'send', peerId: 'p3', peerName: 'Render-Sunucu', title: 'sahne.blend', fileCount: 1, total: 2.1e9, done: 0.9e9, speed: 0, status: 'failed', error: 'Bağlantı koptu', createdAt: now - 26 * 3600e3, finishedAt: now - 26 * 3600e3 + 90e3, sources: ['D:\\sahne.blend'] },
     ],
   };
+  // Önizleme: kapalı kişiler ve favoriler görünsün diye örnek kayıtlar.
+  if (!localStorage.getItem('ff-known-peers')) {
+    const off = (c) => c.repeat(64);
+    localStorage.setItem('ff-known-peers', JSON.stringify({
+      [off('c')]: { name: 'Hakan', os: 'windows', version: '1.12.0', ip: '192.168.1.132', lastSeen: now - 40 * 60e3 },
+      [off('d')]: { name: 'Zeynep (Muhasebe)', os: 'windows', version: '1.12.0', ip: '192.168.1.77', lastSeen: now - 26 * 3600e3 },
+    }));
+    localStorage.setItem('ff-interact', JSON.stringify({ [snap.peers[1].fingerprint]: { n: 9, at: now }, [off('c')]: { n: 6, at: now } }));
+  }
   const fp2 = snap.peers[1].fingerprint;
   const fp1 = snap.peers[0].fingerprint;
   const history = {
@@ -8762,6 +9182,18 @@ function createPreviewApi() {
         setTimeout(() => emit('screen-sharing', { active: true, session: 's1', viewers: [], invited: 1 }), 50);
         setTimeout(() => emit('screen-sharing', { active: true, session: 's1', viewers: ['Elif (Tasarım)'], invited: 1 }), 1500);
         return 's1';
+      }
+      if (cmd === 'screen_share_with') {
+        const names = args.fingerprints.map((f) => snap.peers.find((p) => p.fingerprint === f)?.name || 'Kişi');
+        setTimeout(() => emit('screen-sharing', { active: true, session: 's1', viewers: [], invited: names.length }), 50);
+        setTimeout(() => emit('screen-sharing', { active: true, session: 's1', viewers: names, invited: names.length }), 1500);
+        return 's1';
+      }
+      if (cmd === 'chat_send_to') {
+        const msg = { id: `m${Date.now()}`, outgoing: true, text: args.text.trim(), at: Date.now(), status: 'sending', pending: [args.fingerprint] };
+        (history[args.fingerprint] ||= []).push(msg);
+        emit('chat', { fingerprint: args.fingerprint, name: args.name, unread: 0, incoming: false, message: msg });
+        return msg;
       }
       if (cmd === 'screen_share_stop') { setTimeout(() => emit('screen-sharing', { active: false }), 20); return null; }
       if (cmd === 'screen_clip') {

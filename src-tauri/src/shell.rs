@@ -61,6 +61,26 @@ mod imp {
         Ok(())
     }
 
+    const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+    const RUN_VALUE: &str = "FastFiles";
+
+    /// Oturum açılınca FastFiles tepside (`--hidden`) başlasın. Yalnızca bu kullanıcı için
+    /// (HKCU), yönetici izni gerekmez. Güncelleme sonrası yol değişirse kayıt yenilenir.
+    pub fn set_autostart(exe: &Path, enabled: bool) -> Result<(), String> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (key, _) = hkcu.create_subkey(RUN_KEY).map_err(|e| e.to_string())?;
+        if enabled {
+            let cmd = format!("\"{}\" --hidden", exe.display());
+            let current: Option<String> = key.get_value(RUN_VALUE).ok();
+            if current.as_deref() != Some(cmd.as_str()) {
+                key.set_value(RUN_VALUE, &cmd).map_err(|e| e.to_string())?;
+            }
+        } else {
+            let _ = key.delete_value(RUN_VALUE);
+        }
+        Ok(())
+    }
+
     pub fn unregister() {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         for k in VERB_KEYS {
@@ -111,6 +131,29 @@ pub fn apply(enabled: bool) {
             }
         } else {
             imp::unregister();
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = enabled;
+}
+
+/// Ayara göre "Windows açılınca başlat" kaydını ekler ya da kaldırır. Geliştirme derlemesinde
+/// kayıt defterine dokunmaz.
+pub fn apply_autostart(enabled: bool) {
+    // Test için ayrı profille (FASTFILES_PROFILE) çalışan ikinci "cihaz" asıl kurulumun
+    // başlangıç kaydına dokunmaz.
+    if std::env::var_os("FASTFILES_PROFILE").is_some() {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let Ok(exe) = std::env::current_exe() else { return };
+        let dir = exe.parent().map(|d| d.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if dir.ends_with("\\target\\debug") || dir.ends_with("\\target\\release") {
+            return;
+        }
+        if let Err(e) = imp::set_autostart(&exe, enabled) {
+            eprintln!("[fastfiles] otomatik başlatma ayarlanamadı: {e}");
         }
     }
     #[cfg(not(windows))]

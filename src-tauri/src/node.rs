@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter, ReadHalf, WriteHalf};
@@ -55,6 +55,9 @@ const CHUNK: usize = 1024 * 1024;
 const EMIT_INTERVAL: Duration = Duration::from_millis(150);
 /// Bir cihazdan kabul edilen en fazla mesaj sayısı / zaman penceresi (spam koruması).
 const CHAT_RATE_MAX: usize = 30;
+/// IP başına sınır (kişi başına sınırın iki katı): aynı cihazın sertifika değiştirerek
+/// kişi-başı sınırı aşmasını engeller, ama tek bir cihazın olağan kullanımını kısmaz.
+const CHAT_RATE_MAX_IP: usize = 60;
 const CHAT_RATE_WINDOW: Duration = Duration::from_secs(30);
 /// Veri akışı bu kadar süre hiç ilerlemezse bağlantı kopmuş sayılır.
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -62,6 +65,14 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_DELAYS: [u64; 6] = [2, 4, 8, 15, 30, 30];
 /// Aktarım geçmişinde saklanan en fazla kayıt.
 const HISTORY_MAX: usize = 300;
+/// Aynı anda işlenen en fazla gelen bağlantı (ağdaki biri bağlantı seliyle belleği/soketleri
+/// tüketemesin). Ofiste normalde bir avuç eşzamanlı bağlantı olur.
+const MAX_CONNS_TOTAL: usize = 128;
+/// Tek bir IP'den aynı anda en fazla bu kadar bağlantı; aşanlar hemen kapatılır.
+const MAX_CONNS_PER_IP: u32 = 24;
+/// İlk mesajın en büyük boyutu: tür belli değilken 64 MB'lık bir çerçeve kabul edilmez. Dosya
+/// listesi (Offer) ya da ortak klasör bildirimi büyük olabileceğinden tümüyle küçük de değildir.
+const FIRST_MSG_MAX: usize = 24 * 1024 * 1024;
 
 type SrvRead = ReadHalf<ServerTls<TcpStream>>;
 type SrvWrite = WriteHalf<ServerTls<TcpStream>>;
@@ -96,6 +107,18 @@ pub struct Peer {
     /// Cihazın son görüldüğü tüm adresler (Wi-Fi + ethernet + VPN gibi birden fazla olabilir).
     #[serde(skip)]
     addrs: Vec<(IpAddr, Instant)>,
+}
+
+/// Birebir mesaj iletilemedi: neden?
+#[derive(Debug)]
+pub(crate) enum ChatFail {
+    /// Karşı tarafa ulaşılamadı: mesaj saklanır, kişi çevrimiçi olunca yeniden denenir.
+    #[allow(dead_code)]
+    Unreachable(String),
+    /// Karşı tarafın hız sınırı: biraz sonra yeniden denenir.
+    Rate(String),
+    /// Karşı taraf reddetti (engel, çok uzun): yeniden denenmez.
+    Fatal(String),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -287,7 +310,29 @@ pub struct Node {
     good_addr: Mutex<HashMap<String, SocketAddr>>,
     /// Durum, sohbet olayları, ekran paylaşımı ve telefon bağlantısı.
     pub extras: extras::State,
+    /// Aynı anda işlenen gelen bağlantılar: toplam ve IP başına (sel koruması).
+    conns_total: Arc<AtomicUsize>,
+    conns_per_ip: Arc<Mutex<HashMap<IpAddr, u32>>>,
     pub shutdown: CancellationToken,
+}
+
+/// Gelen bağlantı sayacını tutar; bağlantı nasıl biterse bitsin sayaç geri iner.
+struct ConnGuard {
+    total: Arc<AtomicUsize>,
+    per_ip: Arc<Mutex<HashMap<IpAddr, u32>>>,
+    ip: IpAddr,
+}
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.total.fetch_sub(1, Ordering::Relaxed);
+        let mut map = self.per_ip.lock().unwrap();
+        if let Some(c) = map.get_mut(&self.ip) {
+            *c -= 1;
+            if *c == 0 {
+                map.remove(&self.ip);
+            }
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -369,6 +414,8 @@ impl Node {
             games_path: config_dir.join("games.json"),
             good_addr: Mutex::new(HashMap::new()),
             extras: extras::State::default(),
+            conns_total: Arc::new(AtomicUsize::new(0)),
+            conns_per_ip: Arc::new(Mutex::new(HashMap::new())),
             shutdown: CancellationToken::new(),
         });
         node.load_cached_package();
@@ -1086,8 +1133,12 @@ impl Node {
                 };
                 match accepted {
                     Ok((tcp, addr)) => {
+                        // Bağlantı seli koruması: toplam ve IP başına sınır aşıldıysa bağlantı
+                        // hemen kapatılır (TLS el sıkışması bile başlamaz).
+                        let Some(guard) = node.accept_slot(addr.ip()) else { continue };
                         let n = node.clone();
                         tokio::spawn(async move {
+                            let _guard = guard;
                             if let Err(e) = n.handle_connection(tcp, addr).await {
                                 eprintln!("[fastfiles] {addr}: {e}");
                             }
@@ -1098,6 +1149,24 @@ impl Node {
             }
         });
         Ok(port)
+    }
+
+    /// Gelen bağlantı için yer ayırır. Toplam ya da IP başına sınır aşıldıysa `None` döner
+    /// (bağlantı reddedilir). Dönen guard düşünce sayaçlar geri iner.
+    fn accept_slot(&self, ip: IpAddr) -> Option<ConnGuard> {
+        {
+            let mut map = self.conns_per_ip.lock().unwrap();
+            let c = map.entry(ip).or_insert(0);
+            if *c >= MAX_CONNS_PER_IP || self.conns_total.load(Ordering::Relaxed) >= MAX_CONNS_TOTAL {
+                if *c == 0 {
+                    map.remove(&ip);
+                }
+                return None;
+            }
+            *c += 1;
+        }
+        self.conns_total.fetch_add(1, Ordering::Relaxed);
+        Some(ConnGuard { total: self.conns_total.clone(), per_ip: self.conns_per_ip.clone(), ip })
     }
 
     async fn handle_connection(self: Arc<Self>, tcp: TcpStream, addr: SocketAddr) -> Result<(), String> {
@@ -1116,7 +1185,8 @@ impl Node {
             .ok_or("istemci sertifikası yok")?;
 
         let (mut rd, mut wr) = tokio::io::split(tls);
-        let msg = timeout(Duration::from_secs(15), read_msg(&mut rd))
+        // İlk mesaj boyutu sınırlı: tür belli değilken 64 MB'lık bir çerçeve belleğe alınmaz.
+        let msg = timeout(Duration::from_secs(15), read_msg_max(&mut rd, FIRST_MSG_MAX))
             .await
             .map_err(|_| "ilk mesaj gelmedi".to_string())?
             .map_err(|e| e.to_string())?;
@@ -1414,8 +1484,11 @@ impl Node {
         }
 
         // ── Hedef klasör ve benzersiz isimler (devamda öncekiler aynen kullanılır) ──
+        // Sohbette gelen tek resimler (ekran görüntüleri, yapıştırılan resimler) ana klasörü
+        // doldurmasın: `Resimler\<gönderen>` altına kaydedilir.
         let dest = match &prior {
             Some(p) => PathBuf::from(&p.dest),
+            None if image => image_dir(&PathBuf::from(self.settings().download_dir), &device.name),
             None => PathBuf::from(self.settings().download_dir),
         };
         if let Err(e) = tokio::fs::create_dir_all(&dest).await {
@@ -1733,8 +1806,12 @@ impl Node {
 
     // ───────────────────────────── Mesajlaşma ─────────────────────────────
 
-    fn chat_rate_ok(&self, fp: &str) -> bool {
-        rate_ok(&self.chat_rate, fp, CHAT_RATE_MAX, CHAT_RATE_WINDOW)
+    /// Mesaj hız sınırı: hem kişi (parmak izi) hem de IP başına. IP sınırı, sertifikasını
+    /// sürekli değiştirerek kişi-başı sınırı aşmaya çalışan bir cihazı da durdurur.
+    fn chat_rate_ok(&self, fp: &str, ip: IpAddr) -> bool {
+        // Önce IP penceresine bakılır; kişi penceresi yalnızca IP geçerse tüketilir.
+        rate_ok(&self.chat_rate, &format!("ip:{ip}"), CHAT_RATE_MAX_IP, CHAT_RATE_WINDOW)
+            && rate_ok(&self.chat_rate, fp, CHAT_RATE_MAX, CHAT_RATE_WINDOW)
     }
 
     /// Gelen mesajı doğrular ve kaydeder. Hata durumunda karşı tarafa gidecek ret kodu döner.
@@ -1753,7 +1830,7 @@ impl Node {
         if self.chats.lock().unwrap().contains(&fp, id) {
             return Ok(());
         }
-        if !self.chat_rate_ok(&fp) {
+        if !self.chat_rate_ok(&fp, ip) {
             return Err("rate");
         }
         let text = sanitize_text(text, MAX_CHAT_CHARS);
@@ -2021,6 +2098,14 @@ impl Node {
             reply,
             ..Default::default()
         };
+        // Bu kişiye hâlâ iletilmeyi bekleyen eski mesajlar varsa yenisi onların arkasına girer:
+        // alıcı mesajları geliş sırasıyla gösterdiği için doğrudan gönderim sırayı bozardı.
+        if self.chats.lock().unwrap().has_queued_text(&peer.fingerprint) {
+            let msg = ChatMessage { pending: vec![peer.fingerprint.clone()], ..msg };
+            self.store_chat(&peer.fingerprint, &peer.name, msg.clone());
+            self.flush_outbox();
+            return Ok(msg);
+        }
         self.store_chat(&peer.fingerprint, &peer.name, msg.clone());
         self.spawn_chat_delivery(peer, msg.clone());
         Ok(msg)
@@ -2031,11 +2116,14 @@ impl Node {
         if !msg.outgoing || msg.status != MsgStatus::Failed {
             return Ok(());
         }
-        let peer = self
-            .peers()
-            .into_iter()
-            .find(|p| p.fingerprint == fp)
-            .ok_or("Bu cihaz çevrimdışı, mesaj gönderilemez")?;
+        let Some(peer) = self.peers().into_iter().find(|p| p.fingerprint == fp) else {
+            // Çevrimdışı kişi: mesaj giden kutusuna alınır, çevrimiçi olunca iletilir.
+            if msg.file.is_none() && valid_fingerprint(fp) && self.group_of(fp).is_none() {
+                self.queue_direct(fp, id);
+                return Ok(());
+            }
+            return Err("Bu cihaz çevrimdışı, mesaj gönderilemez".into());
+        };
         self.set_chat_status(fp, id, MsgStatus::Sending, None);
         self.spawn_chat_delivery(peer, msg);
         Ok(())
@@ -2044,33 +2132,85 @@ impl Node {
     fn spawn_chat_delivery(self: &Arc<Self>, peer: Peer, msg: ChatMessage) {
         let node = self.clone();
         tokio::spawn(async move {
-            let (status, error) = match node.deliver_chat(&peer, &msg).await {
-                Ok(()) => (MsgStatus::Sent, None),
-                Err(e) => (MsgStatus::Failed, Some(e)),
-            };
-            node.set_chat_status(&peer.fingerprint, &msg.id, status, error);
+            match node.deliver_chat(&peer, &msg).await {
+                Ok(()) => node.set_chat_status(&peer.fingerprint, &msg.id, MsgStatus::Sent, None),
+                // Bağlantı kurulamadı (karşı taraf tam o an kapandı, ağ koptu): mesaj kaybolmasın,
+                // giden kutusuna alınır ve kişi yeniden çevrimiçi olunca iletilir.
+                Err(ChatFail::Unreachable(_)) => node.queue_direct(&peer.fingerprint, &msg.id),
+                Err(ChatFail::Rate(e) | ChatFail::Fatal(e)) => node.set_chat_status(&peer.fingerprint, &msg.id, MsgStatus::Failed, Some(e)),
+            }
         });
     }
 
-    async fn deliver_chat(&self, peer: &Peer, msg: &ChatMessage) -> Result<(), String> {
-        let mut stream = self.connect(&self.candidates(peer), Some(peer.fingerprint.clone())).await?;
+    /// Birebir mesajı giden kutusuna alır: kişi çevrimiçi olunca (3 gün içinde) iletilir.
+    fn queue_direct(&self, fp: &str, id: &str) {
+        // Bu arada silinen (ya da giden olmayan) mesaj yeniden kuyruğa girmez.
+        let updated = self.chats.lock().unwrap().update_message(fp, id, |m| {
+            if m.deleted || !m.outgoing {
+                return;
+            }
+            m.pending = vec![fp.to_string()];
+            m.status = MsgStatus::Sending;
+            m.error = None;
+        });
+        if let Some(m) = updated {
+            self.emit_chat_message(fp, &m, false);
+        }
+    }
+
+    /// Kişiye mesaj gönderir; çevrimdışıysa mesaj saklanır ve kişi çevrimiçi olunca iletilir.
+    pub fn chat_send_to(self: &Arc<Self>, fp: &str, name: &str, text: &str, reply_to: Option<&str>) -> Result<ChatMessage, String> {
+        if !valid_fingerprint(fp) || fp == self.identity.fingerprint {
+            return Err("Geçersiz kişi".into());
+        }
+        if let Some(peer) = self.peers().into_iter().find(|p| p.fingerprint == fp) {
+            return self.chat_send(&peer.id, text, reply_to);
+        }
+        if self.is_blocked(fp) {
+            return Err("Bu cihazı engellediniz".into());
+        }
+        if text.chars().count() > MAX_CHAT_CHARS {
+            return Err(format!("Mesaj çok uzun (en fazla {MAX_CHAT_CHARS} karakter)"));
+        }
+        let text = sanitize_text(text, MAX_CHAT_CHARS);
+        if text.is_empty() {
+            return Err("Mesaj boş".into());
+        }
+        let name = self.chats.lock().unwrap().conversation_meta(fp).map(|m| m.0).unwrap_or_else(|| sanitize_name(name));
+        let reply = reply_to.and_then(|id| self.reply_ref(fp, id));
+        let msg = ChatMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            outgoing: true,
+            text,
+            at: now_ms(),
+            status: MsgStatus::Sending,
+            pending: vec![fp.to_string()],
+            reply,
+            ..Default::default()
+        };
+        self.store_chat(fp, &name, msg.clone());
+        Ok(msg)
+    }
+
+    pub(crate) async fn deliver_chat(&self, peer: &Peer, msg: &ChatMessage) -> Result<(), ChatFail> {
+        let mut stream = self.connect(&self.candidates(peer), Some(peer.fingerprint.clone())).await.map_err(ChatFail::Unreachable)?;
         write_msg(&mut stream, &Message::Chat { device: self.device_info(), id: msg.id.clone(), text: msg.text.clone(), reply: msg.reply.clone() })
             .await
-            .map_err(|_| "Bağlantı koptu".to_string())?;
+            .map_err(|_| ChatFail::Unreachable("Bağlantı koptu".into()))?;
         let reply = timeout(Duration::from_secs(8), read_msg(&mut stream))
             .await
-            .map_err(|_| "Karşı taraf yanıt vermedi".to_string())?
-            .map_err(|_| "Karşı taraf yanıt vermedi".to_string())?;
+            .map_err(|_| ChatFail::Unreachable("Karşı taraf yanıt vermedi".into()))?
+            .map_err(|_| ChatFail::Unreachable("Karşı taraf yanıt vermedi".into()))?;
         let _ = stream.shutdown().await;
         match reply {
             Message::ChatAck { id } if id == msg.id => Ok(()),
             Message::ChatReject { reason } => Err(match reason.as_str() {
-                "blocked" => "Karşı taraf mesajları kabul etmiyor".into(),
-                "rate" => "Çok hızlı mesaj gönderiyorsunuz, biraz bekleyin".into(),
-                "too_long" => "Mesaj çok uzun".into(),
-                _ => "Mesaj reddedildi".into(),
+                "blocked" => ChatFail::Fatal("Karşı taraf mesajları kabul etmiyor".into()),
+                "rate" => ChatFail::Rate("Çok hızlı mesaj gönderiyorsunuz, biraz bekleyin".into()),
+                "too_long" => ChatFail::Fatal("Mesaj çok uzun".into()),
+                _ => ChatFail::Fatal("Mesaj reddedildi".into()),
             }),
-            _ => Err("Beklenmeyen yanıt".into()),
+            _ => Err(ChatFail::Fatal("Beklenmeyen yanıt".into())),
         }
     }
 
@@ -2675,6 +2815,14 @@ fn is_auto_image(files: &[(Vec<String>, u64)]) -> bool {
     matches!(files, [(parts, size)] if parts.len() == 1 && *size > 0 && *size <= IMAGE_PREVIEW_MAX && is_image_path(Path::new(&parts[0])))
 }
 
+/// Sohbet resimlerinin klasörü: `<indirilenler>\Resimler\<gönderen adı>`. Ad ağdan geldiği için
+/// tek bir güvenli klasör adına indirgenir (yol ayırıcı, `..`, ayrılmış adlar olamaz).
+fn image_dir(download: &Path, sender: &str) -> PathBuf {
+    let flat: String = sanitize_name(sender).chars().map(|c| if c == '/' || c == '\\' { '_' } else { c }).collect();
+    let folder = sanitize_rel_path(&flat).and_then(|p| p.into_iter().next()).filter(|p| p != "..").unwrap_or_else(|| "Diğer".into());
+    download.join("Resimler").join(folder)
+}
+
 /// Kayan pencereli sayaç: son pencerede `max`'tan az olay varsa yenisini sayar ve true döner.
 fn rate_ok(map: &Mutex<HashMap<String, VecDeque<Instant>>>, fp: &str, max: usize, window: Duration) -> bool {
     let mut map = map.lock().unwrap();
@@ -2874,7 +3022,8 @@ mod tests {
         assert_eq!(wait_finished(&alice, &id).await.status, Status::Done);
         assert_eq!(asked(), 0, "resim için onay sorulmamalı");
         let dl = PathBuf::from(bob.settings().download_dir);
-        assert!(dl.join("Foto.JPG").exists());
+        assert!(dl.join("Resimler").join("alice").join("Foto.JPG").exists(), "sohbet resmi gönderenin klasörüne gitmeli");
+        assert!(!dl.join("Foto.JPG").exists());
         // Gelen mesaj gibi: okunmamış sayılır ve "incoming" olarak bildirilir.
         let fp = alice.identity.fingerprint.clone();
         assert!(events.lock().unwrap().iter().any(|e| e.0 == "chat" && e.1["incoming"] == true));
@@ -2909,6 +3058,16 @@ mod tests {
     }
 
     #[test]
+    fn image_dir_is_one_safe_folder_per_sender() {
+        let dl = Path::new("dl");
+        assert_eq!(image_dir(dl, "Ahmet"), dl.join("Resimler").join("Ahmet"));
+        assert_eq!(image_dir(dl, "../../Windows"), dl.join("Resimler").join(".._.._Windows"));
+        assert_eq!(image_dir(dl, "a\\b/c"), dl.join("Resimler").join("a_b_c"));
+        assert_eq!(image_dir(dl, "CON"), dl.join("Resimler").join("_CON"));
+        assert_eq!(image_dir(dl, "Ad: <x>?"), dl.join("Resimler").join("Ad_ _x__"));
+    }
+
+    #[test]
     fn auto_image_rules_and_rate_limit() {
         let one = |name: &str, size: u64| vec![(vec![name.to_string()], size)];
         assert!(is_auto_image(&one("a.png", 10)));
@@ -2926,6 +3085,24 @@ mod tests {
         }
         assert!(!rate_ok(&map, "x", IMAGE_RATE_MAX, IMAGE_RATE_WINDOW), "sınır aşılınca yine sorulmalı");
         assert!(rate_ok(&map, "y", IMAGE_RATE_MAX, IMAGE_RATE_WINDOW), "sayaç cihaz başına");
+    }
+
+    /// Bağlantı seli koruması: IP başına ve toplam sınır; guard düşünce yer boşalır.
+    #[tokio::test]
+    async fn connection_slots_are_capped_per_ip_and_released() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = make_node(tmp.path(), "alice").await;
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 77));
+        let mut guards = Vec::new();
+        for _ in 0..MAX_CONNS_PER_IP {
+            guards.push(node.accept_slot(ip).expect("sınıra kadar kabul edilmeli"));
+        }
+        assert!(node.accept_slot(ip).is_none(), "IP sınırı aşılınca reddedilmeli");
+        // Başka bir IP hâlâ kabul edilir.
+        assert!(node.accept_slot(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 78))).is_some());
+        // Bir guard düşünce o IP için yeniden yer açılır.
+        guards.pop();
+        assert!(node.accept_slot(ip).is_some(), "guard düşünce yer boşalmalı");
     }
 
     #[tokio::test]
@@ -3798,6 +3975,37 @@ mod tests {
         }
         assert_eq!(group_texts(&carol, &key), vec!["Carol yokken yazıldı"]);
         wait_until(|| alice.chat_history(&key).iter().any(|m| m.outgoing && m.pending.is_empty())).await;
+    }
+
+    /// Çevrimdışı kişiye yazılan birebir mesaj saklanır ve kişi çevrimiçi olunca iletilir.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn direct_message_to_offline_peer_is_delivered_later() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = make_node(tmp.path(), "alice").await;
+        let bob = make_node(tmp.path(), "bob").await;
+        let bob_fp = bob.identity.fingerprint.clone();
+        let alice_fp = alice.identity.fingerprint.clone();
+
+        let sent = alice.chat_send_to(&bob_fp, "Bob", "Sabah bakarsın", None).unwrap();
+        assert_eq!(sent.pending, vec![bob_fp.clone()], "çevrimdışı kişiye mesaj beklemeli");
+        alice.flush_outbox();
+        sleep(Duration::from_millis(200)).await;
+        assert!(bob.chat_history(&alice_fp).is_empty());
+
+        introduce(&alice, &bob);
+        // Bob açılır açılmaz yazılan yeni mesaj, bekleyen eskisinin önüne geçmemeli.
+        let second = alice.chat_send(&bob.identity.id, "İkinci mesaj", None).unwrap();
+        assert_eq!(second.pending, vec![bob_fp.clone()], "bekleyen mesaj varken yenisi sıraya girmeli");
+        for _ in 0..60 {
+            alice.flush_outbox();
+            if bob.chat_history(&alice_fp).len() == 2 {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        let got: Vec<String> = bob.chat_history(&alice_fp).into_iter().map(|m| m.text).collect();
+        assert_eq!(got, vec!["Sabah bakarsın", "İkinci mesaj"]);
+        wait_until(|| alice.chat_history(&bob_fp).iter().any(|m| m.id == sent.id && m.pending.is_empty() && m.status == MsgStatus::Sent)).await;
     }
 
     /// Regresyon: "yazıyor…" senkron bağlamdan (tokio çalışma ortamı yok) çağrılınca

@@ -263,6 +263,8 @@ pub enum OutboxItem {
     Leave { key: String, to: String, group_id: String },
     /// Birebir sohbette çevrimdışı kişiye bırakılan dosya: kişi çevrimiçi olunca gönderilir.
     DirectFile { key: String, to: String, msg: ChatMessage },
+    /// Birebir sohbette çevrimdışı kişiye yazılan mesaj: kişi çevrimiçi olunca iletilir.
+    DirectMessage { key: String, to: String, msg: ChatMessage },
 }
 
 /// Bekleyen grup mesajlarından bu kadar eskiyse vazgeçilir.
@@ -330,6 +332,13 @@ impl ChatStore {
         let unread = conv.unread;
         self.save();
         unread
+    }
+
+    /// Birebir sohbette hâlâ iletilmeyi bekleyen (giden kutusundaki) yazılı mesaj var mı?
+    pub fn has_queued_text(&self, fingerprint: &str) -> bool {
+        self.convs
+            .get(fingerprint)
+            .map_or(false, |c| c.group.is_none() && c.messages.iter().any(|m| m.outgoing && m.file.is_none() && !m.pending.is_empty()))
     }
 
     pub fn contains(&self, fingerprint: &str, id: &str) -> bool {
@@ -434,8 +443,8 @@ impl ChatStore {
         let mut changed = self.convs.len() != before;
         for conv in self.convs.values_mut() {
             let Some(group) = conv.group.clone() else {
-                // Birebir sohbet: "çevrimiçi olunca gönder" dosyaları.
-                for m in conv.messages.iter_mut().filter(|m| m.outgoing && m.file.is_some() && !m.pending.is_empty()) {
+                // Birebir sohbet: "çevrimiçi olunca gönder" mesajları ve dosyaları.
+                for m in conv.messages.iter_mut().filter(|m| m.outgoing && !m.pending.is_empty()) {
                     if now.saturating_sub(m.at) > OUTBOX_MAX_AGE_MS {
                         m.status = MsgStatus::Failed;
                         m.error = Some("3 gün içinde gönderilemedi".into());
@@ -443,7 +452,8 @@ impl ChatStore {
                         changed = true;
                         continue;
                     }
-                    items.push(OutboxItem::DirectFile { key: conv.fingerprint.clone(), to: conv.fingerprint.clone(), msg: m.clone() });
+                    let (key, to, msg) = (conv.fingerprint.clone(), conv.fingerprint.clone(), m.clone());
+                    items.push(if m.file.is_some() { OutboxItem::DirectFile { key, to, msg } } else { OutboxItem::DirectMessage { key, to, msg } });
                 }
                 continue;
             };

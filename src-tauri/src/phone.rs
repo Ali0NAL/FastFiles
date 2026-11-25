@@ -27,11 +27,17 @@ struct Session {
     last_activity: Instant,
 }
 
+/// Telefon sunucusunda aynı anda işlenen en fazla HTTP bağlantısı (ağdaki biri soketleri
+/// tüketemesin). Telefon sayfası birkaç paralel istek açar; bu sınır rahatça yeter.
+const MAX_PHONE_CONNS: usize = 32;
+
 #[derive(Default)]
 pub struct State {
     session: Mutex<Option<Session>>,
     /// Süren yükleme/indirme sayısı (otomatik güncelleme bunlar bitene kadar bekler).
     active: std::sync::atomic::AtomicUsize,
+    /// Aynı anda açık HTTP bağlantısı sayısı (sel koruması).
+    conns: std::sync::atomic::AtomicUsize,
 }
 
 impl State {
@@ -243,10 +249,17 @@ impl Node {
                     }
                 };
                 let Ok((stream, _)) = accepted else { continue };
+                // Eşzamanlı bağlantı sayısı sınırlı: aşıldıysa yeni bağlantı hemen kapatılır.
+                use std::sync::atomic::Ordering;
+                if node.extras.phone.conns.fetch_add(1, Ordering::Relaxed) >= MAX_PHONE_CONNS {
+                    node.extras.phone.conns.fetch_sub(1, Ordering::Relaxed);
+                    continue;
+                }
                 let node = node.clone();
                 let token = token.clone();
                 tokio::spawn(async move {
                     let _ = node.phone_handle(stream, &token).await;
+                    node.extras.phone.conns.fetch_sub(1, Ordering::Relaxed);
                 });
             }
         });
@@ -417,54 +430,83 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
 }
 
-/// Telefonda açılan sayfa (tek dosya, dış kaynak yok).
+/// Telefonda açılan sayfa (tek dosya, dış kaynak yok; logo ve renkler uygulamayla aynı).
 const PAGE: &str = r##"<!doctype html>
-<html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark"><meta name="robots" content="noindex,nofollow">
 <title>FastFiles · {{NAME}}</title>
 <style>
-:root{--a:#5b55f6;--bg:#f4f5fa;--s:#fff;--t:#171a2b;--m:#6b7088;--b:#e4e6ef;--ok:#16a35f;--bad:#e0424a}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1020;--s:#1a1c33;--t:#eceefa;--m:#9196b5;--b:#2a2d48;--a:#7c77ff}}
-*{box-sizing:border-box}body{margin:0;font:16px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);color:var(--t)}
-header{padding:20px 16px 8px;display:flex;align-items:center;gap:12px}
-.logo{width:40px;height:40px;border-radius:12px;background:linear-gradient(135deg,var(--a),#22c5e0);display:grid;place-items:center;color:#fff;font-weight:800}
-h1{font-size:18px;margin:0}small{color:var(--m)}
-main{padding:8px 16px 40px;display:grid;gap:14px;max-width:560px;margin:0 auto}
-.card{background:var(--s);border:1px solid var(--b);border-radius:16px;padding:16px}
-.card h2{font-size:15px;margin:0 0 10px}
-.pick{display:block;text-align:center;padding:22px 12px;border:2px dashed var(--a);border-radius:14px;color:var(--a);font-weight:700;cursor:pointer}
+:root{--a:#5b4fd1;--a2:#7a6fe0;--ink:#fff;--bg:#f4f4f2;--s:#fff;--s2:#f6f6f4;--t:#191918;--m:#6c6b66;--b:#e4e3df;--bs:#d3d2cc;--ok:#14804a;--bad:#d23434;--tile:#f4f2ee;--tb:#d3d2cc}
+@media (prefers-color-scheme:dark){:root{--a:#8b80f0;--a2:#a49bf5;--ink:#0d0e10;--bg:#0d0e10;--s:#151619;--s2:#1b1c20;--t:#ececee;--m:#92939b;--b:#26282d;--bs:#34363d;--ok:#3ecf7f;--bad:#ff6b6b}}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+body{margin:0;font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);color:var(--t);-webkit-font-smoothing:antialiased;overflow-x:hidden}
+header{padding:calc(18px + env(safe-area-inset-top)) 18px 10px;display:flex;align-items:center;gap:12px;max-width:620px;margin:0 auto}
+.logo{width:44px;height:44px;border-radius:13px;background:var(--tile);border:1px solid var(--tb);box-shadow:inset 0 1px 0 rgba(255,255,255,.5),0 1px 2px rgba(0,0,0,.12);display:grid;place-items:center;flex-shrink:0}
+.logo svg{width:30px;height:30px;display:block}
+h1{font-size:18px;font-weight:600;margin:0;letter-spacing:-.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+small{color:var(--m);font-size:13px}
+main{padding:10px 18px calc(44px + env(safe-area-inset-bottom));display:grid;gap:14px;max-width:620px;margin:0 auto}
+.card{background:var(--s);border:1px solid var(--b);border-radius:16px;padding:16px;box-shadow:0 1px 2px rgba(0,0,0,.03);min-width:0}
+.card h2{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--m);margin:0 0 12px}
+.pick{display:flex;flex-direction:column;align-items:center;gap:6px;text-align:center;padding:26px 14px;border:1.5px dashed var(--bs);border-radius:14px;color:var(--a);font-weight:600;cursor:pointer;transition:border-color .15s,background .15s}
+.pick:active,.pick.drag{border-color:var(--a);background:color-mix(in srgb,var(--a) 8%,transparent)}
+.pick svg{width:30px;height:30px;stroke:var(--a);fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.pick .sub{font-size:12.5px;font-weight:400;color:var(--m)}
 .pick input{display:none}
-.row{display:flex;align-items:center;gap:10px;padding:10px 0;border-top:1px solid var(--b)}
+.row{display:flex;align-items:center;gap:12px;padding:12px 0;border-top:1px solid var(--b);min-width:0}
 .row:first-child{border-top:0}
-.row .n{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.row .sz{color:var(--m);font-size:13px}
-.bar{height:6px;background:var(--b);border-radius:9px;overflow:hidden;margin-top:6px}
-.bar i{display:block;height:100%;width:0;background:var(--a);transition:width .2s}
-.ok{color:var(--ok);font-weight:700}.bad{color:var(--bad);font-weight:700}
-a.dl{background:var(--a);color:#fff;text-decoration:none;padding:8px 14px;border-radius:10px;font-weight:700;font-size:14px}
-.empty{color:var(--m);font-size:14px}
+.ic{width:34px;height:34px;flex-shrink:0;border-radius:9px;background:var(--s2);display:grid;place-items:center;color:var(--a)}
+.ic svg{width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.mid{flex:1;min-width:0}
+.n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
+.sz{color:var(--m);font-size:12.5px;margin-top:1px}
+.bar{height:5px;background:var(--b);border-radius:9px;overflow:hidden;margin-top:7px}
+.bar i{display:block;height:100%;width:0;background:var(--a);border-radius:9px;transition:width .2s}
+.ok{color:var(--ok);font-weight:600}.bad{color:var(--bad);font-weight:600}
+a.dl{display:inline-flex;align-items:center;gap:6px;background:var(--a);color:var(--ink);text-decoration:none;padding:9px 15px;border-radius:10px;font-weight:600;font-size:14px;flex-shrink:0;box-shadow:inset 0 1px 0 rgba(255,255,255,.16)}
+a.dl:active{filter:brightness(1.06)}
+a.dl svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.empty{color:var(--m);font-size:13.5px;padding:4px 0}
+.note{display:flex;gap:8px;align-items:flex-start;color:var(--m);font-size:12.5px;line-height:1.5;padding:2px 2px 0;max-width:620px;margin:0 auto}
+.note svg{width:15px;height:15px;flex-shrink:0;margin-top:1px;stroke:currentColor;fill:none;stroke-width:1.8}
 </style></head><body>
-<header><div class="logo">⚡</div><div><h1>{{NAME}}</h1><small>FastFiles · aynı Wi-Fi ağı</small></div></header>
+<header>
+<div class="logo" aria-hidden="true"><svg viewBox="7 7.5 46 46"><rect x="21" y="14" width="8" height="36" rx="2" fill="#5b4fd1"/><rect x="21" y="14" width="21" height="8" rx="2" fill="#5b4fd1"/><polygon points="41,11 51,18 41,25" fill="#5b4fd1"/><rect x="21" y="29" width="16" height="7" rx="2" fill="#5b4fd1"/><rect x="9" y="16.5" width="8" height="3" rx="1.5" fill="#a49bf5"/><rect x="12" y="31" width="5" height="3" rx="1.5" fill="#a49bf5"/></svg></div>
+<div style="min-width:0"><h1>{{NAME}}</h1><small>FastFiles · aynı Wi-Fi ağı</small></div>
+</header>
 <main>
 <section class="card"><h2>Bilgisayara gönder</h2>
-<label class="pick">📤 Fotoğraf, video ya da dosya seç<input id="f" type="file" multiple></label>
+<label class="pick" id="pick">
+<svg viewBox="0 0 24 24"><path d="M12 15V4m0 0-4 4m4-4 4 4M5 15v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3"/></svg>
+<span>Fotoğraf, video ya da dosya seç</span>
+<span class="sub">Birden fazla seçebilirsiniz · uygulama gerekmez</span>
+<input id="f" type="file" multiple></label>
 <div id="up"></div></section>
 <section class="card"><h2>Bilgisayardan al</h2><div id="list"><div class="empty">Bilgisayarda "Telefona gönder" ile dosya seçilince burada görünür.</div></div></section>
+<div class="note"><svg viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/></svg><span>Bağlantı yalnızca yerel ağda kalır, internete çıkmaz. Pencere kapanınca bu adres geçersiz olur.</span></div>
 </main>
 <script>
 const base=location.pathname.replace(/\/$/,'');
+const $=s=>document.querySelector(s);
 const fmt=n=>{const u=['B','KB','MB','GB'];let i=0;while(n>=1024&&i<3){n/=1024;i++}return (i?n.toFixed(1):n)+' '+u[i]};
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const UP='<svg viewBox="0 0 24 24"><path d="M12 19V5m0 0-6 6m6-6 6 6"/></svg>';
+const DL='<svg viewBox="0 0 24 24"><path d="M12 5v10m0 0-4-4m4 4 4-4M5 19h14"/></svg>';
 let queue=Promise.resolve();
-document.getElementById('f').onchange=e=>{for(const file of e.target.files){const row=document.createElement('div');row.className='row';
-row.innerHTML='<div class="n"></div><div class="sz"></div>';row.querySelector('.n').innerHTML=esc(file.name)+'<div class="bar"><i></i></div>';
-row.querySelector('.sz').textContent=fmt(file.size);document.getElementById('up').prepend(row);
+function send(file){const row=document.createElement('div');row.className='row';
+row.innerHTML='<div class="ic">'+UP+'</div><div class="mid"><div class="n"></div><div class="bar"><i></i></div></div><div class="sz"></div>';
+row.querySelector('.n').textContent=file.name;row.querySelector('.sz').textContent=fmt(file.size);$('#up').prepend(row);
 queue=queue.then(()=>new Promise(done=>{const x=new XMLHttpRequest();x.open('PUT',base+'/up?name='+encodeURIComponent(file.name));
 x.upload.onprogress=p=>{if(p.lengthComputable)row.querySelector('i').style.width=(p.loaded/p.total*100)+'%'};
-x.onload=()=>{row.querySelector('.sz').innerHTML=x.status==200?'<span class="ok">✓ Gönderildi</span>':'<span class="bad">Hata</span>';done()};
-x.onerror=()=>{row.querySelector('.sz').innerHTML='<span class="bad">Bağlantı koptu</span>';done()};x.send(file)}))}
-e.target.value=''};
+x.onload=()=>{row.querySelector('.bar').style.display='none';row.querySelector('.sz').innerHTML=x.status==200?'<span class="ok">✓ Gönderildi</span>':'<span class="bad">Hata</span>';done()};
+x.onerror=()=>{row.querySelector('.bar').style.display='none';row.querySelector('.sz').innerHTML='<span class="bad">Bağlantı koptu</span>';done()};x.send(file)}))}
+$('#f').onchange=e=>{for(const file of e.target.files)send(file);e.target.value=''};
+const pick=$('#pick');
+['dragenter','dragover'].forEach(ev=>pick.addEventListener(ev,e=>{e.preventDefault();pick.classList.add('drag')}));
+['dragleave','drop'].forEach(ev=>pick.addEventListener(ev,e=>{e.preventDefault();pick.classList.remove('drag')}));
+pick.addEventListener('drop',e=>{for(const file of e.dataTransfer.files)send(file)});
 let sig='';async function poll(){try{const r=await fetch(base+'/list',{cache:'no-store'});if(r.ok){const l=await r.json();const s=JSON.stringify(l);
-if(s!==sig){sig=s;document.getElementById('list').innerHTML=l.length?l.map(f=>'<div class="row"><div class="n">'+esc(f.name)+'<div class="sz">'+fmt(f.size)+'</div></div><a class="dl" href="'+base+'/f/'+f.i+'" download>İndir</a></div>').join(''):'<div class="empty">Bilgisayarda "Telefona gönder" ile dosya seçilince burada görünür.</div>'}}}catch(e){}setTimeout(poll,2500)}
+if(s!==sig){sig=s;$('#list').innerHTML=l.length?l.map(f=>'<div class="row"><div class="ic">'+DL+'</div><div class="mid"><div class="n">'+esc(f.name)+'</div><div class="sz">'+fmt(f.size)+'</div></div><a class="dl" href="'+base+'/f/'+f.i+'" download>'+DL+'İndir</a></div>').join(''):'<div class="empty">Bilgisayarda "Telefona gönder" ile dosya seçilince burada görünür.</div>'}}}catch(e){}setTimeout(poll,2500)}
 poll();
 </script></body></html>"##;
 

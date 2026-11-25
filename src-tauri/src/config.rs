@@ -104,6 +104,8 @@ pub struct Settings {
     pub status: String,
     /// Genel kısayollar: Ctrl+Shift+Space hızlı gönderim, Ctrl+Shift+PrtSc ekran görüntüsü.
     pub hotkeys: bool,
+    /// Windows açılınca FastFiles tepside kendiliğinden başlasın (kullanıcının "Run" kaydı).
+    pub autostart: bool,
 }
 
 impl Default for Settings {
@@ -129,6 +131,7 @@ impl Default for Settings {
             work_avatar: 0,
             status: String::new(),
             hotkeys: true,
+            autostart: true,
         }
     }
 }

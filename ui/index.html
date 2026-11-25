@@ -10,7 +10,7 @@
   <header class="topbar">
     <div class="brand">
       <div class="logo" id="brand-logo" aria-hidden="true">
-        <svg viewBox="0 0 24 24"><path d="M13.5 2 5 13.2h6L9.8 22 19 10h-6.2z"/></svg>
+        <svg viewBox="7 7.5 46 46"><rect x="21" y="14" width="8" height="36" rx="2" fill="#5b4fd1"/><rect x="21" y="14" width="21" height="8" rx="2" fill="#5b4fd1"/><polygon class="lg-arrow" points="41,11 51,18 41,25" fill="#5b4fd1"/><rect x="21" y="29" width="16" height="7" rx="2" fill="#5b4fd1"/><rect class="lg-line" x="9" y="16.5" width="8" height="3" rx="1.5" fill="#a49bf5"/><rect class="lg-line lg-line2" x="12" y="31" width="5" height="3" rx="1.5" fill="#a49bf5"/></svg>
       </div>
       <span>FastFiles</span>
       <span class="fun-chip fun-only" title="Eğlence modu açık: oyunlar, animasyonlar ve birlikte izleme kullanılabilir">☕ Mola</span>
@@ -33,6 +33,9 @@
         <svg viewBox="0 0 24 24"><path d="M6 11h4M8 9v4M15 12h.01M18 10h.01"/><path d="M17.3 5H6.7a4 4 0 0 0-4 3.6l-.6 6.1a2.6 2.6 0 0 0 2.6 2.8c.9 0 1.7-.5 2.1-1.2L8 14h8l1.2 2.3c.4.7 1.2 1.2 2.1 1.2a2.6 2.6 0 0 0 2.6-2.8l-.6-6.1A4 4 0 0 0 17.3 5z"/></svg>Oyunlar
         <span class="tab-badge" id="games-badge" hidden>0</span>
       </button>
+      <button class="btn soft small screen-btn" id="btn-screen" title="Ekranınızı seçtiğiniz kişilerle paylaşın (birden fazla kişi aynı anda izleyebilir)">
+        <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4M12 13V7M9.5 9.5 12 7l2.5 2.5"/></svg><span>Ekranı paylaş</span>
+      </button>
       <button class="icon-btn" id="btn-phone" title="Telefondan / telefona dosya (QR kod)">
         <svg viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.2"/><path d="M11 18.5h2"/></svg>
       </button>
@@ -52,6 +55,7 @@
     <span class="rec-dot" aria-hidden="true"></span>
     <span id="share-bar-text">Ekranınız paylaşılıyor</span>
     <span class="spacer"></span>
+    <button class="btn ghost small" id="share-bar-add">Kişi ekle</button>
     <button class="btn small" id="share-bar-stop">Paylaşımı durdur</button>
   </div>
 
@@ -74,7 +78,7 @@
   <main class="layout">
     <section class="panel peers-panel">
       <div class="panel-head">
-        <h2>Ağdaki cihazlar <span class="count" id="peer-count">0</span></h2>
+        <h2>Kişiler <span class="count" id="peer-count">0</span><span class="count-off" id="peer-count-off" hidden></span></h2>
         <div class="head-actions">
           <button class="btn soft small" id="btn-batch" hidden title="Aynı dosyaları birden fazla kişiye gönder">
             <svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3 19c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5"/><path d="M16 4.8a3.2 3.2 0 0 1 0 6.4M18 13.8c2 .7 3 2.5 3 5.2"/></svg>Toplu gönder
@@ -84,7 +88,16 @@
           </button>
         </div>
       </div>
-      <div class="peers" id="peers"></div>
+      <div class="peers-scroll" id="peers-scroll">
+        <section class="peer-section" id="fav-section" hidden>
+          <div class="section-label"><svg viewBox="0 0 24 24"><path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9z"/></svg>Favoriler<span class="sl-sub">en çok çalıştığınız kişiler</span></div>
+          <div class="peers favs" id="favs"></div>
+        </section>
+        <section class="peer-section">
+          <div class="section-label" id="all-label" hidden>Diğer kişiler</div>
+          <div class="peers" id="peers"></div>
+        </section>
+      </div>
       <div class="empty" id="peers-empty" hidden>
         <div class="radar" aria-hidden="true"><span></span><span></span><span></span><i></i></div>
         <h3>Ağdaki bilgisayarlar aranıyor…</h3>
@@ -241,9 +254,6 @@
           </div>
           <button class="icon-btn sm" id="chat-members" title="Grup üyeleri" hidden>
             <svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3 19c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5"/><path d="M16 4.8a3.2 3.2 0 0 1 0 6.4M18 13.8c2 .7 3 2.5 3 5.2"/></svg>
-          </button>
-          <button class="icon-btn sm" id="chat-screen" title="Ekranımı paylaş">
-            <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4M12 13V7M9.5 9.5 12 7l2.5 2.5"/></svg>
           </button>
           <button class="icon-btn sm fun-only" id="chat-watch" title="Birlikte izle (YouTube)">
             <svg viewBox="0 0 24 24"><rect x="2.5" y="5" width="19" height="13" rx="3"/><path d="M10 8.8v6.4l5.4-3.2z"/><path d="M8 21h8"/></svg>
@@ -435,7 +445,7 @@
       <button class="btn small" id="office-pick-done">Bitti</button>
     </div>
     <div class="office-feed" id="office-feed" aria-live="polite"></div>
-    <div class="office-hint" id="office-hint">Sürükleyerek döndürün · tekerlekle yakınlaşın · kişiye tıklayıp yazın · dosyayı kişinin üstüne bırakın</div>
+    <div class="office-hint" id="office-hint">Sürükleyerek döndürün · sağ tuşla kaydırın · tekerlekle yakınlaşın · kişiye tıklayıp yazın · dosyayı kişinin üstüne bırakın</div>
     <div class="office-error" id="office-error" hidden></div>
   </section>
 
@@ -523,7 +533,7 @@
     <!-- Uygulama kilidi (PIN) -->
   <div class="lock-screen" id="lock-screen" hidden>
     <div class="lock-card">
-      <div class="logo big" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M13.5 2 5 13.2h6L9.8 22 19 10h-6.2z"/></svg></div>
+      <div class="logo big" aria-hidden="true"><svg viewBox="7 7.5 46 46"><rect x="21" y="14" width="8" height="36" rx="2" fill="#5b4fd1"/><rect x="21" y="14" width="21" height="8" rx="2" fill="#5b4fd1"/><polygon points="41,11 51,18 41,25" fill="#5b4fd1"/><rect x="21" y="29" width="16" height="7" rx="2" fill="#5b4fd1"/><rect x="9" y="16.5" width="8" height="3" rx="1.5" fill="#a49bf5"/><rect x="12" y="31" width="5" height="3" rx="1.5" fill="#a49bf5"/></svg></div>
       <h2>FastFiles kilitli</h2>
       <p class="muted">Devam etmek için 4 haneli PIN'inizi girin</p>
       <div class="pin-dots" id="pin-dots"><i></i><i></i><i></i><i></i></div>

@@ -84,6 +84,7 @@ fn update_settings(
     seat: Option<u8>,
     work_avatar: Option<u8>,
     hotkeys: Option<bool>,
+    autostart: Option<bool>,
 ) -> Result<Settings, String> {
     if let Some(name) = &device_name {
         if name.trim().is_empty() {
@@ -130,6 +131,10 @@ fn update_settings(
         if let Some(v) = hotkeys {
             s.hotkeys = v;
             apply_hotkeys(&app, v);
+        }
+        if let Some(v) = autostart {
+            s.autostart = v;
+            std::thread::spawn(move || shell::apply_autostart(v));
         }
         if let Some(v) = shell_menu {
             s.shell_menu = v;
@@ -270,6 +275,12 @@ async fn send_png(node: NodeState<'_>, request: tauri::ipc::Request<'_>) -> Resu
 #[tauri::command]
 async fn screen_share_start(node: NodeState<'_>, key: String) -> Result<String, String> {
     node.inner().screen_share_start(&key)
+}
+
+/// Ekranı seçilen kişilerle paylaşır (üst çubuktaki "Ekranı paylaş").
+#[tauri::command]
+async fn screen_share_with(node: NodeState<'_>, fingerprints: Vec<String>) -> Result<String, String> {
+    node.inner().screen_share_with(&fingerprints)
 }
 
 #[tauri::command]
@@ -501,6 +512,12 @@ fn chat_history(node: NodeState, fingerprint: String) -> Vec<ChatMessage> {
 #[tauri::command]
 async fn chat_send(node: NodeState<'_>, peer_id: String, text: String, reply_to: Option<String>) -> Result<ChatMessage, String> {
     node.inner().chat_send(&peer_id, &text, reply_to.as_deref())
+}
+
+/// Kişiye (parmak iziyle) mesaj: çevrimdışıysa saklanır, çevrimiçi olunca iletilir.
+#[tauri::command]
+async fn chat_send_to(node: NodeState<'_>, fingerprint: String, name: String, text: String, reply_to: Option<String>) -> Result<ChatMessage, String> {
+    node.inner().chat_send_to(&fingerprint, &name, &text, reply_to.as_deref())
 }
 
 #[tauri::command]
@@ -1265,7 +1282,7 @@ pub fn run() {
                     let h = handle.clone();
                     tauri::async_runtime::spawn(async move {
                         tokio::time::sleep(Duration::from_secs(3)).await;
-                        let body = format!("{previous} → {}", update::CURRENT_VERSION);
+                        let body = format!("Sürüm {previous} → {}. Yenilikleri görmek için tıklayın.", update::CURRENT_VERSION);
                         show_notification(&h, "FastFiles güncellendi", &body, serde_json::json!({ "view": "main" }));
                         let _ = h.emit("updated", serde_json::json!({ "from": previous, "to": update::CURRENT_VERSION }));
                     });
@@ -1277,6 +1294,8 @@ pub fn run() {
             // Gezgin menüsü ayara göre eklenir/kaldırılır (kayıt defteri; arayüzü bekletmesin).
             let shell_menu = node.settings().shell_menu;
             std::thread::spawn(move || shell::apply(shell_menu));
+            let autostart = node.settings().autostart;
+            std::thread::spawn(move || shell::apply_autostart(autostart));
             app.manage(node);
             app.manage(SendInbox::default());
             // Uygulama Gezgin'den "FastFiles ile gönder" ile açıldıysa.
@@ -1348,6 +1367,7 @@ pub fn run() {
             chat_image,
             chat_image_open,
             chat_send,
+            chat_send_to,
             chat_retry,
             chat_mark_read,
             chat_clear,
@@ -1410,6 +1430,7 @@ pub fn run() {
             screen_clip_cancel,
             send_png,
             screen_share_start,
+            screen_share_with,
             screen_share_stop,
             screen_watch,
             screen_watch_stop,

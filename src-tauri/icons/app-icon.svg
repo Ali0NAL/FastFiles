@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="-3 -3 70 70">
+  <!-- FastFiles logosu ("Hızlı F"). Tüm simgeler bundan üretilir: cargo tauri icon icons/app-icon.svg -->
+  <rect x="0.35" y="0.35" width="63.3" height="63.3" rx="15" fill="#f4f2ee" stroke="#d3d2cc" stroke-width="0.7"/>
+  <rect x="21" y="14" width="8" height="36" rx="2" fill="#5b4fd1"/>
+  <rect x="21" y="14" width="21" height="8" rx="2" fill="#5b4fd1"/>
+  <polygon points="41,11 51,18 41,25" fill="#5b4fd1"/>
+  <rect x="21" y="29" width="16" height="7" rx="2" fill="#5b4fd1"/>
+  <rect x="9" y="16.5" width="8" height="3" rx="1.5" fill="#a49bf5"/>
+  <rect x="12" y="31" width="5" height="3" rx="1.5" fill="#a49bf5"/>
+</svg>
