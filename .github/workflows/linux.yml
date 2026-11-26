@@ -37,7 +37,8 @@ jobs:
             build-essential curl wget file \
             libxdo-dev libssl-dev \
             libayatana-appindicator3-dev \
-            librsvg2-dev patchelf
+            librsvg2-dev patchelf \
+            libpipewire-0.3-dev clang libclang-dev
 
       - name: Rust kur
         uses: dtolnay/rust-toolchain@stable
