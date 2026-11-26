@@ -1,0 +1,84 @@
+# Linux kurulum dosyalarını üretir: .AppImage (çoğu dağıtımda kurulum gerektirmeden çalışır) ve
+# .deb (Ubuntu/Debian). Derlenen dosyalar, çalıştırmanın sayfasında "Artifacts" altında.
+#
+# Not: Linux'ta otomatik güncelleme çalışmaz (Windows'a özeldir); yeni sürüm elle kurulur.
+# Ekran paylaşımı ve "panoyu gönder" X11 oturumlarında çalışır, Wayland'da sınırlıdır.
+#
+# Elle başlatmak için: GitHub → Actions → "Linux derlemesi" → Run workflow.
+name: Linux derlemesi
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src-tauri/**'
+      - 'ui/**'
+      - '.github/workflows/linux.yml'
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Eski dağıtımlarla uyum için 22.04 (daha yeni glibc/webkit, eski sistemlerde AppImage'i bozabilir).
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri 2'nin Linux ön koşulları (webkit2gtk 4.1, tepsi simgesi, AppImage için patchelf...).
+      - name: Sistem bağımlılıkları
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential curl wget file \
+            libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev patchelf
+
+      - name: Rust kur
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo önbelleği
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          cache-on-failure: true
+
+      - name: Tauri CLI kur
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Derle (.deb ve .AppImage)
+        working-directory: src-tauri
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo tauri build --bundles deb,appimage 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      # Loglar yalnızca giriş yapınca görünür; hata özeti çalıştırma sayfasında herkese görünsün.
+      - name: Hata özetini göster
+        if: failure()
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/build.log"
+          [ -f "$log" ] || exit 0
+          msg="$(grep -nE 'error(\[E[0-9]+\])?:|^error|Error:|failed to' "$log" | head -30; echo '-----'; tail -50 "$log")"
+          msg="${msg//'%'/'%25'}"; msg="${msg//$'\r'/'%0D'}"; msg="${msg//$'\n'/'%0A'}"
+          echo "::error title=Derleme hatası::$msg"
+
+      - name: Sürümü oku
+        id: ver
+        run: echo "version=$(jq -r .version src-tauri/tauri.conf.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Kurulum dosyalarını yükle
+        uses: actions/upload-artifact@v4
+        with:
+          name: FastFiles_${{ steps.ver.outputs.version }}_Linux
+          path: |
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
+          retention-days: 30
