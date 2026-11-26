@@ -22,8 +22,9 @@ concurrency:
 
 jobs:
   build:
-    # Eski dağıtımlarla uyum için 22.04 (daha yeni glibc/webkit, eski sistemlerde AppImage'i bozabilir).
-    runs-on: ubuntu-22.04
+    # 24.04 gerekir: ekran yakalama (xcap → pipewire 0.10) 22.04'ün eski PipeWire'ıyla derlenmiyor.
+    # Bunun bedeli: AppImage görece yeni bir glibc ister (Ubuntu 24.04+, Fedora 40+, güncel dağıtımlar).
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
