@@ -54,6 +54,8 @@ impl State {
 }
 
 /// Ekranı yakalar ve JPEG'e çevirir (bloklayan iş; ayrı iş parçacığında çalışır).
+/// Yalnızca Windows/macOS: Linux'ta ekran yakalama (xcap) kullanılmaz.
+#[cfg(not(target_os = "linux"))]
 fn capture(monitor: &xcap::Monitor) -> Result<Frame, String> {
     let img = monitor.capture_image().map_err(|e| e.to_string())?;
     let (mut w, mut h) = (img.width(), img.height());
@@ -89,6 +91,7 @@ fn capture(monitor: &xcap::Monitor) -> Result<Frame, String> {
     Ok(Frame { jpeg, width: w, height: h })
 }
 
+#[cfg(not(target_os = "linux"))]
 fn primary_monitor() -> Result<xcap::Monitor, String> {
     let all = xcap::Monitor::all().map_err(|e| format!("Ekran bulunamadı: {e}"))?;
     let primary = all.iter().position(|m| m.is_primary().unwrap_or(false)).unwrap_or(0);
@@ -151,7 +154,13 @@ impl Node {
         if online.is_empty() {
             return Err("Paylaşılacak kişi çevrimiçi değil".into());
         }
+        // Linux'ta ekran yakalama derlenmediğinden paylaşım desteklenmez (izleme çalışır).
+        #[cfg(target_os = "linux")]
+        {
+            return Err("Ekran paylaşımı bu sistemde (Linux) desteklenmiyor".into());
+        }
         // Ekran yakalanabiliyor mu? (Hata varsa davet göndermeden söyle.)
+        #[cfg(not(target_os = "linux"))]
         primary_monitor()?;
         let (session, fresh) = {
             let mut guard = self.extras.screen.sharing.lock().unwrap();
@@ -199,7 +208,12 @@ impl Node {
         Ok(session)
     }
 
+    /// Linux'ta ekran yakalama yok: paylaşım başlatma zaten reddedilir, bu çağrılmaz.
+    #[cfg(target_os = "linux")]
+    fn spawn_capture(self: &Arc<Self>) {}
+
     /// Yakalama döngüsü: izleyici varken saniyede ~8 kare üretir.
+    #[cfg(not(target_os = "linux"))]
     fn spawn_capture(self: &Arc<Self>) {
         let Some((stop, tx)) = self.extras.screen.sharing.lock().unwrap().as_ref().map(|s| (s.stop.clone(), s.frames.clone())) else {
             return;

@@ -44,9 +44,12 @@ png = "0.18"
 tauri-plugin-global-shortcut = "2"
 # Telefon bağlantısı: QR kod (SVG).
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
-# Ekran paylaşımı: ekranı yakala, JPEG olarak sıkıştırıp gönder.
-xcap = "0.9"
+# Ekran paylaşımı: ekranı JPEG olarak sıkıştırıp gönder. Ekran yakalama (xcap) yalnızca Windows
+# ve macOS'ta; Linux'ta xcap'in PipeWire zinciri derlenmediğinden ekran paylaşımı kapalıdır.
 jpeg-encoder = { version = "0.7", features = ["simd"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+xcap = "0.9"
 
 [target.'cfg(windows)'.dependencies]
 # Bildirime tıklanınca uygulamayı açabilmek için (notification eklentisi tıklamayı bildirmiyor).
